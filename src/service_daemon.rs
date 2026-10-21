@@ -3461,7 +3461,6 @@ impl Zeroconf {
                                 debug!("conflict handler: new probe of {}", record.get_name());
                                 Probe::new(create_time)
                             });
-                        self.timers.push(Reverse(new_probe.next_send));
                         new_probe
                     }
                 };
@@ -3471,7 +3470,8 @@ impl Zeroconf {
                     record.get_name(),
                     record.get_type()
                 );
-                new_probe.insert_record(record);
+                new_probe.insert_record(record, create_time);
+                self.timers.push(Reverse(new_probe.next_send));
 
                 new_probe.waiting_services.extend(waiting_services.clone());
             }
@@ -5654,6 +5654,43 @@ mod tests {
         assert!(registry.active.is_empty());
         assert!(registry.probing.is_empty());
         assert!(registry.name_changes.is_empty());
+    }
+
+    #[test]
+    fn test_publisher_changed_pending_data_restarts_probe() {
+        let (mut daemon, index) = publisher_test_daemon();
+        let original = publisher_service("pending", "host.local.", "127.0.0.1", "A");
+        let fullname = original.get_fullname().to_string();
+        daemon.register_service(original);
+        {
+            let probe = daemon
+                .dns_registry_map
+                .get_mut(&index)
+                .unwrap()
+                .probing
+                .get_mut(&fullname)
+                .unwrap();
+            probe.start_time = Instant::now() - Duration::from_millis(749);
+            probe.next_send = probe.start_time;
+        }
+        let updated = publisher_service("pending", "host.local.", "127.0.0.1", "B");
+        let before = Instant::now();
+        daemon.register_service(updated.clone());
+        let probe = &daemon.dns_registry_map[&index].probing[&fullname];
+        assert!(probe.start_time >= before);
+        assert_eq!(probe.next_send, probe.start_time);
+        let restarted = probe.start_time;
+        daemon.register_service(updated);
+        assert_eq!(
+            daemon.dns_registry_map[&index].probing[&fullname].start_time,
+            restarted
+        );
+        daemon.probing_handler();
+        assert_eq!(
+            daemon.my_services[&fullname].get_status(index),
+            crate::service_info::ServiceStatus::Probing
+        );
+        finish_publisher_probes(&mut daemon, index);
     }
 
     #[test]

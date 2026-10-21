@@ -1050,7 +1050,18 @@ impl Probe {
     }
 
     /// Adds a probe record, replacing pending SRV/TXT data for the same owner name.
-    pub(crate) fn insert_record(&mut self, record: DnsRecordBox) {
+    /// Changed proposals restart the probe schedule; identical records leave it intact.
+    pub(crate) fn insert_record(&mut self, record: DnsRecordBox, start_time: Instant) {
+        if self.records.iter().any(|existing| {
+            existing.get_type() == record.get_type()
+                && existing.get_class() == record.get_class()
+                && existing.get_name().eq_ignore_ascii_case(record.get_name())
+                && existing.rrdata_match(record.as_ref())
+        }) {
+            return;
+        }
+        self.start_time = start_time;
+        self.next_send = start_time;
         // SRV and TXT records are unique to a service instance name. If that
         // service is updated while its probe is pending, keep the latest
         // value instead of retaining every value until the probe completes.
@@ -1373,8 +1384,6 @@ impl DnsRegistry {
                 Probe::new(start_time)
             });
 
-        self.new_timers.push(probe.next_send);
-
         for record in probe.records.iter() {
             if matches_answer(record) {
                 debug!(
@@ -1383,6 +1392,7 @@ impl DnsRegistry {
                     answer.get_name(),
                 );
                 probe.waiting_services.insert(service_name.to_string());
+                self.new_timers.push(probe.next_send);
                 return false; // Found existing probe for the same record.
             }
         }
@@ -1392,8 +1402,9 @@ impl DnsRegistry {
             answer.get_type(),
             answer.get_name(),
         );
-        probe.insert_record(answer.clone_box());
+        probe.insert_record(answer.clone_box(), start_time);
         probe.waiting_services.insert(service_name.to_string());
+        self.new_timers.push(probe.next_send);
 
         false
     }
@@ -1443,27 +1454,18 @@ impl DnsRegistry {
         }
 
         for record in found_records {
-            let probe = match self.probing.get_mut(record.get_name()) {
-                Some(p) => {
-                    p.start_time = probe_time; // restart this probe.
-                    p
-                }
-                None => {
-                    let new_probe = self
-                        .probing
-                        .entry(record.get_name().to_string())
-                        .or_insert_with(|| Probe::new(probe_time));
-                    new_timer_added = true;
-                    new_probe
-                }
-            };
+            let probe = self
+                .probing
+                .entry(record.get_name().to_string())
+                .or_insert_with(|| Probe::new(probe_time));
 
             debug!(
                 "insert record {} with new hostname {new_name} into probe for: {}",
                 record.get_type(),
                 record.get_name()
             );
-            probe.insert_record(record.boxed());
+            probe.insert_record(record.boxed(), probe_time);
+            new_timer_added = true;
         }
 
         new_timer_added
