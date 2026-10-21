@@ -4,7 +4,8 @@
 use crate::log::{debug, trace};
 use crate::{
     dns_parser::{
-        DnsAddress, DnsIncoming, DnsOutgoing, DnsRecordBox, DnsRecordExt, DnsSrv, RRType, ScopedIp,
+        DnsAddress, DnsIncoming, DnsOutgoing, DnsRecordBox, DnsRecordExt, DnsSrv, DnsTxt, RRType,
+        ScopedIp, CLASS_IN,
     },
     Error, IfKind, InterfaceId, Result,
 };
@@ -1253,13 +1254,34 @@ impl DnsRegistry {
     /// Retains records and rename mappings still used by current registrations.
     /// Address ownership is the union of the registrations using each effective hostname.
     pub(crate) fn retain_services(&mut self, services: &[&ServiceInfo], intf: &MyIntf) {
-        let mut service_names = HashSet::new();
+        let mut service_records = HashMap::new();
         let mut original_names = HashSet::new();
         let mut host_addresses: HashMap<String, HashSet<IpAddr>> = HashMap::new();
         for service in services {
             original_names.insert(service.get_fullname().to_lowercase());
             original_names.insert(service.get_hostname().to_lowercase());
-            service_names.insert(self.resolve_name(service.get_fullname()).to_lowercase());
+            let fullname = self.resolve_name(service.get_fullname());
+            let hostname = self.resolve_name(service.get_hostname());
+            service_records.insert(
+                fullname.to_lowercase(),
+                (
+                    DnsSrv::new(
+                        fullname,
+                        CLASS_IN,
+                        service.get_host_ttl(),
+                        service.get_priority(),
+                        service.get_weight(),
+                        service.get_port(),
+                        hostname.to_string(),
+                    ),
+                    DnsTxt::new(
+                        fullname,
+                        CLASS_IN,
+                        service.get_other_ttl(),
+                        service.generate_txt(),
+                    ),
+                ),
+            );
             host_addresses
                 .entry(self.resolve_name(service.get_hostname()).to_lowercase())
                 .or_default()
@@ -1274,7 +1296,7 @@ impl DnsRegistry {
             |record: &DnsRecordBox| {
                 let name = record.get_name().to_lowercase();
                 match record.get_type() {
-                    RRType::SRV | RRType::TXT => service_names.contains(&name),
+                    RRType::SRV | RRType::TXT => service_records.contains_key(&name),
                     RRType::A | RRType::AAAA => record
                         .any()
                         .downcast_ref::<DnsAddress>()
@@ -1291,7 +1313,22 @@ impl DnsRegistry {
             !records.is_empty()
         });
         self.probing.retain(|_, probe| {
-            probe.records.retain(&owns_record);
+            // Pending unique records must describe the latest registration, even
+            // when no announcement is possible on this interface yet.
+            probe.records.retain(|record| {
+                if !owns_record(record) {
+                    return false;
+                }
+                match record.get_type() {
+                    RRType::SRV | RRType::TXT => service_records
+                        .get(&record.get_name().to_lowercase())
+                        .is_some_and(|(srv, txt)| match record.get_type() {
+                            RRType::SRV => srv.rrdata_match(record.as_ref()),
+                            _ => txt.rrdata_match(record.as_ref()),
+                        }),
+                    _ => true,
+                }
+            });
             probe.waiting_services.retain(|name| {
                 services
                     .iter()
@@ -1325,17 +1362,6 @@ impl DnsRegistry {
             .get(answer.get_name())
             .is_some_and(|records| records.iter().any(&matches_answer))
         {
-            if answer.get_type() == RRType::SRV || answer.get_type() == RRType::TXT {
-                if let Some(probe) = self.probing.get_mut(answer.get_name()) {
-                    probe.records.retain(|pending| {
-                        pending.get_type() != answer.get_type()
-                            || !pending.get_name().eq_ignore_ascii_case(answer.get_name())
-                    });
-                    if probe.records.is_empty() {
-                        self.probing.remove(answer.get_name());
-                    }
-                }
-            }
             return true;
         }
 

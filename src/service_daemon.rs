@@ -5657,6 +5657,47 @@ mod tests {
     }
 
     #[test]
+    fn test_publisher_pending_records_follow_registration_without_announcements() {
+        for no_address in [false, true] {
+            let (mut daemon, index) = publisher_test_daemon();
+            let original = publisher_service("revert", "host.local.", "127.0.0.1", "A");
+            daemon.register_service(original.clone());
+            finish_publisher_probes(&mut daemon, index);
+            let update = ServiceInfo::new(
+                "_test._tcp.local.",
+                "revert",
+                "host.local.",
+                "127.0.0.1",
+                9090,
+                &[("v", "B")][..],
+            )
+            .unwrap();
+            daemon.register_service(update);
+            assert!(!daemon.dns_registry_map[&index].probing.is_empty());
+            let mut revert = publisher_service(
+                "revert",
+                "host.local.",
+                if no_address { "" } else { "127.0.0.1" },
+                "A",
+            );
+            if !no_address {
+                revert.set_requires_probe(false);
+            }
+            daemon.register_service(revert);
+            assert!(daemon.dns_registry_map[&index].probing.is_empty());
+            daemon.register_service(original);
+            finish_publisher_probes(&mut daemon, index);
+            let srv = daemon.dns_registry_map[&index]
+                .active
+                .values()
+                .flatten()
+                .find_map(|record| record.any().downcast_ref::<DnsSrv>())
+                .unwrap();
+            assert_eq!(srv.port(), 8080);
+        }
+    }
+
+    #[test]
     fn test_publisher_conflict_cleanup() {
         let (mut daemon, index) = publisher_test_daemon();
         for cycle in 0..8 {
