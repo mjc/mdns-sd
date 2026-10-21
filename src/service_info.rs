@@ -3,7 +3,9 @@
 #[cfg(feature = "logging")]
 use crate::log::{debug, trace};
 use crate::{
-    dns_parser::{DnsIncoming, DnsOutgoing, DnsRecordBox, DnsRecordExt, DnsSrv, RRType, ScopedIp},
+    dns_parser::{
+        DnsAddress, DnsIncoming, DnsOutgoing, DnsRecordBox, DnsRecordExt, DnsSrv, RRType, ScopedIp,
+    },
     Error, IfKind, InterfaceId, Result,
 };
 use if_addrs::{IfAddr, Interface};
@@ -1248,57 +1250,57 @@ impl DnsRegistry {
         }
     }
 
-    /// Retires the records and pending probes owned by an unregistered service.
-    /// Address records are shared by every service using the same hostname, so
-    /// callers preserve them while another local service still uses that host.
-    pub(crate) fn remove_service_records(
-        &mut self,
-        service_name: &str,
-        fullname: &str,
-        original_hostname: &str,
-        hostname: &str,
-        keep_hostname_records: bool,
-    ) {
-        let service_name = service_name.to_lowercase();
-        let fullname = fullname.to_lowercase();
-        let original_hostname = original_hostname.to_lowercase();
-        let hostname = hostname.to_lowercase();
-
+    /// Retains records and rename mappings still used by current registrations.
+    /// Address ownership is the union of the registrations using each effective hostname.
+    pub(crate) fn retain_services(&mut self, services: &[&ServiceInfo], intf: &MyIntf) {
+        let mut service_names = HashSet::new();
+        let mut original_names = HashSet::new();
+        let mut host_addresses: HashMap<String, HashSet<IpAddr>> = HashMap::new();
+        for service in services {
+            original_names.insert(service.get_fullname().to_lowercase());
+            original_names.insert(service.get_hostname().to_lowercase());
+            service_names.insert(self.resolve_name(service.get_fullname()).to_lowercase());
+            host_addresses
+                .entry(self.resolve_name(service.get_hostname()).to_lowercase())
+                .or_default()
+                .extend(
+                    service
+                        .get_addrs_on_my_intf_v4(intf)
+                        .into_iter()
+                        .chain(service.get_addrs_on_my_intf_v6(intf)),
+                );
+        }
+        let owns_record =
+            |record: &DnsRecordBox| {
+                let name = record.get_name().to_lowercase();
+                match record.get_type() {
+                    RRType::SRV | RRType::TXT => service_names.contains(&name),
+                    RRType::A | RRType::AAAA => record
+                        .any()
+                        .downcast_ref::<DnsAddress>()
+                        .is_some_and(|addr| {
+                            host_addresses.get(&name).is_some_and(|addresses| {
+                                addresses.contains(&addr.address().to_ip_addr())
+                            })
+                        }),
+                    _ => false,
+                }
+            };
         self.active.retain(|_, records| {
-            records.retain(|record| {
-                let name = record.get_name();
-                let record_type = record.get_type();
-                let is_service_record = name.eq_ignore_ascii_case(&fullname)
-                    && (record_type == RRType::SRV || record_type == RRType::TXT);
-                let is_unshared_address = !keep_hostname_records
-                    && name.eq_ignore_ascii_case(&hostname)
-                    && (record_type == RRType::A || record_type == RRType::AAAA);
-                !is_service_record && !is_unshared_address
-            });
+            records.retain(&owns_record);
             !records.is_empty()
         });
-
         self.probing.retain(|_, probe| {
-            probe
-                .waiting_services
-                .retain(|service| !service.eq_ignore_ascii_case(&service_name));
-            probe.records.retain(|record| {
-                let name = record.get_name();
-                let record_type = record.get_type();
-                let is_service_record = name.eq_ignore_ascii_case(&fullname)
-                    && (record_type == RRType::SRV || record_type == RRType::TXT);
-                let is_unshared_address = !keep_hostname_records
-                    && name.eq_ignore_ascii_case(&hostname)
-                    && (record_type == RRType::A || record_type == RRType::AAAA);
-                !is_service_record && !is_unshared_address
+            probe.records.retain(&owns_record);
+            probe.waiting_services.retain(|name| {
+                services
+                    .iter()
+                    .any(|service| service.get_fullname().eq_ignore_ascii_case(name))
             });
-            !probe.records.is_empty() || !probe.waiting_services.is_empty()
+            !probe.records.is_empty()
         });
-
-        self.name_changes.retain(|original, _| {
-            !original.eq_ignore_ascii_case(&service_name)
-                && (keep_hostname_records || !original.eq_ignore_ascii_case(&original_hostname))
-        });
+        self.name_changes
+            .retain(|original, _| original_names.contains(&original.to_lowercase()));
     }
 
     pub(crate) fn is_probing_done<T>(
@@ -1310,17 +1312,29 @@ impl DnsRegistry {
     where
         T: DnsRecordExt + Send + 'static,
     {
-        if let Some(active_records) = self.active.get(answer.get_name()) {
-            for record in active_records.iter() {
-                if answer.matches(record.as_ref()) {
-                    debug!(
-                        "found active record {} {}",
-                        answer.get_type(),
-                        answer.get_name(),
-                    );
-                    return true;
+        // Names changed by probing are part of the record's identity here.
+        // Different registrations can use the same effective hostname.
+        let matches_answer = |record: &DnsRecordBox| {
+            answer.get_type() == record.get_type()
+                && answer.get_class() == record.get_class()
+                && answer.get_name().eq_ignore_ascii_case(record.get_name())
+                && answer.rrdata_match(record.as_ref())
+        };
+        if self
+            .active
+            .get(answer.get_name())
+            .is_some_and(|records| records.iter().any(&matches_answer))
+        {
+            if let Some(probe) = self.probing.get_mut(answer.get_name()) {
+                probe.records.retain(|pending| {
+                    pending.get_type() != answer.get_type()
+                        || !pending.get_name().eq_ignore_ascii_case(answer.get_name())
+                });
+                if probe.records.is_empty() {
+                    self.probing.remove(answer.get_name());
                 }
             }
+            return true;
         }
 
         let probe = self
@@ -1334,7 +1348,7 @@ impl DnsRegistry {
         self.new_timers.push(probe.next_send);
 
         for record in probe.records.iter() {
-            if answer.matches(record.as_ref()) {
+            if matches_answer(record) {
                 debug!(
                     "found existing record {} in probe of '{}'",
                     answer.get_type(),

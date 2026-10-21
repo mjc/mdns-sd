@@ -2366,6 +2366,7 @@ impl Zeroconf {
 
         debug!("register service {:?}", &info);
 
+        self.retain_service_registries(Some(&info));
         let outgoing_addrs = self.send_unsolicited_response(&mut info);
         if !outgoing_addrs.is_empty() {
             self.notify_monitors(DaemonEvent::Announce(
@@ -2378,6 +2379,27 @@ impl Zeroconf {
         // The info will have the original name.
         let service_fullname = info.get_fullname().to_lowercase();
         self.my_services.insert(service_fullname, info);
+    }
+
+    /// Reconciles registry ownership with current services, including a replacement registration.
+    fn retain_service_registries(&mut self, replacement: Option<&ServiceInfo>) {
+        let services: Vec<_> = self
+            .my_services
+            .values()
+            .filter(|service| {
+                replacement.map_or(true, |new| {
+                    !service
+                        .get_fullname()
+                        .eq_ignore_ascii_case(new.get_fullname())
+                })
+            })
+            .chain(replacement)
+            .collect();
+        for (index, registry) in &mut self.dns_registry_map {
+            if let Some(intf) = self.my_intfs.get(index) {
+                registry.retain_services(&services, intf);
+            }
+        }
     }
 
     /// Sends out announcement of `info` on every valid interface.
@@ -3346,6 +3368,7 @@ impl Zeroconf {
             return;
         };
 
+        let mut names_changed = false;
         for answer in msg.answers().iter() {
             let mut new_records = Vec::new();
 
@@ -3416,6 +3439,7 @@ impl Zeroconf {
 
             let waiting_services = probe.waiting_services.clone();
 
+            names_changed |= !new_records.is_empty();
             for record in new_records {
                 if dns_registry.update_hostname(name, record.get_name(), create_time) {
                     self.timers.push(Reverse(create_time));
@@ -3451,6 +3475,10 @@ impl Zeroconf {
 
                 new_probe.waiting_services.extend(waiting_services.clone());
             }
+        }
+        if names_changed {
+            let services: Vec<_> = self.my_services.values().collect();
+            dns_registry.retain_services(&services, my_intf);
         }
     }
 
@@ -4206,20 +4234,7 @@ impl Zeroconf {
                     self.add_timer(t);
                 }
 
-                let remaining_services: Vec<&ServiceInfo> = self.my_services.values().collect();
-                for registry in self.dns_registry_map.values_mut() {
-                    let fullname = registry.resolve_name(info.get_fullname()).to_string();
-                    let hostname = registry.resolve_name(info.get_hostname()).to_string();
-                    let hostname_is_shared =
-                        hostname_is_shared(registry, &hostname, remaining_services.iter().copied());
-                    registry.remove_service_records(
-                        info.get_fullname(),
-                        &fullname,
-                        info.get_hostname(),
-                        &hostname,
-                        hostname_is_shared,
-                    );
-                }
+                self.retain_service_registries(None);
 
                 self.increase_counter(Counter::Unregister, 1);
                 UnregisterStatus::OK
@@ -5385,9 +5400,10 @@ fn handle_expired_probes(
         // send notifications about name changes
         for record in probe.records.iter() {
             if let Some(new_name) = record.get_record().get_new_name() {
-                dns_registry
-                    .name_changes
-                    .insert(name.clone(), new_name.to_string());
+                dns_registry.name_changes.insert(
+                    record.get_record().get_original_name().to_string(),
+                    new_name.to_string(),
+                );
 
                 let event = DnsNameChange {
                     original: record.get_record().get_original_name().to_string(),
@@ -5418,7 +5434,13 @@ fn handle_expired_probes(
                             || !active.get_name().eq_ignore_ascii_case(record.get_name())
                     });
                 }
-                records.push(record);
+                if !records.iter().any(|active| {
+                    active.get_type() == record_type
+                        && active.get_name().eq_ignore_ascii_case(record.get_name())
+                        && active.rrdata_match(record.as_ref())
+                }) {
+                    records.push(record);
+                }
             }
 
             waiting_services.extend(probe.waiting_services);
@@ -5472,39 +5494,24 @@ fn resolve_addr_to_index(if_kind: IfKind, interfaces: &[Interface]) -> IfKind {
     if_kind
 }
 
-/// Checks hostname sharing after applying the name conflict resolution for an interface.
-fn hostname_is_shared<'a>(
-    registry: &DnsRegistry,
-    hostname: &str,
-    services: impl Iterator<Item = &'a ServiceInfo>,
-) -> bool {
-    services.into_iter().any(|service| {
-        registry
-            .resolve_name(service.get_hostname())
-            .eq_ignore_ascii_case(hostname)
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        _new_socket_bind, check_domain_suffix, check_service_name_length, handle_expired_probes,
-        hostname_change, hostname_is_shared, my_ip_interfaces, name_change,
-        resolve_max_packet_size, send_dns_outgoing_impl, valid_instance_name, valid_ip_on_intf,
-        DaemonEvent, HostnameResolutionEvent, IfKind, MaxPacketSizeSelection, MyIntf, SendConfig,
-        ServiceDaemon, ServiceEvent, ServiceInfo, GROUP_ADDR_V4, INITIAL_QUERY_DELAY_MAX_MILLIS,
-        INITIAL_QUERY_DELAY_MIN_MILLIS, MAX_PKT_ABSOLUTE_IPV6, MAX_PKT_DEFAULT, MDNS_PORT,
-        MIN_MAX_PACKET_SIZE, RESOLVE_MAX_TRY, SHARED_RESPONSE_DELAY_MAX_MILLIS,
-        SHARED_RESPONSE_DELAY_MIN_MILLIS,
+        _new_socket_bind, check_domain_suffix, check_service_name_length, hostname_change,
+        my_ip_interfaces, name_change, resolve_max_packet_size, send_dns_outgoing_impl,
+        valid_instance_name, valid_ip_on_intf, DaemonEvent, HostnameResolutionEvent, IfKind,
+        MaxPacketSizeSelection, MyIntf, SendConfig, ServiceDaemon, ServiceEvent, ServiceInfo,
+        GROUP_ADDR_V4, INITIAL_QUERY_DELAY_MAX_MILLIS, INITIAL_QUERY_DELAY_MIN_MILLIS,
+        MAX_PKT_ABSOLUTE_IPV6, MAX_PKT_DEFAULT, MDNS_PORT, MIN_MAX_PACKET_SIZE, RESOLVE_MAX_TRY,
+        SHARED_RESPONSE_DELAY_MAX_MILLIS, SHARED_RESPONSE_DELAY_MIN_MILLIS,
     };
     use crate::{
         dns_parser::{
-            DnsAddress, DnsEntryExt, DnsIncoming, DnsOutgoing, DnsPointer, DnsRecordExt, DnsSrv,
-            DnsTxt, InterfaceId, RRType, ScopedIp, CLASS_IN, FLAGS_AA, FLAGS_QR_QUERY,
-            FLAGS_QR_RESPONSE, LEGACY_UNICAST_MAX_TTL,
+            DnsAddress, DnsEntryExt, DnsIncoming, DnsOutgoing, DnsPointer, DnsSrv, DnsTxt,
+            InterfaceId, RRType, ScopedIp, CLASS_IN, FLAGS_AA, FLAGS_QR_QUERY, FLAGS_QR_RESPONSE,
+            LEGACY_UNICAST_MAX_TTL,
         },
         service_daemon::{add_answer_of_service, check_hostname},
-        service_info::{DnsRegistry, Probe},
     };
     use if_addrs::{IfAddr, Ifv4Addr, Ifv6Addr, Interface};
     use std::{
@@ -5515,124 +5522,305 @@ mod tests {
     };
     use test_log::test;
 
-    #[test]
-    fn test_service_updates_replace_old_published_records_and_unregister_cleans_registry() {
-        let fullname = "cache._http._tcp.local.";
-        let hostname = "host.local.";
-        let mut registry = DnsRegistry::new();
+    /// Runs publisher tests on loopback using a private UDP port.
+    fn publisher_test_daemon() -> (super::Zeroconf, u32) {
+        let mut daemon = new_test_zeroconf();
+        let index = my_ip_interfaces(true)
+            .into_iter()
+            .find(|intf| intf.ip() == IpAddr::V4(Ipv4Addr::LOCALHOST))
+            .unwrap()
+            .index
+            .unwrap();
+        daemon.my_intfs.retain(|key, _| *key == index);
+        daemon.dns_registry_map.retain(|key, _| *key == index);
+        (daemon, index)
+    }
 
-        let mut old_records = Vec::new();
-        for version in 0..1_000 {
-            old_records.push(
-                DnsSrv::new(fullname, CLASS_IN, 120, 0, 0, version, hostname.to_string()).boxed(),
-            );
-            old_records.push(
-                DnsTxt::new(
-                    fullname,
-                    CLASS_IN,
-                    4500,
-                    format!("version={version}").into_bytes(),
-                )
-                .boxed(),
+    fn publisher_service(instance: &str, host: &str, address: &str, txt: &str) -> ServiceInfo {
+        ServiceInfo::new(
+            "_test._tcp.local.",
+            instance,
+            host,
+            address,
+            8080,
+            &[("v", txt)][..],
+        )
+        .unwrap()
+    }
+
+    /// Advances the production probe handler without waiting for real timers.
+    fn finish_publisher_probes(daemon: &mut super::Zeroconf, index: u32) {
+        for _ in 0..4 {
+            let registry = daemon.dns_registry_map.get_mut(&index).unwrap();
+            if registry.probing.is_empty() {
+                break;
+            }
+            for probe in registry.probing.values_mut() {
+                probe.start_time = Instant::now() - Duration::from_secs(1);
+                probe.next_send = probe.start_time;
+            }
+            daemon.probing_handler();
+        }
+        assert!(daemon.dns_registry_map[&index].probing.is_empty());
+        for service in daemon.my_services.values() {
+            assert_eq!(
+                service.get_status(index),
+                crate::service_info::ServiceStatus::Announced
             );
         }
-        registry.active.insert(fullname.to_string(), old_records);
-        registry.active.insert(
-            hostname.to_string(),
-            vec![DnsAddress::new(
-                hostname,
-                RRType::A,
-                CLASS_IN,
-                120,
-                IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)),
-                InterfaceId {
-                    name: "test0".to_string(),
-                    index: 1,
-                },
-            )
-            .boxed()],
-        );
+    }
 
-        let mut probe = Probe::new(Instant::now());
-        probe.waiting_services.insert(fullname.to_string());
-        for version in 1_000..2_000 {
-            probe.insert_record(
-                DnsSrv::new(fullname, CLASS_IN, 120, 0, 0, version, hostname.to_string()).boxed(),
-            );
-            probe.insert_record(
-                DnsTxt::new(
-                    fullname,
-                    CLASS_IN,
-                    4500,
-                    format!("version={version}").into_bytes(),
-                )
-                .boxed(),
-            );
-        }
-        assert_eq!(probe.records.len(), 2);
-        registry.probing.insert(fullname.to_string(), probe);
-
-        let waiting = handle_expired_probes(
-            vec![fullname.to_string()],
-            "test0",
-            &mut registry,
-            &mut Vec::new(),
-        );
-
-        assert_eq!(waiting, HashSet::from([fullname.to_string()]));
-        let active = &registry.active[fullname];
-        assert_eq!(active.len(), 2);
-        assert!(active.iter().any(|record| {
-            record
-                .any()
-                .downcast_ref::<DnsSrv>()
-                .is_some_and(|srv| srv.port() == 1_999)
-        }));
-        assert!(active.iter().any(|record| {
-            record
-                .any()
-                .downcast_ref::<DnsTxt>()
-                .is_some_and(|txt| txt.text() == b"version=1999")
-        }));
-
-        let mut pending = Probe::new(Instant::now());
-        pending.waiting_services.insert(fullname.to_string());
-        pending.insert_record(
-            DnsTxt::new(fullname, CLASS_IN, 4500, b"version=pending".to_vec()).boxed(),
-        );
-        registry.probing.insert(fullname.to_string(), pending);
-
-        registry.remove_service_records(fullname, fullname, hostname, hostname, true);
-        assert!(!registry.active.contains_key(fullname));
-        assert_eq!(registry.active[hostname].len(), 1);
-        assert!(!registry.probing.contains_key(fullname));
-
-        registry.remove_service_records(fullname, fullname, hostname, hostname, false);
-        assert!(!registry.active.contains_key(hostname));
+    fn unregister_publisher(daemon: &mut super::Zeroconf, fullname: &str) {
+        let (sender, receiver) = flume::bounded(1);
+        daemon.exec_command_unregister(false, fullname.to_lowercase(), sender);
+        assert!(matches!(
+            receiver.recv().unwrap(),
+            super::UnregisterStatus::OK
+        ));
     }
 
     #[test]
-    fn test_unregistration_detects_shared_effective_hostname() {
-        let mut registry = DnsRegistry::new();
-        registry
-            .name_changes
-            .insert("host.local.".to_string(), "host-2.local.".to_string());
-        let remaining_service = ServiceInfo::new(
-            "_http._tcp.local.",
-            "remaining",
-            "host-2.local.",
-            "192.168.1.11",
-            80,
-            std::collections::HashMap::<String, String>::new(),
+    fn test_publisher_update_reverts_pending_txt() {
+        let (mut daemon, index) = publisher_test_daemon();
+        let service = publisher_service("revert", "revert.local.", "127.0.0.1", "A");
+        let fullname = service.get_fullname().to_string();
+        daemon.register_service(service.clone());
+        finish_publisher_probes(&mut daemon, index);
+        daemon.register_service(publisher_service(
+            "revert",
+            "revert.local.",
+            "127.0.0.1",
+            "B",
+        ));
+        assert!(!daemon.dns_registry_map[&index].probing.is_empty());
+        daemon.register_service(service.clone());
+        finish_publisher_probes(&mut daemon, index);
+        let registry = &daemon.dns_registry_map[&index];
+        let txt: Vec<_> = registry
+            .active
+            .values()
+            .flatten()
+            .filter_map(|r| r.any().downcast_ref::<DnsTxt>())
+            .collect();
+        assert_eq!(txt.len(), 1);
+        assert_eq!(txt[0].text(), service.generate_txt());
+        daemon.register_service(service);
+        assert_eq!(
+            daemon.my_services[&fullname].get_status(index),
+            crate::service_info::ServiceStatus::Announced
+        );
+        assert!(daemon.dns_registry_map[&index].probing.is_empty());
+    }
+
+    #[test]
+    fn test_publisher_hostname_and_address_updates() {
+        let (mut daemon, index) = publisher_test_daemon();
+        for version in 0..32 {
+            daemon.register_service(publisher_service(
+                "update",
+                &format!("host-{version}.local."),
+                "127.0.0.1",
+                "A",
+            ));
+            finish_publisher_probes(&mut daemon, index);
+            assert_eq!(
+                daemon.dns_registry_map[&index]
+                    .active
+                    .values()
+                    .map(Vec::len)
+                    .sum::<usize>(),
+                3
+            );
+        }
+        for version in 1..33 {
+            daemon.register_service(publisher_service(
+                "update",
+                "host.local.",
+                &format!("127.0.0.{version}"),
+                "A",
+            ));
+            finish_publisher_probes(&mut daemon, index);
+            assert_eq!(
+                daemon.dns_registry_map[&index]
+                    .active
+                    .values()
+                    .map(Vec::len)
+                    .sum::<usize>(),
+                3
+            );
+        }
+        unregister_publisher(&mut daemon, "update._test._tcp.local.");
+        let registry = &daemon.dns_registry_map[&index];
+        assert!(registry.active.is_empty());
+        assert!(registry.probing.is_empty());
+        assert!(registry.name_changes.is_empty());
+    }
+
+    #[test]
+    fn test_publisher_conflict_cleanup() {
+        let (mut daemon, index) = publisher_test_daemon();
+        for cycle in 0..8 {
+            let instance = format!("conflict-{cycle}");
+            let service = publisher_service(&instance, "host.local.", "127.0.0.1", "A");
+            let fullname = service.get_fullname().to_string();
+            daemon.register_service(service);
+            for _ in 0..2 {
+                let name = daemon.dns_registry_map[&index]
+                    .resolve_name(&fullname)
+                    .to_string();
+                let mut out = DnsOutgoing::new(FLAGS_QR_RESPONSE | FLAGS_AA);
+                out.add_answer_record(DnsTxt::new(&name, CLASS_IN, 120, b"\x03v=B".to_vec()));
+                let packet = out.to_data_on_wire(MAX_PKT_DEFAULT, true).pop().unwrap();
+                let msg = DnsIncoming::new(
+                    packet,
+                    InterfaceId {
+                        name: "lo".to_string(),
+                        index,
+                    },
+                )
+                .unwrap();
+                daemon.conflict_handler(&msg, index);
+            }
+            finish_publisher_probes(&mut daemon, index);
+            unregister_publisher(&mut daemon, &fullname);
+            let registry = &daemon.dns_registry_map[&index];
+            assert!(
+                registry.active.is_empty(),
+                "cycle {cycle}: {:?}",
+                registry.active
+            );
+            assert!(registry.probing.is_empty());
+            assert!(
+                registry.name_changes.is_empty(),
+                "{:?}",
+                registry.name_changes
+            );
+        }
+    }
+
+    #[test]
+    fn test_publisher_shared_addresses_after_updates() {
+        let (mut daemon, index) = publisher_test_daemon();
+        daemon.register_service(publisher_service(
+            "first",
+            "shared.local.",
+            "127.0.0.1",
+            "A",
+        ));
+        daemon.register_service(publisher_service(
+            "second",
+            "shared.local.",
+            "127.0.0.2",
+            "A",
+        ));
+        finish_publisher_probes(&mut daemon, index);
+        daemon.register_service(publisher_service(
+            "first",
+            "shared.local.",
+            "127.0.0.3",
+            "A",
+        ));
+        finish_publisher_probes(&mut daemon, index);
+        assert_eq!(
+            daemon.dns_registry_map[&index]
+                .active
+                .values()
+                .map(Vec::len)
+                .sum::<usize>(),
+            6
+        );
+        unregister_publisher(&mut daemon, "first._test._tcp.local.");
+        assert_eq!(
+            daemon.dns_registry_map[&index]
+                .active
+                .values()
+                .map(Vec::len)
+                .sum::<usize>(),
+            3
+        );
+        unregister_publisher(&mut daemon, "second._test._tcp.local.");
+        assert!(daemon.dns_registry_map[&index].active.is_empty());
+    }
+
+    #[test]
+    fn test_publisher_shared_renamed_hostname() {
+        let (mut daemon, index) = publisher_test_daemon();
+        let first = publisher_service("first", "host.local.", "127.0.0.1", "A");
+        let fullname = first.get_fullname().to_string();
+        daemon.register_service(first);
+        let mut out = DnsOutgoing::new(FLAGS_QR_RESPONSE | FLAGS_AA);
+        out.add_answer_record(DnsAddress::new(
+            "host.local.",
+            RRType::A,
+            CLASS_IN,
+            120,
+            "127.0.0.99".parse().unwrap(),
+            InterfaceId {
+                name: "lo".to_string(),
+                index,
+            },
+        ));
+        let packet = out.to_data_on_wire(MAX_PKT_DEFAULT, true).pop().unwrap();
+        let incoming = DnsIncoming::new(
+            packet,
+            InterfaceId {
+                name: "lo".to_string(),
+                index,
+            },
         )
         .unwrap();
+        daemon.conflict_handler(&incoming, index);
+        finish_publisher_probes(&mut daemon, index);
+        let effective = daemon.dns_registry_map[&index]
+            .resolve_name("host.local.")
+            .to_string();
+        assert_ne!(effective, "host.local.");
+        let second = publisher_service("second", &effective, "127.0.0.1", "A");
+        let second_name = second.get_fullname().to_string();
+        daemon.register_service(second.clone());
+        finish_publisher_probes(&mut daemon, index);
+        unregister_publisher(&mut daemon, &fullname);
+        assert_eq!(
+            daemon.dns_registry_map[&index]
+                .active
+                .values()
+                .map(Vec::len)
+                .sum::<usize>(),
+            3
+        );
+        daemon.register_service(second);
+        assert_eq!(
+            daemon.my_services[&second_name].get_status(index),
+            crate::service_info::ServiceStatus::Announced
+        );
+        assert!(daemon.dns_registry_map[&index].probing.is_empty());
+        unregister_publisher(&mut daemon, &second_name);
+        assert!(daemon.dns_registry_map[&index].active.is_empty());
+        assert!(daemon.dns_registry_map[&index].name_changes.is_empty());
+    }
 
-        let effective_hostname = registry.resolve_name("host.local.");
-        assert!(hostname_is_shared(
-            &registry,
-            effective_hostname,
-            std::iter::once(&remaining_service),
-        ));
+    #[test]
+    fn test_publisher_txt_updates_stay_bounded() {
+        let (mut daemon, index) = publisher_test_daemon();
+        for version in 0..64 {
+            daemon.register_service(publisher_service(
+                "txt",
+                "host.local.",
+                "127.0.0.1",
+                &version.to_string(),
+            ));
+            finish_publisher_probes(&mut daemon, index);
+            assert_eq!(
+                daemon.dns_registry_map[&index]
+                    .active
+                    .values()
+                    .map(Vec::len)
+                    .sum::<usize>(),
+                3
+            );
+        }
+        unregister_publisher(&mut daemon, "txt._test._tcp.local.");
+        assert!(daemon.dns_registry_map[&index].active.is_empty());
     }
 
     /// Builds an interface address for the max packet size tests below.
