@@ -4205,6 +4205,23 @@ impl Zeroconf {
                     self.add_timer(t);
                 }
 
+                let hostname_is_shared = self.my_services.values().any(|service| {
+                    service
+                        .get_hostname()
+                        .eq_ignore_ascii_case(info.get_hostname())
+                });
+                for registry in self.dns_registry_map.values_mut() {
+                    let fullname = registry.resolve_name(info.get_fullname()).to_string();
+                    let hostname = registry.resolve_name(info.get_hostname()).to_string();
+                    registry.remove_service_records(
+                        info.get_fullname(),
+                        &fullname,
+                        info.get_hostname(),
+                        &hostname,
+                        hostname_is_shared,
+                    );
+                }
+
                 self.increase_counter(Counter::Unregister, 1);
                 UnregisterStatus::OK
             }
@@ -5393,13 +5410,16 @@ fn handle_expired_probes(
 
         // Move records to active and plan to wake up services if records are not empty.
         if !probe.records.is_empty() {
-            match dns_registry.active.get_mut(&name) {
-                Some(records) => {
-                    records.extend(probe.records);
+            let records = dns_registry.active.entry(name.clone()).or_default();
+            for record in probe.records {
+                let record_type = record.get_type();
+                if record_type == RRType::SRV || record_type == RRType::TXT {
+                    records.retain(|active| {
+                        active.get_type() != record_type
+                            || !active.get_name().eq_ignore_ascii_case(record.get_name())
+                    });
                 }
-                None => {
-                    dns_registry.active.insert(name, probe.records);
-                }
+                records.push(record);
             }
 
             waiting_services.extend(probe.waiting_services);
@@ -5456,21 +5476,23 @@ fn resolve_addr_to_index(if_kind: IfKind, interfaces: &[Interface]) -> IfKind {
 #[cfg(test)]
 mod tests {
     use super::{
-        _new_socket_bind, check_domain_suffix, check_service_name_length, hostname_change,
-        my_ip_interfaces, name_change, resolve_max_packet_size, send_dns_outgoing_impl,
-        valid_instance_name, valid_ip_on_intf, DaemonEvent, HostnameResolutionEvent, IfKind,
-        MaxPacketSizeSelection, MyIntf, SendConfig, ServiceDaemon, ServiceEvent, ServiceInfo,
-        GROUP_ADDR_V4, INITIAL_QUERY_DELAY_MAX_MILLIS, INITIAL_QUERY_DELAY_MIN_MILLIS,
-        MAX_PKT_ABSOLUTE_IPV6, MAX_PKT_DEFAULT, MDNS_PORT, MIN_MAX_PACKET_SIZE, RESOLVE_MAX_TRY,
-        SHARED_RESPONSE_DELAY_MAX_MILLIS, SHARED_RESPONSE_DELAY_MIN_MILLIS,
+        _new_socket_bind, check_domain_suffix, check_service_name_length, handle_expired_probes,
+        hostname_change, my_ip_interfaces, name_change, resolve_max_packet_size,
+        send_dns_outgoing_impl, valid_instance_name, valid_ip_on_intf, DaemonEvent,
+        HostnameResolutionEvent, IfKind, MaxPacketSizeSelection, MyIntf, SendConfig, ServiceDaemon,
+        ServiceEvent, ServiceInfo, GROUP_ADDR_V4, INITIAL_QUERY_DELAY_MAX_MILLIS,
+        INITIAL_QUERY_DELAY_MIN_MILLIS, MAX_PKT_ABSOLUTE_IPV6, MAX_PKT_DEFAULT, MDNS_PORT,
+        MIN_MAX_PACKET_SIZE, RESOLVE_MAX_TRY, SHARED_RESPONSE_DELAY_MAX_MILLIS,
+        SHARED_RESPONSE_DELAY_MIN_MILLIS,
     };
     use crate::{
         dns_parser::{
-            DnsAddress, DnsEntryExt, DnsIncoming, DnsOutgoing, DnsPointer, DnsSrv, InterfaceId,
-            RRType, ScopedIp, CLASS_IN, FLAGS_AA, FLAGS_QR_QUERY, FLAGS_QR_RESPONSE,
-            LEGACY_UNICAST_MAX_TTL,
+            DnsAddress, DnsEntryExt, DnsIncoming, DnsOutgoing, DnsPointer, DnsRecordExt, DnsSrv,
+            DnsTxt, InterfaceId, RRType, ScopedIp, CLASS_IN, FLAGS_AA, FLAGS_QR_QUERY,
+            FLAGS_QR_RESPONSE, LEGACY_UNICAST_MAX_TTL,
         },
         service_daemon::{add_answer_of_service, check_hostname},
+        service_info::{DnsRegistry, Probe},
     };
     use if_addrs::{IfAddr, Ifv4Addr, Ifv6Addr, Interface};
     use std::{
@@ -5480,6 +5502,102 @@ mod tests {
         time::{Duration, Instant, SystemTime},
     };
     use test_log::test;
+
+    #[test]
+    fn test_service_updates_replace_old_published_records_and_unregister_cleans_registry() {
+        let fullname = "cache._http._tcp.local.";
+        let hostname = "host.local.";
+        let mut registry = DnsRegistry::new();
+
+        let mut old_records = Vec::new();
+        for version in 0..1_000 {
+            old_records.push(
+                DnsSrv::new(fullname, CLASS_IN, 120, 0, 0, version, hostname.to_string()).boxed(),
+            );
+            old_records.push(
+                DnsTxt::new(
+                    fullname,
+                    CLASS_IN,
+                    4500,
+                    format!("version={version}").into_bytes(),
+                )
+                .boxed(),
+            );
+        }
+        registry.active.insert(fullname.to_string(), old_records);
+        registry.active.insert(
+            hostname.to_string(),
+            vec![DnsAddress::new(
+                hostname,
+                RRType::A,
+                CLASS_IN,
+                120,
+                IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)),
+                InterfaceId {
+                    name: "test0".to_string(),
+                    index: 1,
+                },
+            )
+            .boxed()],
+        );
+
+        let mut probe = Probe::new(Instant::now());
+        probe.waiting_services.insert(fullname.to_string());
+        for version in 1_000..2_000 {
+            probe.insert_record(
+                DnsSrv::new(fullname, CLASS_IN, 120, 0, 0, version, hostname.to_string()).boxed(),
+            );
+            probe.insert_record(
+                DnsTxt::new(
+                    fullname,
+                    CLASS_IN,
+                    4500,
+                    format!("version={version}").into_bytes(),
+                )
+                .boxed(),
+            );
+        }
+        assert_eq!(probe.records.len(), 2);
+        registry.probing.insert(fullname.to_string(), probe);
+
+        let waiting = handle_expired_probes(
+            vec![fullname.to_string()],
+            "test0",
+            &mut registry,
+            &mut Vec::new(),
+        );
+
+        assert_eq!(waiting, HashSet::from([fullname.to_string()]));
+        let active = &registry.active[fullname];
+        assert_eq!(active.len(), 2);
+        assert!(active.iter().any(|record| {
+            record
+                .any()
+                .downcast_ref::<DnsSrv>()
+                .is_some_and(|srv| srv.port() == 1_999)
+        }));
+        assert!(active.iter().any(|record| {
+            record
+                .any()
+                .downcast_ref::<DnsTxt>()
+                .is_some_and(|txt| txt.text() == b"version=1999")
+        }));
+
+        let mut pending = Probe::new(Instant::now());
+        pending.waiting_services.insert(fullname.to_string());
+        pending.insert_record(
+            DnsTxt::new(fullname, CLASS_IN, 4500, b"version=pending".to_vec()).boxed(),
+        );
+        registry.probing.insert(fullname.to_string(), pending);
+
+        registry.remove_service_records(fullname, fullname, hostname, hostname, true);
+        assert!(!registry.active.contains_key(fullname));
+        assert_eq!(registry.active[hostname].len(), 1);
+        assert!(!registry.probing.contains_key(fullname));
+
+        registry.remove_service_records(fullname, fullname, hostname, hostname, false);
+        assert!(!registry.active.contains_key(hostname));
+    }
 
     /// Builds an interface address for the max packet size tests below.
     fn test_interface(name: &str, index: u32, addr: IfAddr) -> Interface {

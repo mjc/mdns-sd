@@ -1048,6 +1048,16 @@ impl Probe {
 
     /// Add a new record with the same probing name in a sorted order.
     pub(crate) fn insert_record(&mut self, record: DnsRecordBox) {
+        // SRV and TXT records are unique to a service instance name. If that
+        // service is updated while its probe is pending, keep the latest
+        // value instead of retaining every value until the probe completes.
+        if record.get_type() == RRType::SRV || record.get_type() == RRType::TXT {
+            self.records.retain(|existing| {
+                existing.get_type() != record.get_type()
+                    || !existing.get_name().eq_ignore_ascii_case(record.get_name())
+            });
+        }
+
         /*
         RFC 6762: https://datatracker.ietf.org/doc/html/rfc6762#section-8.2.1
 
@@ -1236,6 +1246,59 @@ impl DnsRegistry {
             Some(new_name) => new_name,
             None => name,
         }
+    }
+
+    /// Retires the records and pending probes owned by an unregistered service.
+    /// Address records are shared by every service using the same hostname, so
+    /// callers preserve them while another local service still uses that host.
+    pub(crate) fn remove_service_records(
+        &mut self,
+        service_name: &str,
+        fullname: &str,
+        original_hostname: &str,
+        hostname: &str,
+        keep_hostname_records: bool,
+    ) {
+        let service_name = service_name.to_lowercase();
+        let fullname = fullname.to_lowercase();
+        let original_hostname = original_hostname.to_lowercase();
+        let hostname = hostname.to_lowercase();
+
+        self.active.retain(|_, records| {
+            records.retain(|record| {
+                let name = record.get_name();
+                let record_type = record.get_type();
+                let is_service_record = name.eq_ignore_ascii_case(&fullname)
+                    && (record_type == RRType::SRV || record_type == RRType::TXT);
+                let is_unshared_address = !keep_hostname_records
+                    && name.eq_ignore_ascii_case(&hostname)
+                    && (record_type == RRType::A || record_type == RRType::AAAA);
+                !is_service_record && !is_unshared_address
+            });
+            !records.is_empty()
+        });
+
+        self.probing.retain(|_, probe| {
+            probe
+                .waiting_services
+                .retain(|service| !service.eq_ignore_ascii_case(&service_name));
+            probe.records.retain(|record| {
+                let name = record.get_name();
+                let record_type = record.get_type();
+                let is_service_record = name.eq_ignore_ascii_case(&fullname)
+                    && (record_type == RRType::SRV || record_type == RRType::TXT);
+                let is_unshared_address = !keep_hostname_records
+                    && name.eq_ignore_ascii_case(&hostname)
+                    && (record_type == RRType::A || record_type == RRType::AAAA);
+                !is_service_record && !is_unshared_address
+            });
+            !probe.records.is_empty() || !probe.waiting_services.is_empty()
+        });
+
+        self.name_changes.retain(|original, _| {
+            !original.eq_ignore_ascii_case(&service_name)
+                && (keep_hostname_records || !original.eq_ignore_ascii_case(&original_hostname))
+        });
     }
 
     pub(crate) fn is_probing_done<T>(
