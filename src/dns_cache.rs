@@ -944,6 +944,85 @@ mod tests {
     }
 
     #[test]
+    fn test_bookkeeping_subtype_survives_other_subtype_removal() {
+        let intf = make_intf("en0", 1);
+        let mut cache = DnsCache::new();
+        let mut timers = Vec::new();
+        let instance = "printer._http._tcp.local.";
+        let first = "_print._sub._http._tcp.local.";
+        let second = "_scan._sub._http._tcp.local.";
+        for ty in [first, second, "_http._tcp.local."] {
+            cache.add_or_update(
+                &intf,
+                DnsPointer::new(ty, RRType::PTR, CLASS_IN, 120, instance.to_string()).boxed(),
+                &mut timers,
+                true,
+            );
+        }
+        assert_eq!(cache.subtype_count(), 1);
+        cache.remove_service_type(first);
+        assert_eq!(
+            cache.get_subtype(instance).map(String::as_str),
+            Some(second)
+        );
+        cache.remove_service_type(second);
+        assert!(cache.get_subtype(instance).is_none());
+        assert_eq!(cache.subtype_count(), 0);
+        assert_eq!(cache.ptr_count(), 1);
+    }
+
+    #[test]
+    fn test_bookkeeping_interface_removal_preserves_other_ptr_records() {
+        let first = make_intf("en0", 1);
+        let second = make_intf("en1", 2);
+        let mut cache = DnsCache::new();
+        let mut timers = Vec::new();
+        let instance = "printer._http._tcp.local.";
+        cache.add_or_update(
+            &first,
+            DnsPointer::new(
+                "_print._sub._http._tcp.local.",
+                RRType::PTR,
+                CLASS_IN,
+                120,
+                instance.to_string(),
+            )
+            .boxed(),
+            &mut timers,
+            true,
+        );
+        cache.add_or_update(
+            &second,
+            DnsPointer::new(
+                "_http._tcp.local.",
+                RRType::PTR,
+                CLASS_IN,
+                120,
+                instance.to_string(),
+            )
+            .boxed(),
+            &mut timers,
+            true,
+        );
+        cache.add_or_update(
+            &second,
+            DnsSrv::new(instance, CLASS_IN, 120, 0, 0, 80, "host.local.".to_string()).boxed(),
+            &mut timers,
+            true,
+        );
+        cache.add_or_update(
+            &second,
+            DnsTxt::new(instance, CLASS_IN, 120, vec![0]).boxed(),
+            &mut timers,
+            true,
+        );
+        cache.remove_records_on_intf(InterfaceId::from(&first));
+        assert_eq!(cache.ptr_count(), 1);
+        assert_eq!(cache.srv_count(), 1);
+        assert_eq!(cache.txt_count(), 1);
+        assert_eq!(cache.subtype_count(), 0);
+    }
+    #[test]
     fn test_bookkeeping_subtype_metadata_follows_surviving_ptrs() {
         let parent = "_http._tcp.local.";
         let subtype = "_print._sub._http._tcp.local.";
@@ -1221,84 +1300,5 @@ mod tests {
         let ptr = &cache.get_ptr(ty_domain).unwrap()[0].record;
         assert_eq!(ptr.get_expire(), ptr_expire - slept);
         assert_eq!(ptr.get_record().get_refresh_time(), ptr_refresh - slept);
-    }
-    #[test]
-    fn test_bookkeeping_subtype_survives_other_subtype_removal() {
-        let intf = make_intf("en0", 1);
-        let mut cache = DnsCache::new();
-        let mut timers = Vec::new();
-        let instance = "printer._http._tcp.local.";
-        let first = "_print._sub._http._tcp.local.";
-        let second = "_scan._sub._http._tcp.local.";
-        for ty in [first, second, "_http._tcp.local."] {
-            cache.add_or_update(
-                &intf,
-                DnsPointer::new(ty, RRType::PTR, CLASS_IN, 120, instance.to_string()).boxed(),
-                &mut timers,
-                true,
-            );
-        }
-        assert_eq!(cache.subtype_count(), 1);
-        cache.remove_service_type(first);
-        assert_eq!(
-            cache.get_subtype(instance).map(String::as_str),
-            Some(second)
-        );
-        cache.remove_service_type(second);
-        assert!(cache.get_subtype(instance).is_none());
-        assert_eq!(cache.subtype_count(), 0);
-        assert_eq!(cache.ptr_count(), 1);
-    }
-
-    #[test]
-    fn test_bookkeeping_interface_removal_preserves_other_ptr_records() {
-        let first = make_intf("en0", 1);
-        let second = make_intf("en1", 2);
-        let mut cache = DnsCache::new();
-        let mut timers = Vec::new();
-        let instance = "printer._http._tcp.local.";
-        cache.add_or_update(
-            &first,
-            DnsPointer::new(
-                "_print._sub._http._tcp.local.",
-                RRType::PTR,
-                CLASS_IN,
-                120,
-                instance.to_string(),
-            )
-            .boxed(),
-            &mut timers,
-            true,
-        );
-        cache.add_or_update(
-            &second,
-            DnsPointer::new(
-                "_http._tcp.local.",
-                RRType::PTR,
-                CLASS_IN,
-                120,
-                instance.to_string(),
-            )
-            .boxed(),
-            &mut timers,
-            true,
-        );
-        cache.add_or_update(
-            &second,
-            DnsSrv::new(instance, CLASS_IN, 120, 0, 0, 80, "host.local.".to_string()).boxed(),
-            &mut timers,
-            true,
-        );
-        cache.add_or_update(
-            &second,
-            DnsTxt::new(instance, CLASS_IN, 120, vec![0]).boxed(),
-            &mut timers,
-            true,
-        );
-        cache.remove_records_on_intf(InterfaceId::from(&first));
-        assert_eq!(cache.ptr_count(), 1);
-        assert_eq!(cache.srv_count(), 1);
-        assert_eq!(cache.txt_count(), 1);
-        assert_eq!(cache.subtype_count(), 0);
     }
 }
