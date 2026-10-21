@@ -388,55 +388,58 @@ impl DnsCache {
         now: Instant,
     ) -> HashMap<String, HashSet<String>> {
         let mut expired_instances = HashMap::new();
+        let mut expired_srv_instances = HashSet::new();
 
-        // Check all ty_domain in the cache by following all PTR records, regardless
-        // if the ty_domain is actively queried or not.
-        for (ty_domain, ptr_records) in self.ptr.iter_mut() {
+        // Each cache map owns records with independent TTLs. Expire SRV, TXT,
+        // and NSEC records directly rather than relying on a PTR to reference
+        // them; PTR answers may be absent from a valid response.
+        self.srv.retain(|instance_name, records| {
+            records.retain(|srv| !srv.record.get_record().is_expired(now));
+            if records.is_empty() {
+                expired_srv_instances.insert(instance_name.clone());
+                false
+            } else {
+                true
+            }
+        });
+
+        self.txt.retain(|_, records| {
+            records.retain(|txt| !txt.record.get_record().is_expired(now));
+            !records.is_empty()
+        });
+
+        self.nsec.retain(|_, records| {
+            records.retain(|nsec| !nsec.record.get_record().is_expired(now));
+            !records.is_empty()
+        });
+
+        // PTR records still provide the service type needed for removal
+        // notifications, but they no longer control expiration of other maps.
+        self.ptr.retain(|ty_domain, ptr_records| {
             for ptr in ptr_records.iter() {
                 if let Some(dns_ptr) = ptr.record.any().downcast_ref::<DnsPointer>() {
                     let instance_name = dns_ptr.alias();
-
-                    // evict expired SRV records of this instance
-                    if let Some(srv_records) = self.srv.get_mut(instance_name) {
-                        srv_records.retain(|srv| {
-                            let expired = srv.record.get_record().is_expired(now);
-                            !expired
-                        });
-
-                        if srv_records.is_empty() {
-                            debug!("expired SRV for {}: {:?}", ty_domain, instance_name);
-                            expired_instances
-                                .entry(ty_domain.to_string())
-                                .or_insert_with(HashSet::new)
-                                .insert(instance_name.to_string());
-
-                            // don't keep empty value for this key.
-                            self.srv.remove(instance_name);
-                        }
+                    if expired_srv_instances.contains(instance_name) {
+                        debug!("expired SRV for {}: {:?}", ty_domain, instance_name);
+                        expired_instances
+                            .entry(ty_domain.clone())
+                            .or_insert_with(HashSet::new)
+                            .insert(instance_name.to_string());
                     }
 
-                    // evict expired TXT records of this instance
-                    if let Some(txt_records) = self.txt.get_mut(instance_name) {
-                        txt_records.retain(|txt| !txt.record.get_record().is_expired(now))
+                    if ptr.record.get_record().is_expired(now) {
+                        trace!("expired PTR: domain:{ty_domain} record: {:?}", dns_ptr);
+                        expired_instances
+                            .entry(ty_domain.clone())
+                            .or_insert_with(HashSet::new)
+                            .insert(instance_name.to_string());
                     }
                 }
             }
 
-            // evict expired PTR records
-            ptr_records.retain(|x| {
-                let expired = x.record.get_record().is_expired(now);
-                if expired {
-                    if let Some(dns_ptr) = x.record.any().downcast_ref::<DnsPointer>() {
-                        trace!("expired PTR: domain:{ty_domain} record: {:?}", dns_ptr);
-                        expired_instances
-                            .entry(ty_domain.to_string())
-                            .or_insert_with(HashSet::new)
-                            .insert(dns_ptr.alias().to_string());
-                    }
-                }
-                !expired
-            });
-        }
+            ptr_records.retain(|ptr| !ptr.record.get_record().is_expired(now));
+            !ptr_records.is_empty()
+        });
 
         expired_instances
     }
@@ -902,7 +905,9 @@ fn apply_cache_flush(
 mod tests {
     use super::*;
     use crate::{
-        dns_parser::{DnsAddress, DnsPointer, DnsRecordExt, DnsSrv, DnsTxt, RRType, CLASS_IN},
+        dns_parser::{
+            DnsAddress, DnsNSec, DnsPointer, DnsRecordExt, DnsSrv, DnsTxt, RRType, CLASS_IN,
+        },
         service_info::MyIntf,
         MAX_PKT_DEFAULT,
     };
@@ -1129,5 +1134,63 @@ mod tests {
         let ptr = &cache.get_ptr(ty_domain).unwrap()[0].record;
         assert_eq!(ptr.get_expire(), ptr_expire - slept);
         assert_eq!(ptr.get_record().get_refresh_time(), ptr_refresh - slept);
+    }
+
+    #[test]
+    fn test_evict_expired_srv_txt_and_nsec_without_ptr_records() {
+        let intf = make_intf("en0", 1);
+        let mut cache = DnsCache::new();
+        let mut timers = Vec::new();
+
+        for version in 0..100 {
+            let instance = format!("service-{version}._http._tcp.local.");
+            cache.add_or_update(
+                &intf,
+                DnsSrv::new(
+                    &instance,
+                    CLASS_IN,
+                    1,
+                    0,
+                    0,
+                    80,
+                    format!("host-{version}.local."),
+                )
+                .boxed(),
+                &mut timers,
+                true,
+            );
+            cache.add_or_update(
+                &intf,
+                DnsTxt::new(
+                    &instance,
+                    CLASS_IN,
+                    1,
+                    format!("version={version}").into_bytes(),
+                )
+                .boxed(),
+                &mut timers,
+                true,
+            );
+            cache.add_or_update(
+                &intf,
+                DnsNSec::new(&instance, CLASS_IN, 1, instance.clone(), vec![0]).boxed(),
+                &mut timers,
+                true,
+            );
+        }
+
+        assert_eq!(cache.srv_count(), 100);
+        assert_eq!(cache.txt_count(), 100);
+        assert_eq!(cache.nsec_count(), 100);
+        assert!(cache.ptr.is_empty());
+
+        cache.evict_expired_services(Instant::now() + Duration::from_secs(2));
+
+        assert_eq!(cache.srv_count(), 0);
+        assert_eq!(cache.txt_count(), 0);
+        assert_eq!(cache.nsec_count(), 0);
+        assert!(cache.srv.is_empty());
+        assert!(cache.txt.is_empty());
+        assert!(cache.nsec.is_empty());
     }
 }
