@@ -64,9 +64,6 @@ pub(crate) struct DnsCache {
     /// DnsAddr records indexed by the hostname in lowercase.
     addr: HashMap<String, Vec<DnsRecordIntf>>,
 
-    /// A reverse lookup table from "instance fullname" to "subtype PTR name"
-    subtype: HashMap<String, String>,
-
     /// Negative responses:
     /// A map from "instance fullname" to DnsNSec.
     nsec: HashMap<String, Vec<DnsRecordIntf>>,
@@ -79,7 +76,6 @@ impl DnsCache {
             srv: HashMap::new(),
             txt: HashMap::new(),
             addr: HashMap::new(),
-            subtype: HashMap::new(),
             nsec: HashMap::new(),
         }
     }
@@ -110,7 +106,10 @@ impl DnsCache {
     }
 
     pub(crate) fn subtype_count(&self) -> usize {
-        self.subtype.len()
+        self.subtype_ptrs()
+            .map(|(_, ptr)| ptr.alias())
+            .collect::<HashSet<_>>()
+            .len()
     }
 
     pub(crate) fn get_ptr(&self, ty_domain: &str) -> Option<&Vec<DnsRecordIntf>> {
@@ -129,9 +128,43 @@ impl DnsCache {
         self.addr.get(&hostname.to_lowercase())
     }
 
-    /// A reverse lookup table from "instance fullname" to "subtype PTR name"
+    /// Returns a subtype from a surviving PTR record for this instance.
     pub(crate) fn get_subtype(&self, fullname: &str) -> Option<&String> {
-        self.subtype.get(fullname)
+        self.subtype_ptrs()
+            .filter(|(_, ptr)| ptr.alias().eq_ignore_ascii_case(fullname))
+            .map(|(name, _)| name)
+            .min()
+    }
+
+    /// Derives subtype metadata from the records that own it.
+    fn subtype_ptrs(&self) -> impl Iterator<Item = (&String, &DnsPointer)> {
+        let now = Instant::now();
+        self.ptr
+            .iter()
+            .filter(|(name, _)| split_sub_domain(name).1.is_some())
+            .flat_map(move |(name, records)| {
+                records
+                    .iter()
+                    .filter(move |record| !record.record.get_record().is_expired(now))
+                    .filter_map(move |record| {
+                        record
+                            .record
+                            .any()
+                            .downcast_ref::<DnsPointer>()
+                            .map(|ptr| (name, ptr))
+                    })
+            })
+    }
+
+    /// Checks whether any cached PTR still refers to this instance.
+    fn has_ptr_for_instance(&self, instance: &str) -> bool {
+        self.ptr.values().flatten().any(|record| {
+            record
+                .record
+                .any()
+                .downcast_ref::<DnsPointer>()
+                .is_some_and(|ptr| ptr.alias().eq_ignore_ascii_case(instance))
+        })
     }
 
     /// Returns the list of instances that has `host` as its hostname.
@@ -231,20 +264,6 @@ impl DnsCache {
         is_for_us: bool,
     ) -> Option<(&DnsRecordIntf, bool)> {
         let entry_name = incoming.get_name().to_string();
-
-        // If it is PTR with subtype, store a mapping from the instance fullname
-        // to the subtype in this cache.
-        if incoming.get_type() == RRType::PTR && is_for_us {
-            let (_, subtype_opt) = split_sub_domain(&entry_name);
-            if let Some(subtype) = subtype_opt {
-                if let Some(ptr) = incoming.any().downcast_ref::<DnsPointer>() {
-                    if !self.subtype.contains_key(ptr.alias()) {
-                        self.subtype
-                            .insert(ptr.alias().to_string(), subtype.to_string());
-                    }
-                }
-            }
-        }
 
         // Look up the existing records without creating an entry yet.
         let entry_name_lower = entry_name.to_lowercase();
@@ -444,7 +463,7 @@ impl DnsCache {
     /// Removes all records of a service type: PTR, SRV, TXT records and any ADDR records
     /// that are not referenced by any SRV record.
     pub(crate) fn remove_service_type(&mut self, ty_domain: &str) {
-        let Some(ptr_records) = self.ptr.get_mut(ty_domain) else {
+        let Some(ptr_records) = self.ptr.remove(ty_domain) else {
             return;
         };
 
@@ -453,6 +472,9 @@ impl DnsCache {
         for ptr in ptr_records.iter() {
             if let Some(dns_ptr) = ptr.record.any().downcast_ref::<DnsPointer>() {
                 let instance_name = dns_ptr.alias();
+                if self.has_ptr_for_instance(instance_name) {
+                    continue;
+                }
 
                 // collect all hostnames from SRV records of this instance
                 if let Some(srv_records) = self.srv.get_mut(instance_name) {
@@ -470,8 +492,6 @@ impl DnsCache {
                 self.txt.remove(instance_name);
             }
         }
-
-        self.ptr.remove(ty_domain);
 
         // Check all hostnames in `hosts`: for each hostname, check if any SRV record
         // has `hostname` as its host. If no such SRV, remove the ADDR records of this hostname.
@@ -785,7 +805,11 @@ impl DnsCache {
         self.ptr.retain(|_, records| !records.is_empty());
 
         // Clean up SRV and TXT records for fully removed instances.
-        let all_removed: HashSet<&String> = removed_instances.values().flatten().collect();
+        let all_removed: HashSet<&String> = removed_instances
+            .values()
+            .flatten()
+            .filter(|instance| !self.has_ptr_for_instance(instance))
+            .collect();
         self.srv
             .retain(|instance, _| !all_removed.contains(instance));
         self.txt
@@ -916,6 +940,74 @@ mod tests {
             addrs: HashSet::new(),
             max_packet_size_v4: MAX_PKT_DEFAULT,
             max_packet_size_v6: MAX_PKT_DEFAULT,
+        }
+    }
+
+    #[test]
+    fn test_bookkeeping_subtype_metadata_follows_surviving_ptrs() {
+        let parent = "_http._tcp.local.";
+        let subtype = "_print._sub._http._tcp.local.";
+        let intf = make_intf("en0", 1);
+        let other_intf = make_intf("en1", 2);
+        for cleanup in ["expiry", "record", "browse", "interface"] {
+            let mut cache = DnsCache::new();
+            let mut timers = Vec::new();
+            let mut records = Vec::new();
+            for version in 0..100 {
+                let instance = format!("instance-{version}.{parent}");
+                let ptr =
+                    DnsPointer::new(subtype, RRType::PTR, CLASS_IN, 1, instance.clone()).boxed();
+                records.push(ptr.clone());
+                cache.add_or_update(&intf, ptr, &mut timers, true);
+                cache.add_or_update(
+                    &other_intf,
+                    DnsPointer::new(parent, RRType::PTR, CLASS_IN, 120, instance.clone()).boxed(),
+                    &mut timers,
+                    true,
+                );
+                assert_eq!(
+                    cache.get_subtype(&instance).map(String::as_str),
+                    Some(subtype)
+                );
+            }
+            assert_eq!(cache.subtype_count(), 100);
+            match cleanup {
+                "expiry" => {
+                    cache.evict_expired_services(Instant::now() + Duration::from_secs(2));
+                }
+                "record" => {
+                    for record in records {
+                        assert!(cache.remove(&record));
+                    }
+                }
+                "browse" => cache.remove_service_type(subtype),
+                "interface" => {
+                    cache.remove_records_on_intf(InterfaceId {
+                        name: "en0".to_string(),
+                        index: 1,
+                    });
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(cache.ptr_count(), 100, "parent PTRs must survive {cleanup}");
+            assert_eq!(cache.subtype_count(), 0, "{cleanup}");
+            assert!(
+                cache.get_subtype(&format!("instance-0.{parent}")).is_none(),
+                "{}",
+                cleanup
+            );
+            let replacement = "_scan._sub._http._tcp.local.";
+            let instance = format!("instance-0.{parent}");
+            cache.add_or_update(
+                &intf,
+                DnsPointer::new(replacement, RRType::PTR, CLASS_IN, 120, instance.clone()).boxed(),
+                &mut timers,
+                true,
+            );
+            assert_eq!(
+                cache.get_subtype(&instance).map(String::as_str),
+                Some(replacement)
+            );
         }
     }
 
@@ -1129,5 +1221,84 @@ mod tests {
         let ptr = &cache.get_ptr(ty_domain).unwrap()[0].record;
         assert_eq!(ptr.get_expire(), ptr_expire - slept);
         assert_eq!(ptr.get_record().get_refresh_time(), ptr_refresh - slept);
+    }
+    #[test]
+    fn test_bookkeeping_subtype_survives_other_subtype_removal() {
+        let intf = make_intf("en0", 1);
+        let mut cache = DnsCache::new();
+        let mut timers = Vec::new();
+        let instance = "printer._http._tcp.local.";
+        let first = "_print._sub._http._tcp.local.";
+        let second = "_scan._sub._http._tcp.local.";
+        for ty in [first, second, "_http._tcp.local."] {
+            cache.add_or_update(
+                &intf,
+                DnsPointer::new(ty, RRType::PTR, CLASS_IN, 120, instance.to_string()).boxed(),
+                &mut timers,
+                true,
+            );
+        }
+        assert_eq!(cache.subtype_count(), 1);
+        cache.remove_service_type(first);
+        assert_eq!(
+            cache.get_subtype(instance).map(String::as_str),
+            Some(second)
+        );
+        cache.remove_service_type(second);
+        assert!(cache.get_subtype(instance).is_none());
+        assert_eq!(cache.subtype_count(), 0);
+        assert_eq!(cache.ptr_count(), 1);
+    }
+
+    #[test]
+    fn test_bookkeeping_interface_removal_preserves_other_ptr_records() {
+        let first = make_intf("en0", 1);
+        let second = make_intf("en1", 2);
+        let mut cache = DnsCache::new();
+        let mut timers = Vec::new();
+        let instance = "printer._http._tcp.local.";
+        cache.add_or_update(
+            &first,
+            DnsPointer::new(
+                "_print._sub._http._tcp.local.",
+                RRType::PTR,
+                CLASS_IN,
+                120,
+                instance.to_string(),
+            )
+            .boxed(),
+            &mut timers,
+            true,
+        );
+        cache.add_or_update(
+            &second,
+            DnsPointer::new(
+                "_http._tcp.local.",
+                RRType::PTR,
+                CLASS_IN,
+                120,
+                instance.to_string(),
+            )
+            .boxed(),
+            &mut timers,
+            true,
+        );
+        cache.add_or_update(
+            &second,
+            DnsSrv::new(instance, CLASS_IN, 120, 0, 0, 80, "host.local.".to_string()).boxed(),
+            &mut timers,
+            true,
+        );
+        cache.add_or_update(
+            &second,
+            DnsTxt::new(instance, CLASS_IN, 120, vec![0]).boxed(),
+            &mut timers,
+            true,
+        );
+        cache.remove_records_on_intf(InterfaceId::from(&first));
+        assert_eq!(cache.ptr_count(), 1);
+        assert_eq!(cache.srv_count(), 1);
+        assert_eq!(cache.txt_count(), 1);
+        assert_eq!(cache.subtype_count(), 0);
     }
 }

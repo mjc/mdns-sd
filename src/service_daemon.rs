@@ -1464,7 +1464,31 @@ impl Zeroconf {
     fn remove_service_subscription(&mut self, ty_domain: &str) -> Option<Sender<ServiceEvent>> {
         let sender = self.service_queriers.remove(ty_domain);
         self.clear_service_retransmissions(ty_domain);
+        self.retain_resolved_services();
         sender
+    }
+
+    /// Drops resolution state after the last subscribed PTR or usable SRV disappears.
+    fn retain_resolved_services(&mut self) {
+        let now = Instant::now();
+        let cache = &self.cache;
+        let referenced: HashSet<&str> = cache
+            .all_ptr()
+            .iter()
+            .filter(|(ty, _)| self.service_queriers.contains_key(*ty))
+            .flat_map(|(_, records)| records)
+            .filter(|record| !record.record.get_record().is_expired(now))
+            .filter_map(|record| record.record.any().downcast_ref::<DnsPointer>())
+            .map(DnsPointer::alias)
+            .collect();
+        self.resolved.retain(|instance| {
+            referenced.contains(instance.as_str())
+                && cache.get_srv(instance).is_some_and(|records| {
+                    records
+                        .iter()
+                        .any(|record| !record.record.get_record().is_expired(now))
+                })
+        });
     }
 
     fn remove_hostname_subscription(
@@ -3170,6 +3194,7 @@ impl Zeroconf {
 
         // remove records that are expired.
         let mut removed_ptrs = Vec::new();
+        let mut records_removed = false;
         let mut record_predicate = |record: &DnsRecordBox| {
             if !record.get_record().is_expired(now) {
                 return true;
@@ -3177,6 +3202,7 @@ impl Zeroconf {
 
             debug!("record is expired, removing it from cache.");
             if self.cache.remove(record) {
+                records_removed = true;
                 // for PTR records, send event to listeners
                 if let Some(dns_ptr) = record.any().downcast_ref::<DnsPointer>() {
                     removed_ptrs
@@ -3190,6 +3216,10 @@ impl Zeroconf {
         msg.additionals_mut().retain(&mut record_predicate);
         for (name, alias) in removed_ptrs {
             self.push_service(&name, ServiceEvent::ServiceRemoved(name.clone(), alias));
+        }
+
+        if records_removed {
+            self.retain_resolved_services();
         }
 
         // check possible conflicts and handle them.
@@ -3544,6 +3574,7 @@ impl Zeroconf {
             );
             self.notify_service_removal(removed_instances);
         }
+        self.retain_resolved_services();
     }
 
     /// Handle incoming query packets, figure out whether and what to respond.
@@ -3856,6 +3887,7 @@ impl Zeroconf {
                 }
             }
         }
+        self.retain_resolved_services();
     }
 
     /// The entry point that executes all commands received by the daemon.
@@ -5466,8 +5498,8 @@ mod tests {
     };
     use crate::{
         dns_parser::{
-            DnsAddress, DnsEntryExt, DnsIncoming, DnsOutgoing, DnsPointer, DnsSrv, InterfaceId,
-            RRType, ScopedIp, CLASS_IN, FLAGS_AA, FLAGS_QR_QUERY, FLAGS_QR_RESPONSE,
+            DnsAddress, DnsEntryExt, DnsIncoming, DnsOutgoing, DnsPointer, DnsSrv, DnsTxt,
+            InterfaceId, RRType, ScopedIp, CLASS_IN, FLAGS_AA, FLAGS_QR_QUERY, FLAGS_QR_RESPONSE,
             LEGACY_UNICAST_MAX_TTL,
         },
         service_daemon::{add_answer_of_service, check_hostname},
@@ -8141,5 +8173,198 @@ mod tests {
             receiver_b.try_recv(),
             Ok(HostnameResolutionEvent::SearchStarted(_))
         ));
+    }
+    fn discovery_test_daemon() -> (super::Zeroconf, u32) {
+        let daemon = new_test_zeroconf();
+        let index = daemon
+            .my_intfs
+            .values()
+            .find(|intf| {
+                intf.addrs
+                    .iter()
+                    .any(|addr| addr.ip() == IpAddr::V4(Ipv4Addr::LOCALHOST))
+            })
+            .unwrap()
+            .index;
+        (daemon, index)
+    }
+
+    /// Feeds a complete service response through the DNS parser and receive handler.
+    fn receive_discovery(
+        daemon: &mut super::Zeroconf,
+        index: u32,
+        instance: &str,
+        ptrs: &[(&str, u32)],
+        srv_ttl: u32,
+    ) {
+        let host = format!("{}.local.", instance.split('.').next().unwrap());
+        let mut out = DnsOutgoing::new(FLAGS_QR_RESPONSE | FLAGS_AA);
+        for (ty, ttl) in ptrs {
+            out.add_answer_record(DnsPointer::new(
+                ty,
+                RRType::PTR,
+                CLASS_IN,
+                *ttl,
+                instance.to_string(),
+            ));
+        }
+        out.add_answer_record(DnsSrv::new(
+            instance,
+            CLASS_IN,
+            srv_ttl,
+            0,
+            0,
+            8080,
+            host.clone(),
+        ));
+        out.add_answer_record(DnsTxt::new(instance, CLASS_IN, 120, vec![0]));
+        let interface = InterfaceId::from(&daemon.my_intfs[&index]);
+        out.add_answer_record(DnsAddress::new(
+            &host,
+            RRType::A,
+            CLASS_IN,
+            120,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            interface.clone(),
+        ));
+        for packet in out.to_data_on_wire(MAX_PKT_DEFAULT, true) {
+            let msg = DnsIncoming::new(packet, interface.clone()).unwrap();
+            daemon.handle_response(msg, index);
+        }
+    }
+
+    #[test]
+    fn test_bookkeeping_resolved_batches_expire() {
+        let (mut daemon, index) = discovery_test_daemon();
+        let ty = "_test._tcp.local.";
+        let (sender, _receiver) = flume::unbounded();
+        daemon.service_queriers.insert(ty.to_string(), sender);
+        for batch in 0..2 {
+            for version in 0..100 {
+                receive_discovery(
+                    &mut daemon,
+                    index,
+                    &format!("batch-{batch}-{version}.{ty}"),
+                    &[(ty, 2)],
+                    2,
+                );
+            }
+            assert_eq!(daemon.resolved.len(), 100);
+            let expiry = Instant::now() + Duration::from_secs(121);
+            let removed = daemon.cache.evict_expired_services(expiry);
+            daemon.cache.evict_expired_addr(expiry);
+            daemon.notify_service_removal(removed);
+            assert_eq!(daemon.cache.ptr_count(), 0);
+            assert_eq!(daemon.cache.srv_count(), 0);
+            assert_eq!(daemon.cache.txt_count(), 0);
+            assert_eq!(daemon.cache.addr_count(), 0);
+            assert!(daemon.resolved.is_empty());
+        }
+        daemon.exec_command_stop_browse(ty.to_string());
+        assert!(daemon.service_queriers.is_empty());
+        assert!(daemon.resolved.is_empty());
+    }
+
+    #[test]
+    fn test_bookkeeping_stop_browse_preserves_other_ptr_subscription() {
+        let ty = "_test._tcp.local.";
+        let subtype = "_print._sub._test._tcp.local.";
+        for (first, second) in [(ty, subtype), (subtype, ty)] {
+            let (mut daemon, index) = discovery_test_daemon();
+            let (sender, _receiver) = flume::unbounded();
+            daemon
+                .service_queriers
+                .insert(ty.to_string(), sender.clone());
+            daemon.service_queriers.insert(subtype.to_string(), sender);
+            let instance = format!("shared.{ty}");
+            receive_discovery(
+                &mut daemon,
+                index,
+                &instance,
+                &[(ty, 120), (subtype, 120)],
+                120,
+            );
+            assert!(daemon.resolved.contains(&instance));
+            daemon.exec_command_stop_browse(first.to_string());
+            assert!(daemon.resolved.contains(&instance));
+            assert_eq!(daemon.cache.srv_count(), 1);
+            assert_eq!(daemon.cache.txt_count(), 1);
+            assert_eq!(daemon.cache.addr_count(), 1);
+            daemon.exec_command_stop_browse(second.to_string());
+            assert!(daemon.resolved.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_bookkeeping_expiry_preserves_other_ptr_relationship() {
+        let ty = "_test._tcp.local.";
+        let subtype = "_print._sub._test._tcp.local.";
+        for (short, long) in [(ty, subtype), (subtype, ty)] {
+            let (mut daemon, index) = discovery_test_daemon();
+            let (sender, _receiver) = flume::unbounded();
+            daemon
+                .service_queriers
+                .insert(ty.to_string(), sender.clone());
+            daemon.service_queriers.insert(subtype.to_string(), sender);
+            let instance = format!("shared.{ty}");
+            receive_discovery(
+                &mut daemon,
+                index,
+                &instance,
+                &[(short, 2), (long, 120)],
+                120,
+            );
+            let removed = daemon
+                .cache
+                .evict_expired_services(Instant::now() + Duration::from_secs(3));
+            daemon.notify_service_removal(removed);
+            assert!(daemon.resolved.contains(&instance));
+            assert_eq!(daemon.cache.ptr_count(), 1);
+            daemon.exec_command_stop_browse(long.to_string());
+            assert!(daemon.resolved.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_bookkeeping_srv_expiry_and_interface_removal() {
+        let ty = "_test._tcp.local.";
+        for remove_interface in [false, true] {
+            let (mut daemon, index) = discovery_test_daemon();
+            let (sender, _receiver) = flume::unbounded();
+            daemon.service_queriers.insert(ty.to_string(), sender);
+            let instance = format!("instance.{ty}");
+            receive_discovery(&mut daemon, index, &instance, &[(ty, 120)], 2);
+            assert!(daemon.resolved.contains(&instance));
+            let removed = if remove_interface {
+                let interface = InterfaceId::from(&daemon.my_intfs[&index]);
+                daemon
+                    .cache
+                    .remove_records_on_intf(interface)
+                    .removed_instances
+            } else {
+                daemon
+                    .cache
+                    .evict_expired_services(Instant::now() + Duration::from_secs(3))
+            };
+            daemon.notify_service_removal(removed);
+            assert!(daemon.resolved.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_bookkeeping_failed_delivery_releases_resolved_state() {
+        let (mut daemon, index) = discovery_test_daemon();
+        let ty = "_test._tcp.local.";
+        let (sender, _receiver) = flume::bounded(0);
+        daemon.service_queriers.insert(ty.to_string(), sender);
+        receive_discovery(
+            &mut daemon,
+            index,
+            &format!("blocked.{ty}"),
+            &[(ty, 120)],
+            120,
+        );
+        assert!(daemon.service_queriers.is_empty());
+        assert!(daemon.resolved.is_empty());
     }
 }
