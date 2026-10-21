@@ -1325,13 +1325,15 @@ impl DnsRegistry {
             .get(answer.get_name())
             .is_some_and(|records| records.iter().any(&matches_answer))
         {
-            if let Some(probe) = self.probing.get_mut(answer.get_name()) {
-                probe.records.retain(|pending| {
-                    pending.get_type() != answer.get_type()
-                        || !pending.get_name().eq_ignore_ascii_case(answer.get_name())
-                });
-                if probe.records.is_empty() {
-                    self.probing.remove(answer.get_name());
+            if answer.get_type() == RRType::SRV || answer.get_type() == RRType::TXT {
+                if let Some(probe) = self.probing.get_mut(answer.get_name()) {
+                    probe.records.retain(|pending| {
+                        pending.get_type() != answer.get_type()
+                            || !pending.get_name().eq_ignore_ascii_case(answer.get_name())
+                    });
+                    if probe.records.is_empty() {
+                        self.probing.remove(answer.get_name());
+                    }
                 }
             }
             return true;
@@ -1606,6 +1608,50 @@ mod tests {
     use if_addrs::{IfAddr, IfOperStatus, Ifv4Addr, Ifv6Addr, Interface};
     use std::net::{Ipv4Addr, Ipv6Addr};
     use std::time::Duration;
+
+    #[test]
+    fn test_active_address_preserves_other_pending_addresses() {
+        use crate::dns_parser::{DnsAddress, DnsRecordExt};
+        use crate::InterfaceId;
+        for (first, second, rr_type) in [
+            ("127.0.0.1", "127.0.0.2", RRType::A),
+            ("2001:db8::1", "2001:db8::2", RRType::AAAA),
+        ] {
+            let hostname = "shared.local.";
+            let interface = InterfaceId {
+                name: "test".to_string(),
+                index: 1,
+            };
+            let active = DnsAddress::new(
+                hostname,
+                rr_type,
+                CLASS_IN,
+                120,
+                first.parse().unwrap(),
+                interface.clone(),
+            );
+            let pending = DnsAddress::new(
+                hostname,
+                rr_type,
+                CLASS_IN,
+                120,
+                second.parse().unwrap(),
+                interface,
+            );
+            let mut registry = DnsRegistry::new();
+            registry
+                .active
+                .insert(hostname.to_string(), vec![active.clone().boxed()]);
+            assert!(!registry.is_probing_done(
+                &pending,
+                "second._test._tcp.local.",
+                Instant::now()
+            ));
+            assert!(registry.is_probing_done(&active, "first._test._tcp.local.", Instant::now()));
+            assert_eq!(registry.probing[hostname].records.len(), 1);
+            assert!(pending.matches(registry.probing[hostname].records[0].as_ref()));
+        }
+    }
 
     /// RFC 6762 section 6: the same record must not be multicast on an
     /// interface more than once per second, but is allowed again after a
