@@ -460,8 +460,8 @@ impl DnsCache {
         expired_instances
     }
 
-    /// Removes all records of a service type: PTR, SRV, TXT records and any ADDR records
-    /// that are not referenced by any SRV record.
+    /// Removes a service type's PTRs and service records no remaining PTR references.
+    /// Address records remain while an SRV record still references their host.
     pub(crate) fn remove_service_type(&mut self, ty_domain: &str) {
         let Some(ptr_records) = self.ptr.remove(ty_domain) else {
             return;
