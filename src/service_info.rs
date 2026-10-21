@@ -1046,7 +1046,7 @@ impl Probe {
         }
     }
 
-    /// Add a new record with the same probing name in a sorted order.
+    /// Adds a probe record, replacing pending SRV/TXT data for the same owner name.
     pub(crate) fn insert_record(&mut self, record: DnsRecordBox) {
         // SRV and TXT records are unique to a service instance name. If that
         // service is updated while its probe is pending, keep the latest

@@ -4159,6 +4159,7 @@ impl Zeroconf {
         }
     }
 
+    /// Sends goodbye announcements and retires the service's per-interface registry state.
     fn exec_command_unregister(
         &mut self,
         repeating: bool,
@@ -4205,14 +4206,12 @@ impl Zeroconf {
                     self.add_timer(t);
                 }
 
-                let hostname_is_shared = self.my_services.values().any(|service| {
-                    service
-                        .get_hostname()
-                        .eq_ignore_ascii_case(info.get_hostname())
-                });
+                let remaining_services: Vec<&ServiceInfo> = self.my_services.values().collect();
                 for registry in self.dns_registry_map.values_mut() {
                     let fullname = registry.resolve_name(info.get_fullname()).to_string();
                     let hostname = registry.resolve_name(info.get_hostname()).to_string();
+                    let hostname_is_shared =
+                        hostname_is_shared(registry, &hostname, remaining_services.iter().copied());
                     registry.remove_service_records(
                         info.get_fullname(),
                         &fullname,
@@ -5473,14 +5472,27 @@ fn resolve_addr_to_index(if_kind: IfKind, interfaces: &[Interface]) -> IfKind {
     if_kind
 }
 
+/// Checks hostname sharing after applying the name conflict resolution for an interface.
+fn hostname_is_shared<'a>(
+    registry: &DnsRegistry,
+    hostname: &str,
+    services: impl Iterator<Item = &'a ServiceInfo>,
+) -> bool {
+    services.into_iter().any(|service| {
+        registry
+            .resolve_name(service.get_hostname())
+            .eq_ignore_ascii_case(hostname)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         _new_socket_bind, check_domain_suffix, check_service_name_length, handle_expired_probes,
-        hostname_change, my_ip_interfaces, name_change, resolve_max_packet_size,
-        send_dns_outgoing_impl, valid_instance_name, valid_ip_on_intf, DaemonEvent,
-        HostnameResolutionEvent, IfKind, MaxPacketSizeSelection, MyIntf, SendConfig, ServiceDaemon,
-        ServiceEvent, ServiceInfo, GROUP_ADDR_V4, INITIAL_QUERY_DELAY_MAX_MILLIS,
+        hostname_change, hostname_is_shared, my_ip_interfaces, name_change,
+        resolve_max_packet_size, send_dns_outgoing_impl, valid_instance_name, valid_ip_on_intf,
+        DaemonEvent, HostnameResolutionEvent, IfKind, MaxPacketSizeSelection, MyIntf, SendConfig,
+        ServiceDaemon, ServiceEvent, ServiceInfo, GROUP_ADDR_V4, INITIAL_QUERY_DELAY_MAX_MILLIS,
         INITIAL_QUERY_DELAY_MIN_MILLIS, MAX_PKT_ABSOLUTE_IPV6, MAX_PKT_DEFAULT, MDNS_PORT,
         MIN_MAX_PACKET_SIZE, RESOLVE_MAX_TRY, SHARED_RESPONSE_DELAY_MAX_MILLIS,
         SHARED_RESPONSE_DELAY_MIN_MILLIS,
@@ -5597,6 +5609,30 @@ mod tests {
 
         registry.remove_service_records(fullname, fullname, hostname, hostname, false);
         assert!(!registry.active.contains_key(hostname));
+    }
+
+    #[test]
+    fn test_unregistration_detects_shared_effective_hostname() {
+        let mut registry = DnsRegistry::new();
+        registry
+            .name_changes
+            .insert("host.local.".to_string(), "host-2.local.".to_string());
+        let remaining_service = ServiceInfo::new(
+            "_http._tcp.local.",
+            "remaining",
+            "host-2.local.",
+            "192.168.1.11",
+            80,
+            std::collections::HashMap::<String, String>::new(),
+        )
+        .unwrap();
+
+        let effective_hostname = registry.resolve_name("host.local.");
+        assert!(hostname_is_shared(
+            &registry,
+            effective_hostname,
+            std::iter::once(&remaining_service),
+        ));
     }
 
     /// Builds an interface address for the max packet size tests below.
