@@ -1397,6 +1397,26 @@ fn same_resolution(left: &ResolvedService, right: &ResolvedService) -> bool {
         && left.sub_ty_domain == right.sub_ty_domain
 }
 
+fn merge_scoped_address(addresses: &mut HashSet<ScopedIp>, incoming: ScopedIp) {
+    if let ScopedIp::V4(v4) = &incoming {
+        if let Some(mut existing) = addresses
+            .iter()
+            .find(|addr| addr.to_ip_addr() == incoming.to_ip_addr())
+            .cloned()
+        {
+            addresses.remove(&existing);
+            if let ScopedIp::V4(value) = &mut existing {
+                for id in v4.interface_ids() {
+                    value.add_interface_id(id.clone());
+                }
+            }
+            addresses.insert(existing);
+            return;
+        }
+    }
+    addresses.insert(incoming);
+}
+
 fn schedule_register_resend(
     retransmissions: &mut Vec<ReRun>,
     fullname: &str,
@@ -3372,49 +3392,40 @@ impl Zeroconf {
         }
     }
 
-    /// Sends out a list of `questions` (i.e. DNS questions) via multicast.
-    fn send_query_vec(&self, questions: &[(&str, RRType)]) {
-        let mut out = DnsOutgoing::new(FLAGS_QR_QUERY);
+    fn query_packet_on_intf(&self, questions: &[(&str, RRType)], index: u32) -> DnsOutgoing {
         let now = Instant::now();
-
-        for (name, qtype) in questions {
-            out.add_question(name, *qtype);
-
-            for record in self.cache.get_known_answers(name, *qtype, now) {
-                /*
-                RFC 6762 section 7.1: https://datatracker.ietf.org/doc/html/rfc6762#section-7.1
-                ...
-                    When a Multicast DNS querier sends a query to which it already knows
-                    some answers, it populates the Answer Section of the DNS query
-                    message with those answers.
-                 */
-                trace!("add known answer: {:?}", record.record);
-                let mut new_record = record.record.clone();
-                new_record.get_record_mut().update_ttl(now);
-                out.add_answer_box(new_record);
+        let mut out = DnsOutgoing::new(FLAGS_QR_QUERY);
+        for (name, kind) in questions {
+            out.add_question(name, *kind);
+            for known in self
+                .cache
+                .get_known_answers_on_intf(name, *kind, now, index)
+            {
+                let mut record = known.record.clone();
+                record.get_record_mut().update_ttl(now);
+                out.add_answer_box(record);
             }
         }
+        out
+    }
 
-        let mut invalid_intf_addrs = HashSet::new();
-        for (_, intf) in self.my_intfs.iter() {
-            if let Some(sock) = self.ipv4_sock.as_ref() {
-                if let Err(InternalError::IntfAddrInvalid(intf_addr)) =
+    fn send_query_vec(&self, questions: &[(&str, RRType)]) {
+        let mut invalid = HashSet::new();
+        for (index, intf) in &self.my_intfs {
+            let out = self.query_packet_on_intf(questions, *index);
+            for sock in [self.ipv4_sock.as_ref(), self.ipv6_sock.as_ref()]
+                .iter()
+                .flatten()
+            {
+                if let Err(InternalError::IntfAddrInvalid(addr)) =
                     send_dns_outgoing(&out, intf, &sock.pktinfo, self.port, None, None)
                 {
-                    invalid_intf_addrs.insert(intf_addr);
-                }
-            }
-            if let Some(sock) = self.ipv6_sock.as_ref() {
-                if let Err(InternalError::IntfAddrInvalid(intf_addr)) =
-                    send_dns_outgoing(&out, intf, &sock.pktinfo, self.port, None, None)
-                {
-                    invalid_intf_addrs.insert(intf_addr);
+                    invalid.insert(addr);
                 }
             }
         }
-
-        if !invalid_intf_addrs.is_empty() {
-            let _ = self.send_cmd_to_self(Command::InvalidIntfAddrs(invalid_intf_addrs));
+        if !invalid.is_empty() {
+            let _ = self.send_cmd_to_self(Command::InvalidIntfAddrs(invalid));
         }
     }
 
@@ -3673,11 +3684,55 @@ impl Zeroconf {
         ty_domain: &str,
         fullname: &str,
     ) -> Result<ResolvedService> {
-        let now = Instant::now();
+        let mut scopes: Vec<_> = self
+            .cache
+            .pointers(ty_domain, None)
+            .filter(|(_, ptr)| CanonicalName::new(ptr.alias()) == CanonicalName::new(fullname))
+            .map(|(record, _)| record.src_intf.index)
+            .collect();
+        scopes.sort_unstable();
+        scopes.dedup();
+        let mut result: Option<ResolvedService> = None;
+        for scope in scopes {
+            let service = self.resolve_service_on_intf(ty_domain, fullname, scope);
+            if !service.is_valid() {
+                continue;
+            }
+            if let Some(current) = &mut result {
+                if current.host.eq_ignore_ascii_case(&service.host)
+                    && current.port == service.port
+                    && current.txt_properties == service.txt_properties
+                {
+                    for address in service.addresses {
+                        merge_scoped_address(&mut current.addresses, address);
+                    }
+                }
+            } else {
+                result = Some(service);
+            }
+        }
+        if let Some(service) = result {
+            return Ok(service);
+        }
+        Ok(self.resolve_service_on_intf(ty_domain, fullname, u32::MAX))
+    }
+
+    fn resolve_service_on_intf(
+        &self,
+        ty_domain: &str,
+        fullname: &str,
+        index: u32,
+    ) -> ResolvedService {
+        let display_fullname = self
+            .cache
+            .pointers(ty_domain, Some(index))
+            .find(|(_, ptr)| CanonicalName::new(ptr.alias()) == CanonicalName::new(fullname))
+            .map(|(_, ptr)| ptr.alias().to_string())
+            .unwrap_or_else(|| fullname.to_string());
         let mut resolved_service = ResolvedService {
             ty_domain: ty_domain.to_string(),
             sub_ty_domain: None,
-            fullname: fullname.to_string(),
+            fullname: display_fullname,
             host: String::new(),
             port: 0,
             addresses: HashSet::new(),
@@ -3686,74 +3741,39 @@ impl Zeroconf {
 
         resolved_service.sub_ty_domain = self
             .cache
-            .subtypes(fullname, None)
-            .first()
-            .map(|subtype| subtype.to_string());
-
-        // resolve SRV record
-        if let Some(records) = self.cache.get_srv(fullname) {
-            if let Some(answer) = records
-                .iter()
-                .find(|r| !r.record.get_record().is_expired(now))
-            {
-                if let Some(dns_srv) = answer.record.any().downcast_ref::<DnsSrv>() {
-                    resolved_service.host = dns_srv.host().to_string();
-                    resolved_service.port = dns_srv.port();
-                }
-            }
+            .subtypes(fullname, Some(index))
+            .into_iter()
+            .next()
+            .map(str::to_string);
+        if let Some(srv) = self
+            .cache
+            .get_srv_on_intf(fullname, index)
+            .into_iter()
+            .flatten()
+            .find_map(|record| record.record.any().downcast_ref::<DnsSrv>())
+        {
+            resolved_service.host = srv.host().to_string();
+            resolved_service.port = srv.port();
         }
-
-        // resolve TXT record
-        if let Some(records) = self.cache.get_txt(fullname) {
-            if let Some(record) = records
-                .iter()
-                .find(|r| !r.record.get_record().is_expired(now))
-            {
-                if let Some(dns_txt) = record.record.any().downcast_ref::<DnsTxt>() {
-                    resolved_service.txt_properties = dns_txt.text().into();
-                }
-            }
+        if let Some(txt) = self
+            .cache
+            .get_txt_on_intf(fullname, index)
+            .into_iter()
+            .flatten()
+            .find_map(|record| record.record.any().downcast_ref::<DnsTxt>())
+        {
+            resolved_service.txt_properties = txt.text().into();
         }
-
-        // resolve A and AAAA records
-        if let Some(records) = self.cache.get_addr(&resolved_service.host) {
-            for answer in records.iter() {
-                if let Some(dns_a) = answer.record.any().downcast_ref::<DnsAddress>() {
-                    if dns_a.get_record().is_expired(now) {
-                        trace!(
-                            "Addr expired or expires soon: {}",
-                            dns_a.address().to_ip_addr()
-                        );
-                    } else {
-                        let scoped = dns_a.address();
-                        if let ScopedIp::V4(v4) = &scoped {
-                            // Merge interface_ids if this V4 addr already exists.
-                            // Linear scan by IP since Eq/Hash include interface_ids.
-                            let existing = resolved_service
-                                .addresses
-                                .iter()
-                                .find(|a| a.to_ip_addr() == IpAddr::V4(*v4.addr()))
-                                .cloned();
-                            if let Some(mut existing) = existing {
-                                resolved_service.addresses.remove(&existing);
-                                if let ScopedIp::V4(existing_v4) = &mut existing {
-                                    for id in v4.interface_ids() {
-                                        existing_v4.add_interface_id(id.clone());
-                                    }
-                                }
-                                resolved_service.addresses.insert(existing);
-                            } else {
-                                resolved_service.addresses.insert(scoped);
-                            }
-                        } else {
-                            resolved_service.addresses.insert(scoped);
-                        }
-                    }
-                }
-            }
+        for address in self
+            .cache
+            .get_addr_on_intf(&resolved_service.host, index)
+            .into_iter()
+            .flatten()
+            .filter_map(|record| record.record.any().downcast_ref::<DnsAddress>())
+        {
+            merge_scoped_address(&mut resolved_service.addresses, address.address());
         }
-
-        Ok(resolved_service)
+        resolved_service
     }
 
     fn handle_poller_events(&mut self, events: &mio::Events) {
@@ -4189,14 +4209,7 @@ impl Zeroconf {
                     continue;
                 }
 
-                add_answer_of_service(
-                    &mut out,
-                    &msg,
-                    question.entry_name(),
-                    service,
-                    qtype,
-                    intf_addrs,
-                );
+                add_answer_of_service(&mut out, &msg, service, qtype, dns_registry);
             }
         }
 
@@ -4912,48 +4925,27 @@ impl Zeroconf {
 fn add_answer_of_service(
     out: &mut DnsOutgoing,
     msg: &DnsIncoming,
-    entry_name: &str,
     service: &ServiceInfo,
     qtype: RRType,
-    intf_addrs: Vec<IpAddr>,
+    registry: &DnsRegistry,
 ) {
+    let instance = registry.resolve_name(service.get_fullname());
+    for kind in [RRType::SRV, RRType::TXT] {
+        if qtype == kind || qtype == RRType::ANY {
+            let records: Vec<_> = registry
+                .records_for_name(instance)
+                .iter()
+                .filter(|record| record.get_type() == kind)
+                .cloned()
+                .collect();
+            out.add_unique_rrset(msg, &records);
+        }
+    }
     if qtype == RRType::SRV || qtype == RRType::ANY {
-        out.add_answer(
-            msg,
-            DnsSrv::new(
-                entry_name,
-                CLASS_IN | CLASS_CACHE_FLUSH,
-                service.get_host_ttl(),
-                service.get_priority(),
-                service.get_weight(),
-                service.get_port(),
-                service.get_hostname().to_string(),
-            ),
-        );
-    }
-
-    if qtype == RRType::TXT || qtype == RRType::ANY {
-        out.add_answer(
-            msg,
-            DnsTxt::new(
-                entry_name,
-                CLASS_IN | CLASS_CACHE_FLUSH,
-                service.get_other_ttl(),
-                service.generate_txt(),
-            ),
-        );
-    }
-
-    if qtype == RRType::SRV {
-        for address in intf_addrs {
-            out.add_additional_answer(DnsAddress::new(
-                service.get_hostname(),
-                ip_address_rr_type(&address),
-                CLASS_IN | CLASS_CACHE_FLUSH,
-                service.get_host_ttl(),
-                address,
-                InterfaceId::default(),
-            ));
+        for record in registry.records_for_name(registry.resolve_name(service.get_hostname())) {
+            let mut record = record.clone();
+            record.get_record_mut().set_cache_flush(true);
+            out.add_additional_box(record);
         }
     }
 }
@@ -4968,84 +4960,59 @@ fn answer_hostname_question(
     services: &HashMap<String, ServiceInfo>,
     intf: &MyIntf,
     question: &DnsQuestion,
-    dns_registry: &DnsRegistry,
+    registry: &DnsRegistry,
     out: &mut DnsOutgoing,
     msg: &DnsIncoming,
 ) {
-    let if_index = intf.index;
-    let qtype = question.entry_type();
-    let mut hostname = None;
-    let mut host_ttl = u32::MAX;
-    let mut has_ipv4 = false;
-    let mut has_ipv6 = false;
-    for service in services.values() {
-        if service.get_status(if_index) != ServiceStatus::Announced {
-            continue;
-        }
-
-        let service_hostname = dns_registry.resolve_name(service.get_hostname());
-
-        if service_hostname.to_lowercase() == question.entry_name().to_lowercase() {
-            let ipv4 = service.get_addrs_on_my_intf_v4(intf);
-            let ipv6 = service.get_addrs_on_my_intf_v6(intf);
-            if ipv4.is_empty() && ipv6.is_empty() {
-                continue;
-            }
-            hostname = Some(service_hostname);
-            host_ttl = host_ttl.min(service.get_host_ttl());
-            has_ipv4 |= !ipv4.is_empty();
-            has_ipv6 |= !ipv6.is_empty();
-            // Pick addresses based on the question type, not the
-            // socket family. RFC 6762 doesn't require A queries
-            // to come over IPv4 transport — Android's getaddrinfo
-            // routinely sends both A and AAAA queries over its
-            // preferred IPv6 mDNS socket and expects A records
-            // to be answered with v4 addresses.
-            let mut intf_addrs: Vec<IpAddr> = Vec::new();
-            if qtype == RRType::A || qtype == RRType::ANY {
-                intf_addrs.extend(ipv4);
-            }
-            if qtype == RRType::AAAA || qtype == RRType::ANY {
-                intf_addrs.extend(ipv6);
-            }
-            for address in intf_addrs {
-                out.add_answer(
-                    msg,
-                    DnsAddress::new(
-                        service_hostname,
-                        ip_address_rr_type(&address),
-                        CLASS_IN | CLASS_CACHE_FLUSH,
-                        service.get_host_ttl(),
-                        address,
-                        intf.into(),
-                    ),
-                );
-            }
+    let name = question.entry_name();
+    if !services.values().any(|service| {
+        service.get_status(intf.index) == ServiceStatus::Announced
+            && CanonicalName::new(registry.resolve_name(service.get_hostname()))
+                == CanonicalName::new(name)
+    }) {
+        return;
+    }
+    let records = registry.records_for_name(name);
+    let v4 = records.iter().any(|record| record.get_type() == RRType::A);
+    let v6 = records
+        .iter()
+        .any(|record| record.get_type() == RRType::AAAA);
+    let kind = question.entry_type();
+    for rr_type in [RRType::A, RRType::AAAA] {
+        if kind == rr_type || kind == RRType::ANY {
+            let rrset: Vec<_> = records
+                .iter()
+                .filter(|r| r.get_type() == rr_type)
+                .cloned()
+                .collect();
+            out.add_unique_rrset(msg, &rrset);
         }
     }
-    let missing = match qtype {
-        RRType::A => !has_ipv4,
-        RRType::AAAA => !has_ipv6,
+    let absent = match kind {
+        RRType::A => !v4,
+        RRType::AAAA => !v6,
         RRType::SVCB | RRType::HTTPS => true,
         _ => false,
     };
-    if let Some(hostname) = hostname.filter(|_| missing) {
-        // RFC 6762 section 6.1: explicitly deny absent records
-        // only for a hostname we own on this interface. Combine
-        // all announced services sharing the hostname, so one
-        // registration cannot deny another's address family.
-        let bitmap = if has_ipv6 {
-            vec![if has_ipv4 { 0x40 } else { 0 }, 0, 0, 0x08]
+    if absent && (v4 || v6) {
+        let name = records[0].get_name();
+        let ttl = records
+            .iter()
+            .map(|r| r.get_record().get_ttl())
+            .min()
+            .unwrap_or(120);
+        let bitmap = if v6 {
+            vec![if v4 { 0x40 } else { 0 }, 0, 0, 0x08]
         } else {
             vec![0x40]
         };
         out.add_answer(
             msg,
             DnsNSec::new(
-                hostname,
+                name,
                 CLASS_IN | CLASS_CACHE_FLUSH,
-                host_ttl,
-                hostname.to_string(),
+                ttl,
+                name.to_string(),
                 bitmap,
             ),
         );
@@ -7345,6 +7312,173 @@ mod tests {
     }
 
     #[test]
+    fn test_conflict_renaming_preserves_escaped_labels() {
+        assert_eq!(
+            name_change(r"A\.B._http._tcp.local."),
+            r"A\.B (2)._http._tcp.local."
+        );
+        assert_eq!(
+            name_change(r"A\\B._http._tcp.local."),
+            r"A\\B (2)._http._tcp.local."
+        );
+        assert_eq!(hostname_change(r"A\.B.local."), r"A\.B-2.local.");
+        assert_eq!(hostname_change(r"A\\B.local."), r"A\\B-2.local.");
+        assert_eq!(name_change(r"A\\."), r"A\\ (2).");
+        assert_eq!(name_change(r"A\."), r"A\. (2)");
+    }
+
+    #[test]
+    fn test_conflict_renaming_does_not_overflow_numeric_suffixes() {
+        assert_eq!(
+            name_change("foo (4294967295).local."),
+            "foo (4294967295) (2).local."
+        );
+        assert_eq!(
+            hostname_change("foo-4294967295.local."),
+            "foo-4294967295-2.local."
+        );
+    }
+
+    #[test]
+    fn test_conflict_renaming_maximum_labels_roundtrip() {
+        for label in ["a".repeat(63), "\u{754c}".repeat(21)] {
+            let original = format!("{label}._http._tcp.local.");
+            for renamed in [name_change(&original), hostname_change(&original)] {
+                let labels = crate::dns_name::labels(&renamed);
+                assert!(labels[0].len() <= crate::dns_parser::MAX_LABEL_BYTES);
+                assert_eq!(&labels[1..], &["_http", "_tcp", "local"]);
+                let mut query = DnsOutgoing::new(FLAGS_QR_QUERY);
+                query.add_question(&renamed, RRType::ANY);
+                let packets = query.to_data_on_wire(MAX_PKT_DEFAULT, true);
+                let parsed =
+                    DnsIncoming::new(packets[0].clone(), crate::InterfaceId::default()).unwrap();
+                assert_eq!(parsed.questions()[0].entry_name(), renamed);
+            }
+        }
+        assert_eq!(
+            name_change(&"a".repeat(63)),
+            format!("{} (2)", "a".repeat(59))
+        );
+        assert_eq!(
+            hostname_change(&"\u{754c}".repeat(21)),
+            format!("{}-2", "\u{754c}".repeat(20))
+        );
+    }
+
+    #[test]
+    fn test_conflict_renaming_maximum_names_roundtrip() {
+        let suffix = format!(
+            "{}.{}.{}.local.",
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(63)
+        );
+        for first in [
+            "a".repeat(55),
+            format!("{}x", "\u{754c}".repeat(18)),
+            format!(r"{}\.\\", "a".repeat(53)),
+        ] {
+            let original = format!("{first}.{suffix}");
+            let original_labels = crate::dns_name::labels(&original);
+            let wire_len =
+                |labels: &[String]| labels.iter().map(|label| label.len() + 1).sum::<usize>() + 1;
+            assert_eq!(
+                wire_len(&original_labels),
+                crate::dns_parser::MAX_NAME_BYTES
+            );
+            for renamed in [name_change(&original), hostname_change(&original)] {
+                let labels = crate::dns_name::labels(&renamed);
+                assert!(wire_len(&labels) <= crate::dns_parser::MAX_NAME_BYTES);
+                assert_eq!(&labels[1..], &original_labels[1..]);
+                assert_ne!(labels[0], original_labels[0]);
+                let mut query = DnsOutgoing::new(FLAGS_QR_QUERY);
+                query.add_question(&renamed, RRType::ANY);
+                let packets = query.to_data_on_wire(MAX_PKT_DEFAULT, true);
+                assert_eq!(packets.len(), 1);
+                let parsed =
+                    DnsIncoming::new(packets[0].clone(), crate::InterfaceId::default()).unwrap();
+                assert_eq!(parsed.questions()[0].entry_name(), renamed);
+            }
+        }
+
+        let original = format!("a.{}.{}", "e".repeat(53), suffix);
+        let original_labels = crate::dns_name::labels(&original);
+        assert_eq!(
+            original_labels
+                .iter()
+                .map(|label| label.len() + 1)
+                .sum::<usize>()
+                + 1,
+            crate::dns_parser::MAX_NAME_BYTES
+        );
+        for rename in [name_change as fn(&str) -> String, hostname_change] {
+            let renamed = rename(&original);
+            let labels = crate::dns_name::labels(&renamed);
+            assert_eq!(labels[0], "2");
+            assert_eq!(&labels[1..], &original_labels[1..]);
+            assert_eq!(crate::dns_name::labels(&rename(&renamed))[0], "3");
+            let mut query = DnsOutgoing::new(FLAGS_QR_QUERY);
+            query.add_question(&renamed, RRType::ANY);
+            let packets = query.to_data_on_wire(MAX_PKT_DEFAULT, true);
+            assert_eq!(packets.len(), 1);
+            let parsed =
+                DnsIncoming::new(packets[0].clone(), crate::InterfaceId::default()).unwrap();
+            assert_eq!(parsed.questions()[0].entry_name(), renamed);
+        }
+    }
+
+    #[test]
+    fn test_scoped_resolution_preserves_ptr_instance_presentation() {
+        let mut daemon = new_test_zeroconf();
+        daemon.accept_unsolicited = true;
+        let intf = daemon
+            .my_intfs
+            .values()
+            .find(|intf| {
+                intf.addrs
+                    .iter()
+                    .any(|address| address.ip() == IpAddr::V4(Ipv4Addr::LOCALHOST))
+            })
+            .unwrap();
+        let index = intf.index;
+        let interface = crate::InterfaceId::from(intf);
+        let ty = "_display._tcp.local.";
+        let fullname = r"MiXeD\.Name._display._tcp.local.";
+        let mut outgoing = DnsOutgoing::new(FLAGS_QR_RESPONSE);
+        outgoing.add_answer_record(DnsPointer::new(
+            ty,
+            RRType::PTR,
+            CLASS_IN,
+            120,
+            fullname.to_string(),
+        ));
+        outgoing.add_answer_record(DnsSrv::new(
+            fullname,
+            CLASS_IN,
+            120,
+            0,
+            0,
+            80,
+            "Host.local.".to_string(),
+        ));
+        outgoing.add_answer_record(DnsAddress::new(
+            "Host.local.",
+            RRType::A,
+            CLASS_IN,
+            120,
+            Ipv4Addr::LOCALHOST.into(),
+            interface.clone(),
+        ));
+        for packet in outgoing.to_data_on_wire(MAX_PKT_DEFAULT, true) {
+            daemon.handle_response(DnsIncoming::new(packet, interface.clone()).unwrap(), index);
+        }
+        let canonical = fullname.to_ascii_lowercase();
+        let service = daemon.resolve_service_on_intf(ty, &canonical, index);
+        assert!(service.is_valid());
+        assert_eq!(service.fullname, fullname);
+    }
+
+    #[test]
     fn test_add_answer_txt_ttl() {
         // construct a simple service info
         let service_type = "_test_add_answer._udp.local.";
@@ -7374,15 +7508,18 @@ mod tests {
         let incoming = DnsIncoming::new(dummy_data.pop().unwrap(), interface_id).unwrap();
 
         // Add an answer of TXT type for the service.
-        let if_addrs = vec![service_intf.ip()];
-        add_answer_of_service(
-            &mut out,
-            &incoming,
-            instance,
-            &my_service,
-            RRType::TXT,
-            if_addrs,
-        );
+        let mut my_service = my_service;
+        my_service.set_requires_probe(false);
+        let intf = crate::service_info::MyIntf {
+            name: service_intf.name.clone(),
+            index: service_intf.index.unwrap(),
+            addrs: HashSet::from([service_intf.addr.clone()]),
+            max_packet_size_v4: MAX_PKT_DEFAULT,
+            max_packet_size_v6: MAX_PKT_DEFAULT,
+        };
+        let mut registry = crate::service_info::DnsRegistry::new();
+        registry.reconcile_services(&[&my_service], &intf, Instant::now());
+        add_answer_of_service(&mut out, &incoming, &my_service, RRType::TXT, &registry);
 
         // Check if the answer was added correctly
         assert!(
@@ -8582,172 +8719,5 @@ mod tests {
             receiver_b.try_recv(),
             Ok(HostnameResolutionEvent::SearchStarted(_))
         ));
-    }
-
-    #[test]
-    fn test_conflict_renaming_preserves_escaped_labels() {
-        assert_eq!(
-            name_change(r"A\.B._http._tcp.local."),
-            r"A\.B (2)._http._tcp.local."
-        );
-        assert_eq!(
-            name_change(r"A\\B._http._tcp.local."),
-            r"A\\B (2)._http._tcp.local."
-        );
-        assert_eq!(hostname_change(r"A\.B.local."), r"A\.B-2.local.");
-        assert_eq!(hostname_change(r"A\\B.local."), r"A\\B-2.local.");
-        assert_eq!(name_change(r"A\\."), r"A\\ (2).");
-        assert_eq!(name_change(r"A\."), r"A\. (2)");
-    }
-
-    #[test]
-    fn test_conflict_renaming_does_not_overflow_numeric_suffixes() {
-        assert_eq!(
-            name_change("foo (4294967295).local."),
-            "foo (4294967295) (2).local."
-        );
-        assert_eq!(
-            hostname_change("foo-4294967295.local."),
-            "foo-4294967295-2.local."
-        );
-    }
-
-    #[test]
-    fn test_conflict_renaming_maximum_labels_roundtrip() {
-        for label in ["a".repeat(63), "\u{754c}".repeat(21)] {
-            let original = format!("{label}._http._tcp.local.");
-            for renamed in [name_change(&original), hostname_change(&original)] {
-                let labels = crate::dns_name::labels(&renamed);
-                assert!(labels[0].len() <= crate::dns_parser::MAX_LABEL_BYTES);
-                assert_eq!(&labels[1..], &["_http", "_tcp", "local"]);
-                let mut query = DnsOutgoing::new(FLAGS_QR_QUERY);
-                query.add_question(&renamed, RRType::ANY);
-                let packets = query.to_data_on_wire(MAX_PKT_DEFAULT, true);
-                let parsed =
-                    DnsIncoming::new(packets[0].clone(), crate::InterfaceId::default()).unwrap();
-                assert_eq!(parsed.questions()[0].entry_name(), renamed);
-            }
-        }
-        assert_eq!(
-            name_change(&"a".repeat(63)),
-            format!("{} (2)", "a".repeat(59))
-        );
-        assert_eq!(
-            hostname_change(&"\u{754c}".repeat(21)),
-            format!("{}-2", "\u{754c}".repeat(20))
-        );
-    }
-
-    #[test]
-    fn test_conflict_renaming_maximum_names_roundtrip() {
-        let suffix = format!(
-            "{}.{}.{}.local.",
-            "b".repeat(63),
-            "c".repeat(63),
-            "d".repeat(63)
-        );
-        for first in [
-            "a".repeat(55),
-            format!("{}x", "\u{754c}".repeat(18)),
-            format!(r"{}\.\\", "a".repeat(53)),
-        ] {
-            let original = format!("{first}.{suffix}");
-            let original_labels = crate::dns_name::labels(&original);
-            let wire_len =
-                |labels: &[String]| labels.iter().map(|label| label.len() + 1).sum::<usize>() + 1;
-            assert_eq!(
-                wire_len(&original_labels),
-                crate::dns_parser::MAX_NAME_BYTES
-            );
-            for renamed in [name_change(&original), hostname_change(&original)] {
-                let labels = crate::dns_name::labels(&renamed);
-                assert!(wire_len(&labels) <= crate::dns_parser::MAX_NAME_BYTES);
-                assert_eq!(&labels[1..], &original_labels[1..]);
-                assert_ne!(labels[0], original_labels[0]);
-                let mut query = DnsOutgoing::new(FLAGS_QR_QUERY);
-                query.add_question(&renamed, RRType::ANY);
-                let packets = query.to_data_on_wire(MAX_PKT_DEFAULT, true);
-                assert_eq!(packets.len(), 1);
-                let parsed =
-                    DnsIncoming::new(packets[0].clone(), crate::InterfaceId::default()).unwrap();
-                assert_eq!(parsed.questions()[0].entry_name(), renamed);
-            }
-        }
-
-        let original = format!("a.{}.{}", "e".repeat(53), suffix);
-        let original_labels = crate::dns_name::labels(&original);
-        assert_eq!(
-            original_labels
-                .iter()
-                .map(|label| label.len() + 1)
-                .sum::<usize>()
-                + 1,
-            crate::dns_parser::MAX_NAME_BYTES
-        );
-        for rename in [name_change as fn(&str) -> String, hostname_change] {
-            let renamed = rename(&original);
-            let labels = crate::dns_name::labels(&renamed);
-            assert_eq!(labels[0], "2");
-            assert_eq!(&labels[1..], &original_labels[1..]);
-            assert_eq!(crate::dns_name::labels(&rename(&renamed))[0], "3");
-            let mut query = DnsOutgoing::new(FLAGS_QR_QUERY);
-            query.add_question(&renamed, RRType::ANY);
-            let packets = query.to_data_on_wire(MAX_PKT_DEFAULT, true);
-            assert_eq!(packets.len(), 1);
-            let parsed =
-                DnsIncoming::new(packets[0].clone(), crate::InterfaceId::default()).unwrap();
-            assert_eq!(parsed.questions()[0].entry_name(), renamed);
-        }
-    }
-
-    #[test]
-    fn test_scoped_resolution_preserves_ptr_instance_presentation() {
-        let mut daemon = new_test_zeroconf();
-        daemon.accept_unsolicited = true;
-        let intf = daemon
-            .my_intfs
-            .values()
-            .find(|intf| {
-                intf.addrs
-                    .iter()
-                    .any(|address| address.ip() == IpAddr::V4(Ipv4Addr::LOCALHOST))
-            })
-            .unwrap();
-        let index = intf.index;
-        let interface = crate::InterfaceId::from(intf);
-        let ty = "_display._tcp.local.";
-        let fullname = r"MiXeD\.Name._display._tcp.local.";
-        let mut outgoing = DnsOutgoing::new(FLAGS_QR_RESPONSE);
-        outgoing.add_answer_record(DnsPointer::new(
-            ty,
-            RRType::PTR,
-            CLASS_IN,
-            120,
-            fullname.to_string(),
-        ));
-        outgoing.add_answer_record(DnsSrv::new(
-            fullname,
-            CLASS_IN,
-            120,
-            0,
-            0,
-            80,
-            "Host.local.".to_string(),
-        ));
-        outgoing.add_answer_record(DnsAddress::new(
-            "Host.local.",
-            RRType::A,
-            CLASS_IN,
-            120,
-            Ipv4Addr::LOCALHOST.into(),
-            interface.clone(),
-        ));
-        for packet in outgoing.to_data_on_wire(MAX_PKT_DEFAULT, true) {
-            daemon.handle_response(DnsIncoming::new(packet, interface.clone()).unwrap(), index);
-        }
-        let canonical = fullname.to_ascii_lowercase();
-        let service = daemon.resolve_service_on_intf(ty, &canonical, index);
-        assert!(service.is_valid());
-        assert_eq!(service.fullname, fullname);
     }
 }

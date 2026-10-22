@@ -194,6 +194,47 @@ fn verification_without_browsing_accepts_changed_target_and_new_address() {
 }
 
 #[test]
+fn resolution_and_known_answers_do_not_cross_links() {
+    let (mut daemon, index) = daemon();
+    let other = second_interface(&mut daemon, index);
+    let receiver = subscribe(&mut daemon);
+    daemon.accept_unsolicited = true;
+    let instance = format!("split.{TY}");
+    let mut records = discovery_records(&daemon, index, &instance, "same.local.", 120, true);
+    records.retain(|record| record.get_type() != RRType::A);
+    receive(&mut daemon, index, records);
+    let address = DnsAddress::new(
+        "same.local.",
+        RRType::A,
+        CLASS_IN,
+        120,
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        (&daemon.my_intfs[&other]).into(),
+    )
+    .boxed();
+    receive(&mut daemon, other, vec![address]);
+    assert!(!daemon
+        .resolve_service_from_cache(TY, &instance)
+        .unwrap()
+        .is_valid());
+    assert!(daemon.query_unresolved(&instance));
+    assert!(!receiver
+        .try_iter()
+        .any(|event| matches!(event, ServiceEvent::ServiceResolved(_))));
+    assert_eq!(
+        daemon
+            .cache
+            .get_known_answers_on_intf(TY, RRType::PTR, Instant::now(), index)
+            .len(),
+        1
+    );
+    assert!(daemon
+        .cache
+        .get_known_answers_on_intf(TY, RRType::PTR, Instant::now(), other)
+        .is_empty());
+}
+
+#[test]
 fn other_dns_classes_cannot_create_in_class_discovery_dependencies() {
     let (mut daemon, index) = daemon();
     let receiver = subscribe(&mut daemon);
@@ -653,6 +694,22 @@ fn parent_browse_retains_subtype_metadata_from_parsed_announcements() {
 }
 
 #[test]
+fn escaped_subtype_marker_does_not_expand_parent_browse_interest() {
+    let (mut daemon, index) = daemon();
+    let receiver = subscribe(&mut daemon);
+    let instance = format!("escaped.{TY}");
+    let escaped = format!(r"_print\._sub.{TY}");
+    let mut records = discovery_records(&daemon, index, &instance, "escaped.local.", 120, false);
+    records.insert(
+        0,
+        DnsPointer::new(&escaped, RRType::PTR, CLASS_IN, 120, instance).boxed(),
+    );
+    receive(&mut daemon, index, records);
+    assert_eq!(daemon.cache.record_count(), 0);
+    assert!(receiver.is_empty());
+}
+
+#[test]
 fn type_enumeration_does_not_resolve_type_names_as_instances() {
     let (mut daemon, index) = daemon();
     let (sender, receiver) = flume::unbounded();
@@ -950,20 +1007,4 @@ fn cached_complete_service_replays_once_across_links_and_alias_case() {
         assert_eq!(daemon.cache.pointers(TY, None).count(), 2);
         assert!(daemon.pending_resolves.is_empty());
     }
-}
-
-#[test]
-fn escaped_subtype_marker_does_not_expand_parent_browse_interest() {
-    let (mut daemon, index) = daemon();
-    let receiver = subscribe(&mut daemon);
-    let instance = format!("escaped.{TY}");
-    let escaped = format!(r"_print\._sub.{TY}");
-    let mut records = discovery_records(&daemon, index, &instance, "escaped.local.", 120, false);
-    records.insert(
-        0,
-        DnsPointer::new(&escaped, RRType::PTR, CLASS_IN, 120, instance).boxed(),
-    );
-    receive(&mut daemon, index, records);
-    assert_eq!(daemon.cache.record_count(), 0);
-    assert!(receiver.is_empty());
 }

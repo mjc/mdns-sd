@@ -791,7 +791,8 @@ pub trait DnsRecordExt: fmt::Debug {
     /// Returns true if another record has matched content,
     /// and if its TTL is at least half of this record's.
     fn suppressed_by_answer(&self, other: &dyn DnsRecordExt) -> bool {
-        self.matches(other) && (other.get_record().ttl > self.get_record().ttl / 2)
+        self.matches(other)
+            && (u64::from(other.get_record().ttl) * 2 >= u64::from(self.get_record().ttl))
     }
 
     /// Required by RFC 6762 Section 7.1: Known-Answer Suppression.
@@ -1939,6 +1940,20 @@ impl DnsOutgoing {
         true
     }
 
+    /// Sends the complete unique RRset when at least one member needs an answer.
+    pub(crate) fn add_unique_rrset(&mut self, msg: &DnsIncoming, records: &[DnsRecordBox]) -> bool {
+        if records.iter().all(|record| record.suppressed_by(msg)) {
+            self.known_answer_count += records.len() as i64;
+            return false;
+        }
+        for record in records {
+            let mut answer = record.clone();
+            answer.get_record_mut().set_cache_flush(true);
+            self.add_answer_box(answer);
+        }
+        true
+    }
+
     /// Adds `answer` to the outgoing msg unconditionally. Its full TTL is
     /// written on the wire.
     pub fn add_answer_record(&mut self, answer: impl DnsRecordExt + Send + 'static) {
@@ -1949,9 +1964,9 @@ impl DnsOutgoing {
     /// Adds a PTR answer for `service` along with recommended additional records
     /// (SRV, TXT, and address records) per [RFC 6763 Section 12.1].
     ///
-    /// Resolves any name conflicts via `dns_registry` and selects addresses
-    /// matching the given interface. Does nothing if no addresses are available
-    /// on `intf` or if the PTR answer is suppressed by known-answer entries in `msg`.
+    /// Uses the interface registry's current SRV/TXT records and complete host
+    /// address sets. The selected transport and both name claims must be ready.
+    /// Known-answer entries in `msg` may suppress the PTR and its additionals.
     ///
     /// [RFC 6763 Section 12.1]: https://tools.ietf.org/html/rfc6763#section-12.1
     pub(crate) fn add_answer_with_additionals(
@@ -1962,19 +1977,21 @@ impl DnsOutgoing {
         dns_registry: &DnsRegistry,
         is_ipv4: bool,
     ) {
-        let intf_addrs = if is_ipv4 {
-            service.get_addrs_on_my_intf_v4(intf)
+        let transport_available = if is_ipv4 {
+            intf.next_ifaddr_v4().is_some()
         } else {
-            service.get_addrs_on_my_intf_v6(intf)
+            intf.next_ifaddr_v6().is_some()
         };
-        if intf_addrs.is_empty() {
-            trace!("No addrs on LAN of intf {:?}", intf);
+        if !transport_available {
             return;
         }
-
-        // check if we changed our name due to conflicts.
         let service_fullname = dns_registry.resolve_name(service.get_fullname());
         let hostname = dns_registry.resolve_name(service.get_hostname());
+        let service_records = dns_registry.records_for_name(service_fullname);
+        let host_records = dns_registry.records_for_name(hostname);
+        if service_records.is_empty() || host_records.is_empty() {
+            return;
+        }
 
         let ptr_added = self.add_answer(
             msg,
@@ -2003,34 +2020,10 @@ impl DnsOutgoing {
             ));
         }
 
-        // Add recommended additional answers according to
-        // https://tools.ietf.org/html/rfc6763#section-12.1.
-        self.add_additional_answer(DnsSrv::new(
-            service_fullname,
-            CLASS_IN | CLASS_CACHE_FLUSH,
-            service.get_host_ttl(),
-            service.get_priority(),
-            service.get_weight(),
-            service.get_port(),
-            hostname.to_string(),
-        ));
-
-        self.add_additional_answer(DnsTxt::new(
-            service_fullname,
-            CLASS_IN | CLASS_CACHE_FLUSH,
-            service.get_other_ttl(),
-            service.generate_txt(),
-        ));
-
-        for address in intf_addrs {
-            self.add_additional_answer(DnsAddress::new(
-                hostname,
-                ip_address_rr_type(&address),
-                CLASS_IN | CLASS_CACHE_FLUSH,
-                service.get_host_ttl(),
-                address,
-                intf.into(),
-            ));
+        for source in service_records.iter().chain(host_records) {
+            let mut record = source.clone();
+            record.get_record_mut().set_cache_flush(true);
+            self.add_additional_box(record);
         }
     }
 
@@ -3042,6 +3035,130 @@ mod tests {
     }
 
     #[test]
+    fn test_probe_order_compares_uncompressed_name_lengths_and_case() {
+        let ptr = |alias: &str| {
+            DnsPointer::new(
+                "_http._tcp.local.",
+                RRType::PTR,
+                CLASS_IN,
+                120,
+                alias.to_string(),
+            )
+        };
+        assert_eq!(
+            ptr("z.local.").compare_rdata(&ptr("aa.local.")),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            ptr(r"\.a.local.").compare_rdata(&ptr("z.local.")),
+            std::cmp::Ordering::Greater
+        );
+        assert!(ptr("Z.local.").rrdata_match(&ptr("z.local.")));
+        assert_eq!(
+            ptr("Z.local.").compare_rdata(&ptr("z.local.")),
+            std::cmp::Ordering::Less
+        );
+
+        let srv = |host: &str| {
+            DnsSrv::new(
+                "instance._http._tcp.local.",
+                CLASS_IN,
+                120,
+                0,
+                0,
+                80,
+                host.to_string(),
+            )
+        };
+        assert_eq!(
+            srv("z.local.").compare_rdata(&srv("aa.local.")),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            srv(r"\.a.local.").compare_rdata(&srv("z.local.")),
+            std::cmp::Ordering::Greater
+        );
+
+        let nsec = |name: &str| {
+            DnsNSec::new(
+                "host.local.",
+                CLASS_IN,
+                120,
+                name.to_string(),
+                vec![0, 1, 0x40],
+            )
+        };
+        assert_eq!(
+            nsec("z.local.").compare_rdata(&nsec("aa.local.")),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            nsec(r"\.a.local.").compare_rdata(&nsec("z.local.")),
+            std::cmp::Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn test_escaped_names_roundtrip_without_merging_labels() {
+        let names = [
+            r"A\.B._http._tcp.local.",
+            "A.B._http._tcp.local.",
+            r"A\\._http._tcp.local.",
+        ];
+        let mut out = DnsOutgoing::new(FLAGS_QR_RESPONSE);
+        for name in names {
+            out.add_answer_record(DnsPointer::new(
+                "_http._tcp.local.",
+                RRType::PTR,
+                CLASS_IN,
+                120,
+                name.to_string(),
+            ));
+        }
+        let packets = out.to_packets(MAX_PKT_DEFAULT, IPV6);
+        let incoming =
+            DnsIncoming::new(packets[0].as_bytes().to_vec(), test_interface_id()).unwrap();
+        let aliases: Vec<_> = incoming
+            .answers()
+            .iter()
+            .map(|record| record.any().downcast_ref::<DnsPointer>().unwrap().alias())
+            .collect();
+        assert_eq!(aliases, names);
+        let mut repeated = DnsOutgoing::new(FLAGS_QR_RESPONSE);
+        for record in incoming.answers() {
+            repeated.add_answer_box(record.clone());
+        }
+        let repeated_packets = repeated.to_packets(MAX_PKT_DEFAULT, IPV6);
+        assert_eq!(repeated_packets[0].as_bytes(), packets[0].as_bytes());
+    }
+
+    #[test]
+    fn test_escaped_name_length_counts_wire_bytes() {
+        let label = r"\.".repeat(63);
+        let name = format!("{label}.{label}.{label}.{}.", r"\.".repeat(61));
+        let mut out = DnsOutgoing::new(FLAGS_QR_QUERY);
+        out.add_question(&name, RRType::PTR);
+        let packets = out.to_packets(MAX_PKT_DEFAULT, IPV6);
+        let incoming =
+            DnsIncoming::new(packets[0].as_bytes().to_vec(), test_interface_id()).unwrap();
+        assert_eq!(incoming.questions()[0].entry.name, name);
+    }
+
+    #[test]
+    fn test_known_answer_suppression_at_half_ttl() {
+        let answer = DnsTxt::new("Printer.local.", CLASS_IN | CLASS_CACHE_FLUSH, 120, vec![0]);
+        for (ttl, suppressed) in [(59, false), (60, true), (61, true)] {
+            let known = DnsTxt::new("printer.LOCAL.", CLASS_IN, ttl, vec![0]);
+            assert_eq!(answer.suppressed_by_answer(&known), suppressed);
+        }
+        let odd_ttl = DnsTxt::new("Printer.local.", CLASS_IN, 121, vec![0]);
+        let below_half = DnsTxt::new("Printer.local.", CLASS_IN, 60, vec![0]);
+        let above_half = DnsTxt::new("Printer.local.", CLASS_IN, 61, vec![0]);
+        assert!(!odd_ttl.suppressed_by_answer(&below_half));
+        assert!(odd_ttl.suppressed_by_answer(&above_half));
+    }
+
+    #[test]
     fn test_goodbye_ttl_preserves_record_data_and_effective_name() {
         let mut record = DnsTxt::new(
             "original.local.",
@@ -3073,6 +3190,134 @@ mod tests {
             incoming.answers()[0].get_record().get_refresh_time()
         );
         assert!(original.matches(incoming.answers()[0].as_ref()));
+    }
+
+    #[test]
+    fn test_unique_rrset_is_sent_completely_or_suppressed_completely() {
+        let interface = test_interface_id();
+        let records: Vec<_> = [Ipv4Addr::new(192, 0, 2, 1), Ipv4Addr::new(192, 0, 2, 2)]
+            .iter()
+            .copied()
+            .map(|address| {
+                DnsAddress::new(
+                    "host.local.",
+                    RRType::A,
+                    CLASS_IN,
+                    120,
+                    address.into(),
+                    interface.clone(),
+                )
+                .boxed()
+            })
+            .collect();
+        for known_count in [1, 2] {
+            let mut query = DnsOutgoing::new(FLAGS_QR_QUERY);
+            query.add_question("host.local.", RRType::A);
+            for record in records.iter().take(known_count) {
+                query.add_answer_box(record.clone());
+            }
+            let packets = query.to_packets(MAX_PKT_DEFAULT, IPV6);
+            let incoming =
+                DnsIncoming::new(packets[0].as_bytes().to_vec(), interface.clone()).unwrap();
+            let mut response = DnsOutgoing::new(FLAGS_QR_RESPONSE);
+            let added = response.add_unique_rrset(&incoming, &records);
+            if known_count == 1 {
+                assert!(added);
+                assert_eq!(response.answers_count(), 2);
+                assert!(response
+                    .answers()
+                    .iter()
+                    .all(|record| record.get_cache_flush()));
+                assert_eq!(response.known_answer_count(), 0);
+            } else {
+                assert!(!added);
+                assert_eq!(response.answers_count(), 0);
+                assert_eq!(response.known_answer_count(), 2);
+            }
+        }
+    }
+
+    #[test]
+    fn test_ptr_additionals_include_shared_host_complete_address_sets() {
+        let intf = crate::service_info::MyIntf {
+            name: "test".to_string(),
+            index: 1,
+            addrs: std::collections::HashSet::from([
+                if_addrs::IfAddr::V4(if_addrs::Ifv4Addr {
+                    ip: Ipv4Addr::new(192, 0, 2, 1),
+                    netmask: Ipv4Addr::new(255, 255, 255, 0),
+                    prefixlen: 24,
+                    broadcast: None,
+                }),
+                if_addrs::IfAddr::V6(if_addrs::Ifv6Addr {
+                    ip: "2001:db8::1".parse().unwrap(),
+                    netmask: "ffff:ffff:ffff:ffff::".parse().unwrap(),
+                    prefixlen: 64,
+                    broadcast: None,
+                }),
+            ]),
+            max_packet_size_v4: MAX_PKT_DEFAULT,
+            max_packet_size_v6: MAX_PKT_DEFAULT,
+        };
+        let mut first = crate::ServiceInfo::new(
+            "_http._tcp.local.",
+            "first",
+            "shared.local.",
+            "192.0.2.10",
+            80,
+            &[] as &[(&str, &str)],
+        )
+        .unwrap();
+        let mut second = crate::ServiceInfo::new(
+            "_http._tcp.local.",
+            "second",
+            "shared.local.",
+            "192.0.2.11,2001:db8::10",
+            81,
+            &[] as &[(&str, &str)],
+        )
+        .unwrap();
+        first.set_requires_probe(false);
+        second.set_requires_probe(false);
+        let mut registry = crate::service_info::DnsRegistry::new();
+        registry.reconcile_services(&[&first, &second], &intf, std::time::Instant::now());
+        let mut query = DnsOutgoing::new(FLAGS_QR_QUERY);
+        query.add_question("_http._tcp.local.", RRType::PTR);
+        let packets = query.to_packets(MAX_PKT_DEFAULT, IPV6);
+        let incoming = DnsIncoming::new(packets[0].as_bytes().to_vec(), (&intf).into()).unwrap();
+        let mut response = DnsOutgoing::new(FLAGS_QR_RESPONSE);
+        response.add_answer_with_additionals(&incoming, &first, &intf, &registry, true);
+        assert_eq!(response.answers_count(), 1);
+        let additionals = response.additionals();
+        assert_eq!(
+            additionals
+                .iter()
+                .filter(|record| record.get_type() == RRType::A)
+                .count(),
+            2
+        );
+        assert_eq!(
+            additionals
+                .iter()
+                .filter(|record| record.get_type() == RRType::AAAA)
+                .count(),
+            1
+        );
+        assert_eq!(
+            additionals
+                .iter()
+                .filter(|record| record.get_type() == RRType::SRV)
+                .count(),
+            1
+        );
+        assert_eq!(
+            additionals
+                .iter()
+                .filter(|record| record.get_type() == RRType::TXT)
+                .count(),
+            1
+        );
+        assert!(additionals.iter().all(|record| record.get_cache_flush()));
     }
 
     /// Found by fuzzing the packet parser.
@@ -3884,115 +4129,5 @@ mod tests {
         assert!(out
             .to_complete_data_on_wire(MAX_PKT_DEFAULT, false)
             .is_none());
-    }
-
-    #[test]
-    fn test_probe_order_compares_uncompressed_name_lengths_and_case() {
-        let ptr = |alias: &str| {
-            DnsPointer::new(
-                "_http._tcp.local.",
-                RRType::PTR,
-                CLASS_IN,
-                120,
-                alias.to_string(),
-            )
-        };
-        assert_eq!(
-            ptr("z.local.").compare_rdata(&ptr("aa.local.")),
-            std::cmp::Ordering::Less
-        );
-        assert_eq!(
-            ptr(r"\.a.local.").compare_rdata(&ptr("z.local.")),
-            std::cmp::Ordering::Greater
-        );
-        assert!(ptr("Z.local.").rrdata_match(&ptr("z.local.")));
-        assert_eq!(
-            ptr("Z.local.").compare_rdata(&ptr("z.local.")),
-            std::cmp::Ordering::Less
-        );
-
-        let srv = |host: &str| {
-            DnsSrv::new(
-                "instance._http._tcp.local.",
-                CLASS_IN,
-                120,
-                0,
-                0,
-                80,
-                host.to_string(),
-            )
-        };
-        assert_eq!(
-            srv("z.local.").compare_rdata(&srv("aa.local.")),
-            std::cmp::Ordering::Less
-        );
-        assert_eq!(
-            srv(r"\.a.local.").compare_rdata(&srv("z.local.")),
-            std::cmp::Ordering::Greater
-        );
-
-        let nsec = |name: &str| {
-            DnsNSec::new(
-                "host.local.",
-                CLASS_IN,
-                120,
-                name.to_string(),
-                vec![0, 1, 0x40],
-            )
-        };
-        assert_eq!(
-            nsec("z.local.").compare_rdata(&nsec("aa.local.")),
-            std::cmp::Ordering::Less
-        );
-        assert_eq!(
-            nsec(r"\.a.local.").compare_rdata(&nsec("z.local.")),
-            std::cmp::Ordering::Greater
-        );
-    }
-
-    #[test]
-    fn test_escaped_names_roundtrip_without_merging_labels() {
-        let names = [
-            r"A\.B._http._tcp.local.",
-            "A.B._http._tcp.local.",
-            r"A\\._http._tcp.local.",
-        ];
-        let mut out = DnsOutgoing::new(FLAGS_QR_RESPONSE);
-        for name in names {
-            out.add_answer_record(DnsPointer::new(
-                "_http._tcp.local.",
-                RRType::PTR,
-                CLASS_IN,
-                120,
-                name.to_string(),
-            ));
-        }
-        let packets = out.to_packets(MAX_PKT_DEFAULT, IPV6);
-        let incoming =
-            DnsIncoming::new(packets[0].as_bytes().to_vec(), test_interface_id()).unwrap();
-        let aliases: Vec<_> = incoming
-            .answers()
-            .iter()
-            .map(|record| record.any().downcast_ref::<DnsPointer>().unwrap().alias())
-            .collect();
-        assert_eq!(aliases, names);
-        let mut repeated = DnsOutgoing::new(FLAGS_QR_RESPONSE);
-        for record in incoming.answers() {
-            repeated.add_answer_box(record.clone());
-        }
-        let repeated_packets = repeated.to_packets(MAX_PKT_DEFAULT, IPV6);
-        assert_eq!(repeated_packets[0].as_bytes(), packets[0].as_bytes());
-    }
-
-    #[test]
-    fn test_escaped_name_length_counts_wire_bytes() {
-        let label = r"\.".repeat(63);
-        let name = format!("{label}.{label}.{label}.{}.", r"\.".repeat(61));
-        let mut out = DnsOutgoing::new(FLAGS_QR_QUERY);
-        out.add_question(&name, RRType::PTR);
-        let packets = out.to_packets(MAX_PKT_DEFAULT, IPV6);
-        let incoming =
-            DnsIncoming::new(packets[0].as_bytes().to_vec(), test_interface_id()).unwrap();
-        assert_eq!(incoming.questions()[0].entry.name, name);
     }
 }

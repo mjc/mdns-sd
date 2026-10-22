@@ -238,18 +238,6 @@ impl DnsCache {
     pub(crate) fn get_ptr(&self, ty_domain: &str) -> Option<&Vec<DnsRecordIntf>> {
         self.ptr.get(CanonicalName::new(ty_domain).as_str())
     }
-    pub(crate) fn get_srv(&self, fullname: &str) -> Option<&Vec<DnsRecordIntf>> {
-        self.srv.get(CanonicalName::new(fullname).as_str())
-    }
-
-    pub(crate) fn get_txt(&self, fullname: &str) -> Option<&Vec<DnsRecordIntf>> {
-        self.txt.get(CanonicalName::new(fullname).as_str())
-    }
-
-    pub(crate) fn get_addr(&self, hostname: &str) -> Option<&Vec<DnsRecordIntf>> {
-        self.addr.get(CanonicalName::new(hostname).as_str())
-    }
-
     #[cfg(test)]
     pub(crate) fn get_ptr_on_intf(&self, name: &str, index: u32) -> Option<Vec<&DnsRecordIntf>> {
         self.records_for(name, RRType::PTR, Some(index))
@@ -275,7 +263,6 @@ impl DnsCache {
     pub(crate) fn get_srv_on_intf(&self, name: &str, index: u32) -> Option<Vec<&DnsRecordIntf>> {
         self.records_for(name, RRType::SRV, Some(index))
     }
-    #[cfg(test)]
     pub(crate) fn get_txt_on_intf(&self, name: &str, index: u32) -> Option<Vec<&DnsRecordIntf>> {
         self.records_for(name, RRType::TXT, Some(index))
     }
@@ -730,38 +717,23 @@ impl DnsCache {
             .collect()
     }
 
-    pub(crate) fn get_known_answers<'a>(
-        &'a self,
+    pub(crate) fn get_known_answers_on_intf(
+        &self,
         name: &str,
-        qtype: RRType,
+        ty: RRType,
         now: Instant,
-    ) -> Vec<&'a DnsRecordIntf> {
-        let records_opt = match qtype {
-            RRType::PTR => self.get_ptr(name),
-            RRType::SRV => self.get_srv(name),
-            RRType::A | RRType::AAAA => self.get_addr(name),
-            RRType::TXT => self.get_txt(name),
-            _ => None,
-        };
-
-        let records = match records_opt {
-            Some(items) => items,
-            None => return Vec::new(),
-        };
-
-        // From RFC 6762 section 7.1:
-        // ..Generally, this applies only to Shared records, not Unique records,..
-        //
-        // ..a Multicast DNS querier SHOULD NOT include
-        // records in the Known-Answer list whose remaining TTL is less than
-        // half of their original TTL.
-        records
-            .iter()
-            .filter(move |r| {
-                r.record.get_type() == qtype
-                    && !r.record.get_record().is_expired(now)
-                    && !r.record.get_record().is_unique()
-                    && !r.record.get_record().halflife_passed(now)
+        index: u32,
+    ) -> Vec<&DnsRecordIntf> {
+        if ty == RRType::ANY {
+            return Vec::new();
+        }
+        self.records_for(name, ty, Some(index))
+            .into_iter()
+            .flatten()
+            .filter(|record| {
+                !record.record.get_record().is_unique()
+                    && !record.record.get_record().is_expired(now)
+                    && !record.record.get_record().halflife_passed(now)
             })
             .collect()
     }
