@@ -2654,11 +2654,7 @@ impl Zeroconf {
                     .flatten()
                 {
                     let is_ipv4 = socket.pktinfo.domain() == Domain::IPV4;
-                    let max_size = if is_ipv4 {
-                        intf.max_packet_size_v4
-                    } else {
-                        intf.max_packet_size_v6
-                    };
+                    let max_size = intf.max_packet_size(is_ipv4);
                     let expected = out.to_data_on_wire(max_size, is_ipv4).len();
                     match send_dns_outgoing(&out, intf, &socket.pktinfo, self.port, None, None) {
                         Ok(packets) => sent |= expected > 0 && packets.len() == expected,
@@ -2699,7 +2695,11 @@ impl Zeroconf {
                         continue;
                     }
 
-                    let announced_v4 = if let Some(sock) = self.ipv4_sock.as_mut() {
+                    let mut announcement = Announcement::default();
+                    for sock in [self.ipv4_sock.as_ref(), self.ipv6_sock.as_ref()]
+                        .iter()
+                        .flatten()
+                    {
                         match announce_service_on_intf(
                             dns_registry,
                             info,
@@ -2707,35 +2707,14 @@ impl Zeroconf {
                             &sock.pktinfo,
                             self.port,
                         ) {
-                            Ok(announced) => announced,
+                            Ok(result) => announcement.merge(result),
                             Err(InternalError::IntfAddrInvalid(intf_addr)) => {
                                 invalid_intf_addrs.insert(intf_addr);
-                                Announcement::default()
                             }
                         }
-                    } else {
-                        Announcement::default()
-                    };
-                    let announced_v6 = if let Some(sock) = self.ipv6_sock.as_mut() {
-                        match announce_service_on_intf(
-                            dns_registry,
-                            info,
-                            intf,
-                            &sock.pktinfo,
-                            self.port,
-                        ) {
-                            Ok(announced) => announced,
-                            Err(InternalError::IntfAddrInvalid(intf_addr)) => {
-                                invalid_intf_addrs.insert(intf_addr);
-                                Announcement::default()
-                            }
-                        }
-                    } else {
-                        Announcement::default()
-                    };
+                    }
 
-                    let sent = announced_v4.sent || announced_v6.sent;
-                    if sent || announced_v4.needs_retry || announced_v6.needs_retry {
+                    if announcement.sent || announcement.needs_retry {
                         let next_time = now
                             + Duration::from_millis(
                                 ANNOUNCE_SECOND_DELAY_MILLIS
@@ -2748,7 +2727,7 @@ impl Zeroconf {
                             next_time,
                         );
                     }
-                    if sent {
+                    if announcement.sent {
                         let fullname = dns_registry.resolve_name(&service_name).to_string();
 
                         let hostname = dns_registry.resolve_name(info.get_hostname());
@@ -4413,18 +4392,21 @@ impl Zeroconf {
         };
         let was_announced = info.get_status(if_index) == ServiceStatus::Announced;
 
-        let announced_v4 = if let Some(sock) = self.ipv4_sock.as_ref() {
-            announce_service_on_intf(dns_registry, info, intf, &sock.pktinfo, self.port)?
-        } else {
-            Announcement::default()
-        };
-        let announced_v6 = if let Some(sock) = self.ipv6_sock.as_ref() {
-            announce_service_on_intf(dns_registry, info, intf, &sock.pktinfo, self.port)?
-        } else {
-            Announcement::default()
-        };
+        let mut announcement = Announcement::default();
+        for sock in [self.ipv4_sock.as_ref(), self.ipv6_sock.as_ref()]
+            .iter()
+            .flatten()
+        {
+            announcement.merge(announce_service_on_intf(
+                dns_registry,
+                info,
+                intf,
+                &sock.pktinfo,
+                self.port,
+            )?);
+        }
 
-        if announced_v4.sent || announced_v6.sent {
+        if announcement.sent {
             let hostname = dns_registry.resolve_name(info.get_hostname());
             let service_name = dns_registry.resolve_name(&fullname).to_string();
 
@@ -4436,10 +4418,7 @@ impl Zeroconf {
             );
             info.set_status(if_index, ServiceStatus::Announced);
         }
-        if announced_v4.needs_retry
-            || announced_v6.needs_retry
-            || (!was_announced && (announced_v4.sent || announced_v6.sent))
-        {
+        if announcement.needs_retry || (!was_announced && announcement.sent) {
             schedule_register_resend(
                 &mut self.retransmissions,
                 &fullname,
@@ -5183,27 +5162,15 @@ fn prepare_announce(
     intf: &MyIntf,
     registry: &DnsRegistry,
 ) -> Option<DnsOutgoing> {
-    if info.get_addrs_on_my_intf_v4(intf).is_empty()
-        && info.get_addrs_on_my_intf_v6(intf).is_empty()
-    {
+    if info.addrs_on_intf(intf).next().is_none() || !registry.is_service_claimed(info) {
         return None;
     }
     let fullname = registry.resolve_name(info.get_fullname());
     let hostname = registry.resolve_name(info.get_hostname());
-    if !registry.is_claimed(fullname) || !registry.is_claimed(hostname) {
-        return None;
-    }
     let mut out = DnsOutgoing::new(FLAGS_QR_RESPONSE | FLAGS_AA);
-    out.add_answer_record(DnsPointer::new(
-        info.get_type(),
-        RRType::PTR,
-        CLASS_IN,
-        info.get_other_ttl(),
-        fullname.to_string(),
-    ));
-    if let Some(subtype) = info.get_subtype() {
+    for name in std::iter::once(info.get_type()).chain(info.get_subtype().as_deref()) {
         out.add_answer_record(DnsPointer::new(
-            subtype,
+            name,
             RRType::PTR,
             CLASS_IN,
             info.get_other_ttl(),
@@ -5228,6 +5195,13 @@ fn prepare_announce(
 struct Announcement {
     sent: bool,
     needs_retry: bool,
+}
+
+impl Announcement {
+    fn merge(&mut self, other: Self) {
+        self.sent |= other.sent;
+        self.needs_retry |= other.needs_retry;
+    }
 }
 
 fn schedule_register_resend(
@@ -5276,11 +5250,7 @@ fn announce_service_on_intf(
                 needs_retry,
             });
         }
-        let max_size = if is_ipv4 {
-            intf.max_packet_size_v4
-        } else {
-            intf.max_packet_size_v6
-        };
+        let max_size = intf.max_packet_size(is_ipv4);
         let expected = out.to_data_on_wire(max_size, is_ipv4).len();
         let sent_packets = send_dns_outgoing(&out, intf, sock, port, None, None)?;
         let sent = expected > 0 && sent_packets.len() == expected;

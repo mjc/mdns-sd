@@ -451,20 +451,28 @@ impl ServiceInfo {
         self.weight
     }
 
-    /// Returns all addresses published
+    pub(crate) fn addrs_on_intf<'a>(
+        &'a self,
+        my_intf: &'a MyIntf,
+    ) -> impl Iterator<Item = IpAddr> + 'a {
+        self.addresses.iter().copied().filter(move |addr| {
+            my_intf
+                .addrs
+                .iter()
+                .any(|if_addr| valid_ip_on_intf(addr, if_addr))
+        })
+    }
+
+    /// Returns the IPv4 addresses published on this interface.
     pub(crate) fn get_addrs_on_my_intf_v4(&self, my_intf: &MyIntf) -> Vec<IpAddr> {
-        self.addresses
-            .iter()
-            .filter(|a| a.is_ipv4() && my_intf.addrs.iter().any(|x| valid_ip_on_intf(a, x)))
-            .copied()
+        self.addrs_on_intf(my_intf)
+            .filter(IpAddr::is_ipv4)
             .collect()
     }
 
     pub(crate) fn get_addrs_on_my_intf_v6(&self, my_intf: &MyIntf) -> Vec<IpAddr> {
-        self.addresses
-            .iter()
-            .filter(|a| a.is_ipv6() && my_intf.addrs.iter().any(|x| valid_ip_on_intf(a, x)))
-            .copied()
+        self.addrs_on_intf(my_intf)
+            .filter(IpAddr::is_ipv6)
             .collect()
     }
 
@@ -1396,10 +1404,7 @@ impl DnsRegistry {
 
         let published_hosts: HashSet<_> = services
             .iter()
-            .filter(|service| {
-                !service.get_addrs_on_my_intf_v4(intf).is_empty()
-                    || !service.get_addrs_on_my_intf_v6(intf).is_empty()
-            })
+            .filter(|service| service.addrs_on_intf(intf).next().is_some())
             .map(|service| registry_key(self.resolve_name(service.get_hostname())))
             .collect();
 
@@ -1409,11 +1414,7 @@ impl DnsRegistry {
             .map(|service| (*service, true))
             .chain(pending_hosts.iter().map(|service| (*service, false)))
         {
-            let addresses: Vec<_> = service
-                .get_addrs_on_my_intf_v4(intf)
-                .into_iter()
-                .chain(service.get_addrs_on_my_intf_v6(intf))
-                .collect();
+            let addresses: Vec<_> = service.addrs_on_intf(intf).collect();
             if addresses.is_empty() {
                 continue;
             }
@@ -1535,6 +1536,11 @@ impl DnsRegistry {
 
     pub(crate) fn is_claimed(&self, name: &str) -> bool {
         self.active.contains_key(&registry_key(name))
+    }
+
+    pub(crate) fn is_service_claimed(&self, service: &ServiceInfo) -> bool {
+        self.is_claimed(self.resolve_name(service.get_fullname()))
+            && self.is_claimed(self.resolve_name(service.get_hostname()))
     }
 }
 

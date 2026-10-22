@@ -150,25 +150,18 @@ impl DnsCache {
                     class: CLASS_IN,
                 };
                 if let Some(records) = self.records.get(&(index, key)) {
-                    result.extend(
-                        records
-                            .iter()
-                            .filter(|record| !record.record.get_record().is_expired(now)),
-                    );
+                    result.extend(records);
                 }
             }
         } else {
             for ((_, key), records) in &self.records {
                 if key.name == name && key.class == CLASS_IN && types.contains(&key.rr_type) {
-                    result.extend(
-                        records
-                            .iter()
-                            .filter(|record| !record.record.get_record().is_expired(now)),
-                    );
+                    result.extend(records);
                 }
             }
             result.sort_by_key(|record| record.src_intf.index);
         }
+        result.retain(|record| !record.record.get_record().is_expired(now));
         if result.is_empty() {
             None
         } else {
@@ -314,14 +307,10 @@ impl DnsCache {
             .collect()
     }
 
-    fn addresses_for_host(
-        &self,
-        host: &str,
-        index: Option<u32>,
-    ) -> HashMap<String, HashSet<ScopedIp>> {
+    pub(crate) fn get_addresses_for_host(&self, host: &str) -> HashMap<String, HashSet<ScopedIp>> {
         let mut result = HashMap::new();
         for record in self
-            .records_for(host, RRType::ANY, index)
+            .records_for(host, RRType::ANY, None)
             .into_iter()
             .flatten()
         {
@@ -333,9 +322,6 @@ impl DnsCache {
             }
         }
         result
-    }
-    pub(crate) fn get_addresses_for_host(&self, host: &str) -> HashMap<String, HashSet<ScopedIp>> {
-        self.addresses_for_host(host, None)
     }
 
     pub(crate) fn service_verify_queries(
@@ -466,40 +452,33 @@ impl DnsCache {
         }
     }
 
-    fn has_ptr(&self, ty: &str, instance: &str, index: Option<u32>, now: Instant) -> bool {
+    fn has_ptr(&self, ty: &str, instance: &str, now: Instant) -> bool {
         let name = CanonicalName::new(instance);
-        self.records_for(ty, RRType::PTR, index)
-            .into_iter()
-            .flatten()
-            .any(|record| {
-                !record.record.get_record().is_expired(now)
-                    && record
-                        .record
-                        .any()
-                        .downcast_ref::<DnsPointer>()
-                        .is_some_and(|ptr| CanonicalName::new(ptr.alias()) == name)
-            })
+        self.get_ptr(ty).into_iter().flatten().any(|record| {
+            !record.record.get_record().is_expired(now)
+                && record
+                    .record
+                    .any()
+                    .downcast_ref::<DnsPointer>()
+                    .is_some_and(|ptr| CanonicalName::new(ptr.alias()) == name)
+        })
     }
 
     fn has_service(&self, ty: &str, instance: &str, now: Instant) -> bool {
-        self.records_for(ty, RRType::PTR, None)
-            .into_iter()
-            .flatten()
-            .any(|ptr| {
-                !ptr.record.get_record().is_expired(now)
-                    && ptr
-                        .record
-                        .any()
-                        .downcast_ref::<DnsPointer>()
-                        .is_some_and(|ptr| {
-                            CanonicalName::new(ptr.alias()) == CanonicalName::new(instance)
-                        })
-                    && self
-                        .get_srv_on_intf(instance, ptr.src_intf.index)
-                        .into_iter()
-                        .flatten()
-                        .any(|srv| !srv.record.get_record().is_expired(now))
-            })
+        let name = CanonicalName::new(instance);
+        self.get_ptr(ty).into_iter().flatten().any(|ptr| {
+            !ptr.record.get_record().is_expired(now)
+                && ptr
+                    .record
+                    .any()
+                    .downcast_ref::<DnsPointer>()
+                    .is_some_and(|ptr| CanonicalName::new(ptr.alias()) == name)
+                && self
+                    .get_srv_on_intf(instance, ptr.src_intf.index)
+                    .into_iter()
+                    .flatten()
+                    .any(|srv| !srv.record.get_record().is_expired(now))
+        })
     }
 
     /// All record types expire through this pass, independently of PTR relationships.
@@ -571,20 +550,23 @@ impl DnsCache {
     ) -> HashSet<(u32, CanonicalName, RRType)> {
         let mut names = HashSet::new();
         for ty in service_types {
+            let ty_name = CanonicalName::new(ty);
             for record in self.get_ptr(ty).into_iter().flatten() {
                 if record.record.get_record().is_expired(now) {
                     continue;
                 }
-                names.insert((record.src_intf.index, CanonicalName::new(ty), RRType::PTR));
-                if CanonicalName::new(ty).as_str() == SERVICE_TYPE_ENUMERATION {
+                let scope = record.src_intf.index;
+                names.insert((scope, ty_name.clone(), RRType::PTR));
+                if ty_name.as_str() == SERVICE_TYPE_ENUMERATION {
                     continue;
                 }
                 if let Some(ptr) = record.record.any().downcast_ref::<DnsPointer>() {
                     let instance = CanonicalName::new(ptr.alias());
-                    names.insert((record.src_intf.index, instance.clone(), RRType::SRV));
-                    names.insert((record.src_intf.index, instance, RRType::TXT));
+                    for ty in [RRType::SRV, RRType::TXT] {
+                        names.insert((scope, instance.clone(), ty));
+                    }
                     for srv in self
-                        .get_srv_on_intf(ptr.alias(), record.src_intf.index)
+                        .get_srv_on_intf(ptr.alias(), scope)
                         .into_iter()
                         .flatten()
                     {
@@ -592,16 +574,10 @@ impl DnsCache {
                             continue;
                         }
                         if let Some(srv) = srv.record.any().downcast_ref::<DnsSrv>() {
-                            names.insert((
-                                record.src_intf.index,
-                                CanonicalName::new(srv.host()),
-                                RRType::A,
-                            ));
-                            names.insert((
-                                record.src_intf.index,
-                                CanonicalName::new(srv.host()),
-                                RRType::AAAA,
-                            ));
+                            let host = CanonicalName::new(srv.host());
+                            for ty in [RRType::A, RRType::AAAA] {
+                                names.insert((scope, host.clone(), ty));
+                            }
                         }
                     }
                 }
@@ -794,7 +770,7 @@ impl DnsCache {
         let now = Instant::now();
         let mut removed_instances: HashMap<String, HashSet<String>> = HashMap::new();
         for (ty, instance) in ptrs {
-            if !self.has_ptr(&ty, &instance, None, now) {
+            if !self.has_ptr(&ty, &instance, now) {
                 removed_instances.entry(ty).or_default().insert(instance);
             } else {
                 modified_instances.insert(instance);

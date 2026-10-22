@@ -25,16 +25,8 @@ impl Zeroconf {
                 info.set_status(*index, previous.get_status(*index));
             }
             let changes_host = !names_equal(previous.get_hostname(), info.get_hostname());
-            let waits_for_host = changes_host
-                && info.requires_probe()
-                && self.my_intfs.iter().any(|(index, intf)| {
-                    let eligible = !info.get_addrs_on_my_intf_v4(intf).is_empty()
-                        || !info.get_addrs_on_my_intf_v6(intf).is_empty();
-                    eligible
-                        && !self.dns_registry_map.get(index).is_some_and(|registry| {
-                            registry.is_claimed(registry.resolve_name(info.get_hostname()))
-                        })
-                });
+            let waits_for_host =
+                changes_host && info.requires_probe() && !self.hostname_is_claimed(&info);
             if waits_for_host {
                 self.pending_registrations.insert(fullname, info);
                 self.reconcile_registries();
@@ -102,29 +94,28 @@ impl Zeroconf {
         }
         for service in self.my_services.values_mut() {
             for (index, registry) in &self.dns_registry_map {
-                if !registry.is_claimed(registry.resolve_name(service.get_fullname()))
-                    || !registry.is_claimed(registry.resolve_name(service.get_hostname()))
-                {
+                if !registry.is_service_claimed(service) {
                     service.set_status(*index, ServiceStatus::Probing);
                 }
             }
         }
     }
 
+    /// Every interface used by this registration has claimed its hostname.
+    fn hostname_is_claimed(&self, service: &ServiceInfo) -> bool {
+        self.my_intfs.iter().all(|(index, intf)| {
+            service.addrs_on_intf(intf).next().is_none()
+                || self.dns_registry_map.get(index).is_some_and(|registry| {
+                    registry.is_claimed(registry.resolve_name(service.get_hostname()))
+                })
+        })
+    }
+
     pub(super) fn commit_ready_registrations(&mut self) {
         let ready: Vec<_> = self
             .pending_registrations
             .iter()
-            .filter(|(_, service)| {
-                self.my_intfs.iter().all(|(index, intf)| {
-                    let eligible = !service.get_addrs_on_my_intf_v4(intf).is_empty()
-                        || !service.get_addrs_on_my_intf_v6(intf).is_empty();
-                    !eligible
-                        || self.dns_registry_map.get(index).is_some_and(|registry| {
-                            registry.is_claimed(registry.resolve_name(service.get_hostname()))
-                        })
-                })
-            })
+            .filter(|(_, service)| self.hostname_is_claimed(service))
             .map(|(name, _)| name.clone())
             .collect();
         if ready.is_empty() {
@@ -158,28 +149,19 @@ impl Zeroconf {
                 for record in registry.records_for_name(hostname) {
                     push_record(&mut records, record.clone());
                 }
-                if !registry.is_claimed(fullname) || !registry.is_claimed(hostname) {
+                if !registry.is_service_claimed(service) {
                     continue;
                 }
                 for record in registry.records_for_name(fullname) {
                     push_record(&mut records, record.clone());
                 }
-                push_record(
-                    &mut records,
-                    DnsPointer::new(
-                        service.get_type(),
-                        RRType::PTR,
-                        CLASS_IN,
-                        service.get_other_ttl(),
-                        fullname.to_string(),
-                    )
-                    .boxed(),
-                );
-                if let Some(subtype) = service.get_subtype() {
+                for name in
+                    std::iter::once(service.get_type()).chain(service.get_subtype().as_deref())
+                {
                     push_record(
                         &mut records,
                         DnsPointer::new(
-                            subtype,
+                            name,
                             RRType::PTR,
                             CLASS_IN,
                             service.get_other_ttl(),
@@ -378,7 +360,7 @@ impl Zeroconf {
         for (key, service) in &mut self.my_services {
             let fullname = registry.resolve_name(service.get_fullname());
             let hostname = registry.resolve_name(service.get_hostname());
-            if !registry.is_claimed(fullname) || !registry.is_claimed(hostname) {
+            if !registry.is_service_claimed(service) {
                 continue;
             }
             let related = records.iter().any(|record| {
