@@ -2320,7 +2320,7 @@ mod tests {
             key: "key1".to_string(),
             val: Some("val1".to_string().into()),
         };
-        let prop_1_debug = format!("{:?}", &prop_1);
+        let prop_1_debug = format!("{:?}", prop_1);
         assert_eq!(
             prop_1_debug,
             "TxtProperty {key: \"key1\", val: Some(\"val1\")}"
@@ -2331,7 +2331,7 @@ mod tests {
             key: "key2".to_string(),
             val: Some(vec![150u8, 151u8, 152u8]),
         };
-        let prop_2_debug = format!("{:?}", &prop_2);
+        let prop_2_debug = format!("{:?}", prop_2);
         assert_eq!(
             prop_2_debug,
             "TxtProperty {key: \"key2\", val: Some(0x969798)}"

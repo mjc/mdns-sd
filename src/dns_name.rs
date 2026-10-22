@@ -3,6 +3,8 @@
 use crate::dns_parser::{DnsRecordExt, RRType};
 use std::borrow::Borrow;
 
+pub(crate) const SERVICE_TYPE_ENUMERATION: &str = "_services._dns-sd._udp.local.";
+
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct CanonicalName(String);
 

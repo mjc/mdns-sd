@@ -11,6 +11,13 @@ pub(super) fn daemon() -> (Zeroconf, u32) {
     let index = loopback.index.unwrap();
     daemon.my_intfs.retain(|key, _| *key == index);
     daemon.dns_registry_map.retain(|key, _| *key == index);
+    daemon
+        .my_intfs
+        .get_mut(&index)
+        .unwrap()
+        .addrs
+        .retain(|address| address.ip().is_ipv4());
+    daemon.ipv6_sock = None;
     daemon.if_selections = vec![
         IfSelection {
             if_kind: IfKind::All,

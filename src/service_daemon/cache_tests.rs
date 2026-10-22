@@ -764,3 +764,34 @@ fn escaped_subtype_marker_does_not_expand_parent_browse_interest() {
     assert_eq!(daemon.cache.usage(), (0, 0));
     assert!(receiver.is_empty());
 }
+
+#[test]
+fn type_enumeration_does_not_resolve_type_names_as_instances() {
+    let (mut daemon, index) = daemon();
+    let (sender, receiver) = flume::unbounded();
+    daemon
+        .service_queriers
+        .insert(SERVICE_TYPE_ENUMERATION.to_string(), sender.into());
+    let alias = "_print._sub._cache._tcp.local.";
+    let mut records = discovery_records(&daemon, index, alias, "unrelated.local.", 120, false);
+    records.push(
+        DnsPointer::new(
+            SERVICE_TYPE_ENUMERATION,
+            RRType::PTR,
+            CLASS_IN,
+            120,
+            alias.to_string(),
+        )
+        .boxed(),
+    );
+    receive(&mut daemon, index, records);
+    assert_eq!(daemon.cache.ptr_count(), 1);
+    assert_eq!(daemon.cache.srv_count(), 0);
+    assert_eq!(daemon.cache.txt_count(), 0);
+    assert_eq!(daemon.cache.addr_count(), 0);
+    assert!(daemon.pending_resolves.is_empty());
+    assert!(daemon.retransmissions.is_empty());
+    assert!(receiver
+        .try_iter()
+        .any(|event| matches!(event, ServiceEvent::ServiceFound(..))));
+}

@@ -28,6 +28,7 @@
 // In mDNS and DNS, the basic data structure is "Resource Record" (RR), where
 // in Service Discovery, the basic data structure is "Service Info". One Service Info
 // corresponds to a set of DNS Resource Records.
+use crate::dns_name::SERVICE_TYPE_ENUMERATION;
 #[cfg(feature = "logging")]
 use crate::log::{debug, trace};
 use crate::{
@@ -1702,9 +1703,10 @@ impl Zeroconf {
                 let valid = ptr_alive
                     && match delivery {
                         BrowseDelivery::Found(_) => {
-                            if self
-                                .resolve_service_on_intf(ty, instance, *index)
-                                .is_ok_and(|service| service.is_valid())
+                            if ty != SERVICE_TYPE_ENUMERATION
+                                && self
+                                    .resolve_service_on_intf(ty, instance, *index)
+                                    .is_ok_and(|service| service.is_valid())
                             {
                                 changed.insert((ty.clone(), instance.clone()));
                                 newly_resolved.insert((ty.clone(), *index, instance.clone()));
@@ -2634,6 +2636,12 @@ impl Zeroconf {
                     if let Some(probe) = dns_registry.probing.get_mut(question.entry_name()) {
                         if sent {
                             probe.update_next_send(now);
+                            trace!(
+                                "probe sent on {} for {} ({}/3)",
+                                intf.name,
+                                question.entry_name(),
+                                probe.probes_sent
+                            );
                         } else {
                             probe.next_send = now + Duration::from_secs(1);
                         }
@@ -2929,7 +2937,7 @@ impl Zeroconf {
         }
         let mut scopes = HashSet::new();
         for (ty, subscription) in &self.service_queriers {
-            if !subscription.querying {
+            if !subscription.querying || ty == SERVICE_TYPE_ENUMERATION {
                 continue;
             }
             for record in self.cache.get_ptr(ty).into_iter().flatten() {
@@ -3338,6 +3346,9 @@ impl Zeroconf {
                     continue;
                 }
                 if let Some(ptr) = record.any().downcast_ref::<DnsPointer>() {
+                    if CanonicalName::new(record.get_name()).as_str() == SERVICE_TYPE_ENUMERATION {
+                        continue;
+                    }
                     dependencies.push((CanonicalName::new(ptr.alias()), RRType::SRV));
                     dependencies.push((CanonicalName::new(ptr.alias()), RRType::TXT));
                 } else if let Some(srv) = record.any().downcast_ref::<DnsSrv>() {
@@ -3356,7 +3367,9 @@ impl Zeroconf {
 
     fn expire_cache(&mut self, now: Instant) {
         let expired = self.cache.evict_expired(now);
-        self.notify_service_removal(expired.expired_services);
+        if !expired.changed {
+            return;
+        }
         for (hostname, addrs) in expired.expired_addrs {
             self.push_hostname(
                 &hostname,
@@ -3365,7 +3378,7 @@ impl Zeroconf {
             let instances = self.cache.get_instances_on_host(&hostname);
             self.resolve_updated_instances(&instances.into_iter().collect());
         }
-        self.reconcile_browse_state();
+        self.notify_service_removal(expired.expired_services);
     }
 
     fn hostname_snapshot(&self) -> HashMap<String, HashSet<ScopedIp>> {
@@ -3411,6 +3424,7 @@ impl Zeroconf {
         let Some(intf) = self.my_intfs.get(&if_index) else {
             return;
         };
+        let mut mutated = false;
         let mut changed = Vec::new();
         let mut found = Vec::new();
         for record in records {
@@ -3429,6 +3443,7 @@ impl Zeroconf {
                 if !inserted {
                     continue;
                 }
+                mutated = true;
                 let kind = cached.record.get_type();
                 let name = cached.record.get_name().to_string();
                 if let Some(ptr) = cached.record.any().downcast_ref::<DnsPointer>() {
@@ -3479,7 +3494,9 @@ impl Zeroconf {
             }
         }
         self.notify_hostname_changes(previous_addresses);
-        self.resolve_updated_instances(&updated);
+        if mutated {
+            self.resolve_updated_instances(&updated);
+        }
     }
 
     fn conflict_handler(&mut self, msg: &DnsIncoming, if_index: u32) {
@@ -3609,7 +3626,7 @@ impl Zeroconf {
             .collect();
         let mut instances = HashSet::new();
         for (ty, records) in self.cache.all_ptr() {
-            if !self.service_queriers.contains_key(&ty) {
+            if ty == SERVICE_TYPE_ENUMERATION || !self.service_queriers.contains_key(&ty) {
                 continue;
             }
             for record in records {
@@ -4449,6 +4466,9 @@ impl Zeroconf {
                 query_ptr_count += 1;
             }
 
+            if ty_domain == SERVICE_TYPE_ENUMERATION {
+                continue;
+            }
             let instances = self.cache.refresh_due_srv_txt(ty_domain);
             for (instance, types) in instances {
                 trace!("sending refresh query for: {}", instance);
@@ -6576,7 +6596,7 @@ mod tests {
             match event {
                 ServiceEvent::ServiceResolved(info) => {
                     resolved = true;
-                    println!("Resolved a service of {}", &info.fullname);
+                    println!("Resolved a service of {}", info.fullname);
                     break;
                 }
                 e => {
@@ -6658,7 +6678,7 @@ mod tests {
             match event {
                 ServiceEvent::ServiceResolved(info) => {
                     resolved = true;
-                    println!("Resolved a service of {}", &info.fullname);
+                    println!("Resolved a service of {}", info.fullname);
                     break;
                 }
                 e => {
@@ -6699,7 +6719,7 @@ mod tests {
         while let Ok(event) = browse_chan.recv_timeout(timeout) {
             if let ServiceEvent::ServiceResolved(info) = event {
                 resolved = true;
-                println!("Resolved a service of {}", &info.fullname);
+                println!("Resolved a service of {}", info.fullname);
                 break;
             }
         }
@@ -6713,7 +6733,7 @@ mod tests {
         let expire_timeout = Duration::from_secs(new_ttl as u64);
         while let Ok(event) = browse_chan.recv_timeout(expire_timeout) {
             if let ServiceEvent::ServiceRemoved(service_type, full_name) = event {
-                println!("Service removed: {}: {}", &service_type, &full_name);
+                println!("Service removed: {}: {}", service_type, full_name);
                 break;
             }
         }
@@ -6754,7 +6774,7 @@ mod tests {
                 Ok(HostnameResolutionEvent::AddressesFound(found_hostname, addresses)) => {
                     assert_eq!(found_hostname, hostname);
                     assert!(addresses.contains(&service_ip_addr));
-                    println!("address found: {:?}", &addresses);
+                    println!("address found: {:?}", addresses);
                     break true;
                 }
                 Ok(HostnameResolutionEvent::SearchStopped(_)) => break false,
@@ -6778,7 +6798,7 @@ mod tests {
 
                     println!(
                         "address removed: hostname: {} addresses: {:?}",
-                        &hostname, &addresses
+                        hostname, addresses
                     );
                     break true;
                 }
@@ -6833,7 +6853,7 @@ mod tests {
         while let Ok(event) = browse_chan.recv_timeout(timeout) {
             if let ServiceEvent::ServiceResolved(info) = event {
                 resolved = true;
-                println!("Resolved a service of {}", &info.fullname);
+                println!("Resolved a service of {}", info.fullname);
                 break;
             }
         }
@@ -6843,7 +6863,7 @@ mod tests {
         // wait over 80% of TTL, and refresh PTR should be sent out.
         let timeout = Duration::from_millis(new_ttl as u64 * 1000 * 90 / 100);
         while let Ok(event) = browse_chan.recv_timeout(timeout) {
-            println!("event: {:?}", &event);
+            println!("event: {:?}", event);
         }
 
         // verify refresh counter.
@@ -7162,7 +7182,7 @@ mod tests {
         client.set_ip_check_interval(1).unwrap();
 
         // Now shutdown the interface and expect the client to lose the service.
-        println!("Shutting down interface {}", &intf_name);
+        println!("Shutting down interface {}", intf_name);
         client.test_down_interface(&intf_name).unwrap();
 
         let mut got_removed = false;
@@ -7176,7 +7196,7 @@ mod tests {
         }
         assert!(got_removed, "Should receive ServiceRemoved event");
 
-        println!("Bringing up interface {}", &intf_name);
+        println!("Bringing up interface {}", intf_name);
         client.test_up_interface(&intf_name).unwrap();
         let mut got_data = false;
         while let Ok(event) = receiver.recv_timeout(timeout) {
@@ -7239,7 +7259,7 @@ mod tests {
         while let Ok(event) = browse_chan.recv_timeout(timeout) {
             if let ServiceEvent::ServiceResolved(info) = event {
                 resolved = true;
-                println!("Resolved a service of {}", &info.get_fullname());
+                println!("Resolved a service of {}", info.get_fullname());
                 break;
             }
         }
@@ -7291,7 +7311,7 @@ mod tests {
         while let Ok(event) = browse_chan.recv_timeout(timeout) {
             if let ServiceEvent::ServiceResolved(info) = event {
                 resolved = true;
-                println!("Resolved a service of {}", &info.get_fullname());
+                println!("Resolved a service of {}", info.get_fullname());
                 break;
             }
         }

@@ -1,7 +1,7 @@
 //! Received DNS records, grouped by their link and resource record set.
 
 use crate::{
-    dns_name::{CanonicalName, RrsetKey},
+    dns_name::{CanonicalName, RrsetKey, SERVICE_TYPE_ENUMERATION},
     dns_parser::{DnsAddress, DnsPointer, DnsRecordBox, DnsSrv, InterfaceId, RRType, CLASS_IN},
     service_info::{split_sub_domain, MyIntf},
     ScopedIp,
@@ -37,6 +37,7 @@ pub(crate) struct IntfRemovalResult {
 }
 
 pub(crate) struct CacheEviction {
+    pub(crate) changed: bool,
     pub(crate) expired_services: HashMap<String, HashSet<String>>,
     pub(crate) expired_addrs: HashMap<String, HashSet<ScopedIp>>,
 }
@@ -503,6 +504,7 @@ impl DnsCache {
 
     /// All record types expire through this pass, independently of PTR relationships.
     pub(crate) fn evict_expired(&mut self, now: Instant) -> CacheEviction {
+        let mut changed = false;
         let mut candidates = Vec::new();
         let mut lost_srv = HashSet::new();
         let mut expired_addrs: HashMap<String, HashSet<ScopedIp>> = HashMap::new();
@@ -511,6 +513,7 @@ impl DnsCache {
                 if !record.record.get_record().is_expired(now) {
                     return true;
                 }
+                changed = true;
                 match key.rr_type {
                     RRType::PTR => {
                         if let Some(ptr) = record.record.any().downcast_ref::<DnsPointer>() {
@@ -555,6 +558,7 @@ impl DnsCache {
             }
         }
         CacheEviction {
+            changed,
             expired_services,
             expired_addrs,
         }
@@ -572,6 +576,9 @@ impl DnsCache {
                     continue;
                 }
                 names.insert((record.src_intf.index, CanonicalName::new(ty), RRType::PTR));
+                if CanonicalName::new(ty).as_str() == SERVICE_TYPE_ENUMERATION {
+                    continue;
+                }
                 if let Some(ptr) = record.record.any().downcast_ref::<DnsPointer>() {
                     let instance = CanonicalName::new(ptr.alias());
                     names.insert((record.src_intf.index, instance.clone(), RRType::SRV));

@@ -213,10 +213,10 @@ fn integration_success() {
     assert!(*respond_count >= 2 || *known_answer_count > 0);
 
     // Test the special meta-query of "_services._dns-sd._udp.local."
-    let service2_type = "_my-service2._udp.local.";
+    let service2_type = format!("_s2{:x}._udp.local.", fastrand::u32(..));
     let service2_instance = "instance2";
     let service2 = ServiceInfo::new(
-        service2_type,
+        &service2_type,
         service2_instance,
         host_name,
         &my_ifaddrs[..],
@@ -230,7 +230,8 @@ fn integration_success() {
     // Browse using the special meta-query.
     let meta_query = "_services._dns-sd._udp.local.";
     let browse_chan = d.browse(meta_query).unwrap();
-    let timeout = Duration::from_secs(2);
+    // A query can precede probe completion, then back off for two seconds.
+    let timeout = Duration::from_secs(5);
 
     loop {
         match browse_chan.recv_timeout(timeout) {
@@ -248,7 +249,11 @@ fn integration_success() {
                 }
             },
             Err(e) => {
-                panic!("browse error: {}", e);
+                let metrics = d
+                    .get_metrics()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(1));
+                panic!("browse error: {}; metrics: {:?}", e, metrics);
             }
         }
     }
