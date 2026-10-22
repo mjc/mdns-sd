@@ -200,9 +200,7 @@ impl Zeroconf {
         repeat_goodbyes: bool,
     ) {
         let after = self.publication_snapshot();
-        // A queued goodbye must never withdraw records reintroduced by a later registration.
-        self.retransmissions
-            .retain(|rerun| !matches!(&rerun.command, Command::UnregisterResend(..)));
+        self.prune_goodbye_retries(&after);
         let indexes: HashSet<_> = before.keys().chain(after.keys()).copied().collect();
         for index in indexes {
             let previous = before.get(&index).map(Vec::as_slice).unwrap_or(&[]);
@@ -244,6 +242,12 @@ impl Zeroconf {
                     let packets = self.send_publication_packet(index, is_ipv4, &out);
                     if repeat_goodbyes {
                         for packet in packets {
+                            if self.retransmissions.iter().any(|rerun| {
+                                matches!(&rerun.command, Command::UnregisterResend(existing, current_index, current_family)
+                                    if existing == &packet && *current_index == index && *current_family == is_ipv4)
+                            }) {
+                                continue;
+                            }
                             self.add_retransmission(
                                 Instant::now() + Duration::from_millis(120),
                                 Command::UnregisterResend(packet, index, is_ipv4),
@@ -273,6 +277,68 @@ impl Zeroconf {
                 self.record_publication_update(index, &updates, false);
                 if sent {
                     self.record_publication_update(index, out.answers(), true);
+                }
+            }
+        }
+    }
+
+    /// Keeps withdrawals that still apply, including unrelated records in mixed packets.
+    fn prune_goodbye_retries(&mut self, current: &PublicationSnapshot) {
+        let queued = std::mem::take(&mut self.retransmissions);
+        for rerun in queued {
+            let ReRun { next_time, command } = rerun;
+            let (packet, index, is_ipv4) = match command {
+                Command::UnregisterResend(packet, index, is_ipv4) => (packet, index, is_ipv4),
+                command => {
+                    self.retransmissions.push(ReRun { next_time, command });
+                    continue;
+                }
+            };
+            let Some(intf) = self.my_intfs.get(&index) else {
+                continue;
+            };
+            let records = current.get(&index).map(Vec::as_slice).unwrap_or(&[]);
+            let Ok(incoming) = DnsIncoming::new(packet.clone(), intf.into()) else {
+                self.retransmissions.push(ReRun {
+                    next_time,
+                    command: Command::UnregisterResend(packet, index, is_ipv4),
+                });
+                continue;
+            };
+            let withdrawn: Vec<_> = incoming.all_records().collect();
+            let mut out = DnsOutgoing::new(FLAGS_QR_RESPONSE | FLAGS_AA);
+            for mut record in withdrawn
+                .iter()
+                .filter(|old| {
+                    !records.iter().any(|published| {
+                        if old.get_type() == RRType::PTR {
+                            old.matches(published.as_ref())
+                        } else {
+                            RrsetKey::new(old.as_ref()) == RrsetKey::new(published.as_ref())
+                        }
+                    })
+                })
+                .cloned()
+            {
+                // Parsing a TTL-zero goodbye applies the receiver's one-second grace.
+                record.get_record_mut().set_ttl(0);
+                out.add_answer_box(record);
+            }
+            if out.answers_count() == withdrawn.len() {
+                self.retransmissions.push(ReRun {
+                    next_time,
+                    command: Command::UnregisterResend(packet, index, is_ipv4),
+                });
+            } else if out.answers_count() > 0 {
+                if let Some(packets) =
+                    out.to_complete_data_on_wire(intf.max_packet_size(is_ipv4), is_ipv4)
+                {
+                    for packet in packets {
+                        self.retransmissions.push(ReRun {
+                            next_time,
+                            command: Command::UnregisterResend(packet, index, is_ipv4),
+                        });
+                    }
                 }
             }
         }

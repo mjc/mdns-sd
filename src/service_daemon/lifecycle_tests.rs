@@ -140,6 +140,12 @@ fn distinct_registrations_release_all_owned_records() {
         assert!(daemon.dns_registry_map[&index].probing.is_empty());
         assert!(daemon.dns_registry_map[&index].name_changes.is_empty());
         assert!(daemon.retransmissions.len() <= 2);
+        // Complete this lifecycle's optional goodbye retries before the next one.
+        // The fixture drives callbacks directly instead of waiting on wall time.
+        for retry in std::mem::take(&mut daemon.retransmissions) {
+            assert!(matches!(&retry.command, Command::UnregisterResend(..)));
+            daemon.exec_command(retry.command, true);
+        }
     }
 }
 
@@ -459,6 +465,114 @@ fn shared_effective_hostname_survives_original_registration_removal() {
     unregister(&mut daemon, &second_name);
     assert_eq!(active_count(&daemon), 0);
     assert!(daemon.dns_registry_map[&index].name_changes.is_empty());
+}
+
+fn goodbye_retries(daemon: &Zeroconf, index: u32) -> Vec<(Instant, Vec<u8>)> {
+    daemon
+        .retransmissions
+        .iter()
+        .filter_map(|rerun| match &rerun.command {
+            Command::UnregisterResend(packet, current, _) if *current == index => {
+                Some((rerun.next_time, packet.clone()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn unrelated_publication_changes_preserve_queued_goodbyes() {
+    let (mut daemon, index) = daemon();
+    let mut removed = service("removed", "removed.local.", "127.0.0.1", "A");
+    removed.set_requires_probe(false);
+    daemon.register_service(removed.clone());
+    unregister(&mut daemon, removed.get_fullname());
+    let queued = goodbye_retries(&daemon, index);
+    assert_eq!(queued.len(), 1);
+    let mut other = service("other", "other.local.", "127.0.0.1", "A");
+    other.set_requires_probe(false);
+    daemon.register_service(other.clone());
+    assert_eq!(goodbye_retries(&daemon, index), queued);
+    other._set_port(9090);
+    daemon.register_service(other.clone());
+    assert_eq!(goodbye_retries(&daemon, index), queued);
+    unregister(&mut daemon, other.get_fullname());
+    assert!(goodbye_retries(&daemon, index).contains(&queued[0]));
+    assert_eq!(goodbye_retries(&daemon, index).len(), 2);
+}
+
+#[test]
+fn reregistration_cancels_only_its_overlapping_goodbyes() {
+    let (mut daemon, index) = daemon();
+    let mut first = service("first-retry", "first.local.", "127.0.0.1", "A");
+    first.set_requires_probe(false);
+    let mut second = service("second-retry", "second.local.", "127.0.0.1", "A");
+    second.set_requires_probe(false);
+    daemon.register_service(first.clone());
+    daemon.register_service(second.clone());
+    unregister(&mut daemon, first.get_fullname());
+    unregister(&mut daemon, second.get_fullname());
+    let queued = goodbye_retries(&daemon, index);
+    assert_eq!(queued.len(), 2);
+    let interface = InterfaceId::from(&daemon.my_intfs[&index]);
+    let unrelated = queued
+        .iter()
+        .find(|(_, packet)| {
+            DnsIncoming::new(packet.clone(), interface.clone())
+                .unwrap()
+                .all_records()
+                .any(|record| record.get_name() == second.get_fullname())
+        })
+        .unwrap()
+        .clone();
+    first._set_port(9090);
+    daemon.register_service(first);
+    assert_eq!(goodbye_retries(&daemon, index), vec![unrelated]);
+}
+
+#[test]
+fn mixed_goodbye_packets_keep_unrelated_records_when_a_hostname_returns() {
+    let (mut daemon, index) = daemon();
+    let mut removed = service("old-retry", "shared-retry.local.", "127.0.0.1", "A");
+    removed.set_requires_probe(false);
+    daemon.register_service(removed.clone());
+    unregister(&mut daemon, removed.get_fullname());
+    let queued = goodbye_retries(&daemon, index);
+    assert_eq!(queued.len(), 1);
+    let interface = InterfaceId::from(&daemon.my_intfs[&index]);
+    let records: Vec<_> = DnsIncoming::new(queued[0].1.clone(), interface.clone())
+        .unwrap()
+        .all_records()
+        .collect();
+    assert_eq!(records.len(), 4);
+    let mut expected = DnsOutgoing::new(FLAGS_QR_RESPONSE | FLAGS_AA);
+    for mut record in records
+        .into_iter()
+        .filter(|record| record.get_type() != RRType::A)
+    {
+        record.get_record_mut().set_ttl(0);
+        expected.add_answer_box(record);
+    }
+    let expected = expected.to_data_on_wire(MAX_PKT_DEFAULT, true);
+    let mut replacement = service("new-retry", "shared-retry.local.", "127.0.0.2", "B");
+    replacement.set_requires_probe(false);
+    daemon.register_service(replacement);
+    let remaining = goodbye_retries(&daemon, index);
+    assert_eq!(remaining, vec![(queued[0].0, expected[0].clone())]);
+    let records: Vec<_> = DnsIncoming::new(remaining[0].1.clone(), interface)
+        .unwrap()
+        .all_records()
+        .collect();
+    assert_eq!(records.len(), 3);
+    assert!(records
+        .iter()
+        .any(|record| record.get_type() == RRType::PTR));
+    assert!(records
+        .iter()
+        .any(|record| record.get_type() == RRType::SRV));
+    assert!(records
+        .iter()
+        .any(|record| record.get_type() == RRType::TXT));
 }
 
 #[test]
