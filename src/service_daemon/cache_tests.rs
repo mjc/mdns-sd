@@ -1,0 +1,681 @@
+use super::lifecycle_tests::{daemon, finish, receive, service};
+use super::*;
+
+const TY: &str = "_cache._tcp.local.";
+
+fn discovery_records(
+    daemon: &Zeroconf,
+    index: u32,
+    instance: &str,
+    host: &str,
+    ttl: u32,
+    include_ptr: bool,
+) -> Vec<DnsRecordBox> {
+    let mut records = Vec::new();
+    if include_ptr {
+        records.push(DnsPointer::new(TY, RRType::PTR, CLASS_IN, ttl, instance.to_string()).boxed());
+    }
+    records.extend([
+        DnsSrv::new(
+            instance,
+            CLASS_IN | CLASS_CACHE_FLUSH,
+            ttl,
+            0,
+            0,
+            8080,
+            host.to_string(),
+        )
+        .boxed(),
+        DnsTxt::new(
+            instance,
+            CLASS_IN | CLASS_CACHE_FLUSH,
+            ttl,
+            b"\x03v=A".to_vec(),
+        )
+        .boxed(),
+        DnsAddress::new(
+            host,
+            RRType::A,
+            CLASS_IN | CLASS_CACHE_FLUSH,
+            ttl,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            (&daemon.my_intfs[&index]).into(),
+        )
+        .boxed(),
+    ]);
+    records
+}
+
+fn subscribe(daemon: &mut Zeroconf) -> Receiver<ServiceEvent> {
+    let (sender, receiver) = flume::unbounded();
+    daemon
+        .service_queriers
+        .insert(TY.to_string(), sender.into());
+    receiver
+}
+
+fn second_interface(daemon: &mut Zeroconf, index: u32) -> u32 {
+    let other = index + 65_536;
+    let first = &daemon.my_intfs[&index];
+    daemon.my_intfs.insert(
+        other,
+        MyIntf {
+            name: "cache-test-link".to_string(),
+            index: other,
+            addrs: first.addrs.clone(),
+            max_packet_size_v4: first.max_packet_size_v4,
+            max_packet_size_v6: first.max_packet_size_v6,
+        },
+    );
+    other
+}
+
+#[test]
+fn publisher_does_not_learn_unrelated_no_ptr_responses() {
+    let (mut daemon, index) = daemon();
+    daemon.register_service(service("publisher", "owned.local.", "127.0.0.1", "A"));
+    finish(&mut daemon, index);
+    assert!(daemon.service_queriers.is_empty());
+    assert!(daemon.hostname_resolvers.is_empty());
+    assert!(!daemon.accept_unsolicited);
+    let deadlines = daemon.scheduled_deadlines();
+    for version in 0..100 {
+        let instance = format!("foreign-{version}.{TY}");
+        let host = format!("foreign-{version}.local.");
+        let mut records = discovery_records(&daemon, index, &instance, &host, 86400, false);
+        records.push(DnsNSec::new(&instance, CLASS_IN, 86400, instance.clone(), vec![0]).boxed());
+        receive(&mut daemon, index, records);
+        assert_eq!(daemon.cache.usage(), (0, 0));
+        assert_eq!(daemon.scheduled_deadlines(), deadlines);
+    }
+    assert_eq!(daemon.my_services.len(), 1);
+    assert_eq!(
+        daemon.dns_registry_map[&index]
+            .active
+            .values()
+            .map(Vec::len)
+            .sum::<usize>(),
+        3
+    );
+}
+
+#[test]
+fn repeated_ptr_refreshes_keep_one_record_and_one_live_deadline() {
+    let (mut daemon, index) = daemon();
+    daemon.accept_unsolicited = true;
+    let baseline = daemon.scheduled_deadlines();
+    for _ in 0..10_000 {
+        receive(
+            &mut daemon,
+            index,
+            vec![DnsPointer::new(TY, RRType::PTR, CLASS_IN, 4500, format!("fixed.{TY}")).boxed()],
+        );
+        assert_eq!(daemon.cache.ptr_count(), 1);
+        assert_eq!(daemon.cache.usage().0, 1);
+        assert_eq!(daemon.scheduled_deadlines(), baseline + 1);
+    }
+}
+
+#[test]
+fn parsed_orphan_records_expire_without_discovery_subscriptions() {
+    let (mut daemon, index) = daemon();
+    daemon.accept_unsolicited = true;
+    let baseline = daemon.scheduled_deadlines();
+    for version in 0..100 {
+        let instance = format!("orphan-{version}.{TY}");
+        let host = format!("orphan-{version}.local.");
+        let mut records = discovery_records(&daemon, index, &instance, &host, 120, false);
+        records.push(DnsNSec::new(&instance, CLASS_IN, 120, instance.clone(), vec![0]).boxed());
+        receive(&mut daemon, index, records);
+    }
+    assert_eq!(
+        (
+            daemon.cache.ptr_count(),
+            daemon.cache.srv_count(),
+            daemon.cache.txt_count(),
+            daemon.cache.nsec_count(),
+            daemon.cache.addr_count()
+        ),
+        (0, 100, 100, 100, 100)
+    );
+    daemon.cache.age_records(Duration::from_secs(121));
+    daemon.cache.evict_expired(Instant::now());
+    assert_eq!(daemon.cache.usage(), (0, 0));
+    assert_eq!(daemon.scheduled_deadlines(), baseline);
+}
+
+#[test]
+fn verification_without_browsing_accepts_changed_target_and_new_address() {
+    let (mut daemon, index) = daemon();
+    let instance = format!("verify.{TY}");
+    daemon.accept_unsolicited = true;
+    let records = discovery_records(&daemon, index, &instance, "old.local.", 120, false);
+    receive(&mut daemon, index, records);
+    daemon.accept_unsolicited = false;
+    assert!(daemon.service_queriers.is_empty());
+    assert!(daemon.hostname_resolvers.is_empty());
+    daemon.exec_command_verify(instance.clone(), Duration::from_secs(10), false);
+    let deadline = daemon.verifications[&instance];
+    assert!(
+        daemon.cache.get_srv_on_intf(&instance, index).unwrap()[0]
+            .record
+            .get_expire()
+            <= deadline
+    );
+    let records = discovery_records(&daemon, index, &instance, "new.local.", 120, false);
+    receive(&mut daemon, index, records);
+    let records = daemon.cache.get_srv_on_intf(&instance, index).unwrap();
+    let updated = records
+        .iter()
+        .find(|record| {
+            record
+                .record
+                .any()
+                .downcast_ref::<DnsSrv>()
+                .is_some_and(|srv| srv.host() == "new.local.")
+        })
+        .unwrap();
+    assert!(updated.record.get_expire() > deadline);
+    assert_eq!(
+        daemon
+            .cache
+            .get_addr_on_intf("new.local.", index)
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn resolution_and_known_answers_do_not_cross_links() {
+    let (mut daemon, index) = daemon();
+    let other = second_interface(&mut daemon, index);
+    let receiver = subscribe(&mut daemon);
+    daemon.accept_unsolicited = true;
+    let instance = format!("split.{TY}");
+    let mut records = discovery_records(&daemon, index, &instance, "same.local.", 120, true);
+    records.retain(|record| record.get_type() != RRType::A);
+    receive(&mut daemon, index, records);
+    let address = DnsAddress::new(
+        "same.local.",
+        RRType::A,
+        CLASS_IN,
+        120,
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        (&daemon.my_intfs[&other]).into(),
+    )
+    .boxed();
+    receive(&mut daemon, other, vec![address]);
+    assert!(!daemon
+        .resolve_service_from_cache(TY, &instance)
+        .unwrap()
+        .is_valid());
+    assert!(daemon.query_unresolved(&instance));
+    assert!(!receiver
+        .try_iter()
+        .any(|event| matches!(event, ServiceEvent::ServiceResolved(_))));
+    assert_eq!(
+        daemon
+            .cache
+            .get_known_answers_on_intf(TY, RRType::PTR, Instant::now(), index)
+            .len(),
+        1
+    );
+    assert!(daemon
+        .cache
+        .get_known_answers_on_intf(TY, RRType::PTR, Instant::now(), other)
+        .is_empty());
+}
+
+#[test]
+fn other_dns_classes_cannot_create_in_class_discovery_dependencies() {
+    let (mut daemon, index) = daemon();
+    let receiver = subscribe(&mut daemon);
+    let instance = format!("foreign-class.{TY}");
+    let mut records = discovery_records(&daemon, index, &instance, "foreign.local.", 120, false);
+    records.insert(
+        0,
+        DnsPointer::new(TY, RRType::PTR, 3, 120, instance).boxed(),
+    );
+    receive(&mut daemon, index, records);
+    assert_eq!(daemon.cache.usage(), (0, 0));
+    assert!(receiver.is_empty());
+    assert!(daemon.pending_resolves.is_empty());
+}
+
+#[test]
+fn capacity_eviction_inside_a_packet_does_not_emit_phantom_found_events() {
+    let (mut daemon, index) = daemon();
+    let receiver = subscribe(&mut daemon);
+    daemon.cache.set_limits(1, 1024 * 1024);
+    let records = discovery_records(
+        &daemon,
+        index,
+        &format!("capacity.{TY}"),
+        "capacity.local.",
+        120,
+        true,
+    );
+    receive(&mut daemon, index, records);
+    assert_eq!(daemon.cache.usage().0, 1);
+    assert!(receiver.is_empty());
+    assert!(daemon.service_queriers[TY].delivered.is_empty());
+    assert!(daemon.pending_resolves.is_empty());
+}
+
+#[test]
+fn lowering_cache_limits_retires_delivery_and_hostname_state_once() {
+    let (mut daemon, index) = daemon();
+    let receiver = subscribe(&mut daemon);
+    let (sender, host_receiver) = flume::unbounded();
+    daemon
+        .hostname_resolvers
+        .insert("capacity.local.".to_string(), (sender, None));
+    let records = discovery_records(
+        &daemon,
+        index,
+        &format!("capacity.{TY}"),
+        "capacity.local.",
+        120,
+        true,
+    );
+    receive(&mut daemon, index, records);
+    assert_eq!(daemon.service_queriers[TY].delivered.len(), 1);
+    assert!(receiver
+        .try_iter()
+        .any(|event| matches!(event, ServiceEvent::ServiceResolved(_))));
+    assert!(host_receiver
+        .try_iter()
+        .any(|event| matches!(event, HostnameResolutionEvent::AddressesFound(_, _))));
+    daemon.process_set_option(DaemonOption::CacheLimits(0, 0));
+    assert_eq!(daemon.cache.usage(), (0, 0));
+    assert!(daemon.service_queriers[TY].delivered.is_empty());
+    assert!(daemon.pending_resolves.is_empty());
+    assert_eq!(
+        receiver
+            .try_iter()
+            .filter(|event| matches!(event, ServiceEvent::ServiceRemoved(_, _)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        host_receiver
+            .try_iter()
+            .filter(|event| matches!(event, HostnameResolutionEvent::AddressesRemoved(_, _)))
+            .count(),
+        1
+    );
+    daemon.process_set_option(DaemonOption::CacheLimits(0, 0));
+    assert!(receiver.is_empty());
+    assert!(host_receiver.is_empty());
+}
+
+#[test]
+fn resolved_batches_leave_no_delivery_or_pending_resolution_history() {
+    let (mut daemon, index) = daemon();
+    let receiver = subscribe(&mut daemon);
+    let baseline = daemon.scheduled_deadlines();
+    for batch in 0..2 {
+        for version in 0..100 {
+            let records = discovery_records(
+                &daemon,
+                index,
+                &format!("batch-{batch}-{version}.{TY}"),
+                &format!("batch-{batch}-{version}.local."),
+                120,
+                true,
+            );
+            receive(&mut daemon, index, records);
+        }
+        assert_eq!(daemon.service_queriers[TY].delivered.len(), 100);
+        assert_eq!(
+            receiver
+                .try_iter()
+                .filter(|event| matches!(event, ServiceEvent::ServiceResolved(_)))
+                .count(),
+            100
+        );
+        daemon.cache.age_records(Duration::from_secs(121));
+        let expired = daemon.cache.evict_expired(Instant::now());
+        daemon.notify_service_removal(expired.expired_services);
+        assert_eq!(daemon.cache.usage(), (0, 0));
+        assert!(daemon.service_queriers[TY].delivered.is_empty());
+        assert!(daemon.pending_resolves.is_empty());
+        assert!(!daemon
+            .retransmissions
+            .iter()
+            .any(|rerun| matches!(&rerun.command, Command::Resolve(_, _))));
+        assert_eq!(
+            receiver
+                .try_iter()
+                .filter(|event| matches!(event, ServiceEvent::ServiceRemoved(_, _)))
+                .count(),
+            100
+        );
+        assert_eq!(daemon.scheduled_deadlines(), baseline);
+    }
+}
+
+#[test]
+fn expired_hostname_removal_is_delivered_before_an_unrelated_response() {
+    let (mut daemon, index) = daemon();
+    let host = "expired.local.";
+    let (sender, receiver) = flume::unbounded();
+    daemon
+        .hostname_resolvers
+        .insert(host.to_string(), (sender, None));
+    let address = DnsAddress::new(
+        host,
+        RRType::A,
+        CLASS_IN,
+        1,
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        (&daemon.my_intfs[&index]).into(),
+    )
+    .boxed();
+    receive(&mut daemon, index, vec![address]);
+    assert!(receiver
+        .try_iter()
+        .any(|event| matches!(event, HostnameResolutionEvent::AddressesFound(_, _))));
+    daemon.cache.age_records(Duration::from_secs(2));
+    receive(
+        &mut daemon,
+        index,
+        vec![DnsTxt::new("unrelated.local.", CLASS_IN, 120, vec![0]).boxed()],
+    );
+    assert_eq!(
+        receiver
+            .try_iter()
+            .filter(|event| matches!(event, HostnameResolutionEvent::AddressesRemoved(_, _)))
+            .count(),
+        1
+    );
+    assert_eq!(daemon.cache.usage(), (0, 0));
+}
+
+#[test]
+fn cache_only_subscription_receives_future_announcements_without_querying() {
+    let (mut daemon, index) = daemon();
+    daemon.next_ip_check = None;
+    let (sender, receiver) = flume::unbounded();
+    daemon.exec_command_browse(false, TY.to_string(), 1, true, sender);
+    assert!(!daemon.service_queriers[TY].querying);
+    assert!(receiver
+        .try_iter()
+        .any(|event| matches!(event, ServiceEvent::SearchStopped(_))));
+    let records = discovery_records(
+        &daemon,
+        index,
+        &format!("passive.{TY}"),
+        "passive.local.",
+        120,
+        true,
+    );
+    receive(&mut daemon, index, records);
+    let events: Vec<_> = receiver.try_iter().collect();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, ServiceEvent::ServiceFound(_, _)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, ServiceEvent::ServiceResolved(_)))
+            .count(),
+        1
+    );
+    assert!(daemon.pending_resolves.is_empty());
+    assert!(daemon.retransmissions.is_empty());
+    assert_eq!(
+        daemon.peek_earliest_timer(),
+        daemon.cache.next_deadline(Instant::now(), &[], &[])
+    );
+}
+
+#[test]
+fn incomplete_cache_only_data_does_not_schedule_resolution_or_refresh() {
+    let (mut daemon, index) = daemon();
+    daemon.next_ip_check = None;
+    let (sender, receiver) = flume::unbounded();
+    daemon.exec_command_browse(false, TY.to_string(), 1, true, sender);
+    receiver.try_iter().for_each(drop);
+    receive(
+        &mut daemon,
+        index,
+        vec![DnsPointer::new(TY, RRType::PTR, CLASS_IN, 120, format!("incomplete.{TY}")).boxed()],
+    );
+    assert_eq!(
+        receiver
+            .try_iter()
+            .filter(|event| matches!(event, ServiceEvent::ServiceFound(_, _)))
+            .count(),
+        1
+    );
+    assert!(daemon.pending_resolves.is_empty());
+    assert!(daemon.retransmissions.is_empty());
+    assert_eq!(daemon.scheduled_deadlines(), 1);
+    let ptr = daemon.cache.get_ptr_on_intf(TY, index).unwrap()[0];
+    assert_eq!(daemon.peek_earliest_timer(), Some(ptr.record.get_expire()));
+    assert!(ptr.record.get_record().get_refresh_time() < ptr.record.get_expire());
+}
+
+#[test]
+fn browse_case_changes_share_one_subscription_and_stop_it() {
+    let (mut daemon, index) = daemon();
+    let mixed = "_CaChE._tcp.local.";
+    let (sender, receiver) = flume::unbounded();
+    daemon.exec_command_browse(false, mixed.to_string(), 1, false, sender);
+    let records = discovery_records(
+        &daemon,
+        index,
+        &format!("Printer.{TY}"),
+        "printer.local.",
+        120,
+        true,
+    );
+    receive(&mut daemon, index, records);
+    let events: Vec<_> = receiver.try_iter().collect();
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, ServiceEvent::ServiceFound(..))));
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, ServiceEvent::ServiceResolved(..))));
+    let (sender, receiver) = flume::unbounded();
+    daemon.exec_command_browse(false, TY.to_string(), 1, false, sender);
+    assert_eq!(daemon.service_queriers.len(), 1);
+    assert!(receiver
+        .try_iter()
+        .any(|event| matches!(event, ServiceEvent::ServiceResolved(..))));
+    daemon.exec_command_stop_browse(mixed.to_string());
+    assert!(daemon.service_queriers.is_empty());
+    assert!(daemon.pending_resolves.is_empty());
+    assert!(daemon.retransmissions.is_empty());
+    assert!(receiver
+        .try_iter()
+        .any(|event| matches!(event, ServiceEvent::SearchStopped(..))));
+}
+
+#[test]
+fn unsolicited_unsupported_class_cannot_displace_in_records() {
+    let (mut daemon, index) = daemon();
+    daemon.accept_unsolicited = true;
+    daemon.cache.set_limits(1, 4096);
+    receive(
+        &mut daemon,
+        index,
+        vec![DnsPointer::new(TY, RRType::PTR, CLASS_IN, 120, format!("valid.{TY}")).boxed()],
+    );
+    receive(
+        &mut daemon,
+        index,
+        vec![DnsPointer::new(
+            "other.local.",
+            RRType::PTR,
+            3,
+            120,
+            "unrelated.local.".to_string(),
+        )
+        .boxed()],
+    );
+    assert_eq!(daemon.cache.usage().0, 1);
+    assert!(daemon.cache.get_ptr(TY).is_some());
+    assert!(daemon.cache.get_ptr("other.local.").is_none());
+}
+
+#[test]
+fn unresolved_link_cannot_hide_loss_of_the_last_resolved_link() {
+    let (mut daemon, index) = daemon();
+    let other = second_interface(&mut daemon, index);
+    let receiver = subscribe(&mut daemon);
+    let instance = format!("two-links.{TY}");
+    receive(
+        &mut daemon,
+        other,
+        vec![DnsPointer::new(TY, RRType::PTR, CLASS_IN, 120, instance.clone()).boxed()],
+    );
+    let records = discovery_records(&daemon, index, &instance, "resolved.local.", 120, true);
+    receive(&mut daemon, index, records);
+    assert!(receiver
+        .try_iter()
+        .any(|event| matches!(event, ServiceEvent::ServiceResolved(..))));
+    daemon.cache.remove_records_on_intf(InterfaceId {
+        name: daemon.my_intfs[&index].name.clone(),
+        index,
+    });
+    daemon.reconcile_browse_state();
+    assert_eq!(
+        receiver
+            .try_iter()
+            .filter(|event| matches!(event, ServiceEvent::ServiceRemoved(..)))
+            .count(),
+        1
+    );
+    assert!(daemon.cache.get_ptr_on_intf(TY, other).is_some());
+    daemon.reconcile_browse_state();
+    assert!(receiver.is_empty());
+}
+
+#[test]
+fn hostname_subscription_matches_normalized_backslash_presentation() {
+    let (mut daemon, index) = daemon();
+    let (sender, receiver) = flume::unbounded();
+    let host = r"slash\q.local.";
+    daemon.add_hostname_resolver(host.to_string(), sender, None);
+    let address = DnsAddress::new(
+        host,
+        RRType::A,
+        CLASS_IN,
+        120,
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        (&daemon.my_intfs[&index]).into(),
+    )
+    .boxed();
+    receive(&mut daemon, index, vec![address]);
+    assert!(receiver
+        .try_iter()
+        .any(|event| matches!(event, HostnameResolutionEvent::AddressesFound(..))));
+    daemon.exec_command_stop_resolve_hostname(r"slash\\q.local.".to_string());
+    assert!(daemon.hostname_resolvers.is_empty());
+    assert!(receiver
+        .try_iter()
+        .any(|event| matches!(event, HostnameResolutionEvent::SearchStopped(..))));
+}
+
+#[test]
+fn stopping_browses_releases_interest_without_deleting_live_records_or_verification() {
+    let (mut daemon, index) = daemon();
+    let receiver = subscribe(&mut daemon);
+    let subtype = "_color._sub._cache._tcp.local.";
+    let (sender, sub_receiver) = flume::unbounded();
+    daemon.exec_command_browse(false, subtype.to_string(), 1, false, sender);
+    let instance = format!("shared.{TY}");
+    let mut records = discovery_records(&daemon, index, &instance, "shared.local.", 120, true);
+    records.push(DnsPointer::new(subtype, RRType::PTR, CLASS_IN, 120, instance.clone()).boxed());
+    receive(&mut daemon, index, records);
+    assert!(receiver
+        .try_iter()
+        .any(|event| matches!(event, ServiceEvent::ServiceResolved(..))));
+    assert!(sub_receiver
+        .try_iter()
+        .any(|event| matches!(event, ServiceEvent::ServiceResolved(..))));
+    daemon.exec_command_verify(instance.clone(), Duration::from_secs(10), false);
+    let before = daemon.cache.usage();
+    daemon.exec_command_stop_browse(TY.to_string());
+    assert_eq!(daemon.cache.usage(), before);
+    assert_eq!(daemon.service_queriers.len(), 1);
+    assert!(daemon
+        .resolve_service_from_cache(subtype, &instance)
+        .unwrap()
+        .is_valid());
+    daemon.exec_command_stop_browse(subtype.to_string());
+    assert!(daemon.service_queriers.is_empty());
+    assert!(daemon.pending_resolves.is_empty());
+    assert_eq!(daemon.cache.usage(), before);
+    assert!(daemon
+        .retransmissions
+        .iter()
+        .any(|rerun| matches!(&rerun.command, Command::Verify(name, _) if name == &instance)));
+    assert!(!daemon
+        .cache
+        .service_verify_queries(&instance, None)
+        .is_empty());
+    daemon.exec_command_verify(instance, Duration::from_secs(10), true);
+    daemon.cache.age_records(Duration::from_secs(121));
+    daemon.expire_cache(Instant::now());
+    assert_eq!(daemon.cache.usage(), (0, 0));
+    assert_eq!(daemon.cache.subtype_count(), 0);
+}
+
+#[test]
+fn removing_a_link_notifies_hostname_subscribers_once() {
+    let (mut daemon, index) = daemon();
+    let other = second_interface(&mut daemon, index);
+    let host = "linked.local.";
+    let (sender, receiver) = flume::unbounded();
+    daemon.add_hostname_resolver(host.to_string(), sender, None);
+    for scope in [index, other] {
+        let address = DnsAddress::new(
+            host,
+            RRType::A,
+            CLASS_IN,
+            120,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            (&daemon.my_intfs[&scope]).into(),
+        )
+        .boxed();
+        receive(&mut daemon, scope, vec![address]);
+    }
+    let _ = receiver.try_iter().collect::<Vec<_>>();
+    let intf = &daemon.my_intfs[&other];
+    let interfaces: Vec<_> = intf
+        .addrs
+        .iter()
+        .map(|addr| Interface {
+            name: intf.name.clone(),
+            index: Some(other),
+            addr: addr.clone(),
+            oper_status: if_addrs::IfOperStatus::Up,
+            is_p2p: false,
+            #[cfg(windows)]
+            adapter_name: String::new(),
+        })
+        .collect();
+    for intf in &interfaces {
+        daemon.del_interface_addr(intf);
+    }
+    let removed: Vec<_> = receiver
+        .try_iter()
+        .filter_map(|event| match event {
+            HostnameResolutionEvent::AddressesRemoved(_, addresses) => Some(addresses),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(removed.len(), 1);
+    assert!(!removed[0].is_empty());
+    assert!(daemon.cache.get_addr_on_intf(host, index).is_some());
+    assert!(daemon.cache.get_addr_on_intf(host, other).is_none());
+}

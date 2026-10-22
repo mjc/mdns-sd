@@ -18,7 +18,6 @@ pub(crate) struct IpType(u8);
 impl IpType {
     pub const V4: Self = Self(0b01);
     pub const V6: Self = Self(0b10);
-    pub const BOTH: Self = Self(0b11);
 
     fn contains(self, other: Self) -> bool {
         self.0 & other.0 == other.0
@@ -68,7 +67,6 @@ impl DnsCache {
     pub(crate) fn set_limits(&mut self, max_records: usize, max_bytes: usize) {
         self.max_records = max_records;
         self.max_bytes = max_bytes;
-        self.evict_expired(Instant::now());
         loop {
             let (records, bytes) = self.usage();
             if records <= max_records && bytes <= max_bytes {
@@ -102,17 +100,22 @@ impl DnsCache {
     }
 
     fn evict_oldest(&mut self) -> bool {
+        let now = Instant::now();
         let oldest = self
             .records
             .iter()
             .flat_map(|(key, records)| {
-                records
-                    .iter()
-                    .enumerate()
-                    .map(move |(index, record)| (key, index, record.record.get_created()))
+                records.iter().enumerate().map(move |(index, record)| {
+                    (
+                        key,
+                        index,
+                        !record.record.get_record().is_expired(now),
+                        record.record.get_created(),
+                    )
+                })
             })
-            .min_by_key(|(_, _, received)| *received)
-            .map(|(key, index, _)| (key.clone(), index));
+            .min_by_key(|(_, _, live, received)| (*live, *received))
+            .map(|(key, index, _, _)| (key.clone(), index));
         if let Some((key, index)) = oldest {
             if let Some(records) = self.records.get_mut(&key) {
                 records.remove(index);
@@ -180,13 +183,6 @@ impl DnsCache {
             .collect()
     }
 
-    pub(crate) fn is_known_name(&self, name: &str, index: u32) -> bool {
-        let name = CanonicalName::new(name);
-        self.records.iter().any(|((scope, key), records)| {
-            *scope == index && key.name == name && !records.is_empty()
-        })
-    }
-
     pub(crate) fn has_rrset(
         &self,
         record: &dyn crate::dns_parser::DnsRecordExt,
@@ -235,15 +231,6 @@ impl DnsCache {
     pub(crate) fn get_ptr(&self, name: &str) -> Option<Vec<&DnsRecordIntf>> {
         self.records_for(name, RRType::PTR, None)
     }
-    pub(crate) fn get_srv(&self, name: &str) -> Option<Vec<&DnsRecordIntf>> {
-        self.records_for(name, RRType::SRV, None)
-    }
-    pub(crate) fn get_txt(&self, name: &str) -> Option<Vec<&DnsRecordIntf>> {
-        self.records_for(name, RRType::TXT, None)
-    }
-    pub(crate) fn get_addr(&self, name: &str) -> Option<Vec<&DnsRecordIntf>> {
-        self.records_for(name, RRType::ANY, None)
-    }
     pub(crate) fn get_ptr_on_intf(&self, name: &str, index: u32) -> Option<Vec<&DnsRecordIntf>> {
         self.records_for(name, RRType::PTR, Some(index))
     }
@@ -287,10 +274,6 @@ impl DnsCache {
         subtypes.sort_unstable();
         subtypes.dedup();
         subtypes
-    }
-
-    pub(crate) fn get_subtype(&self, fullname: &str) -> Option<&str> {
-        self.subtypes(fullname, None).into_iter().next()
     }
 
     pub(crate) fn subtype_count(&self) -> usize {
@@ -353,13 +336,6 @@ impl DnsCache {
     pub(crate) fn get_addresses_for_host(&self, host: &str) -> HashMap<String, HashSet<ScopedIp>> {
         self.addresses_for_host(host, None)
     }
-    pub(crate) fn get_addresses_for_host_on_intf(
-        &self,
-        host: &str,
-        index: u32,
-    ) -> HashMap<String, HashSet<ScopedIp>> {
-        self.addresses_for_host(host, Some(index))
-    }
 
     pub(crate) fn service_verify_queries(
         &mut self,
@@ -410,14 +386,13 @@ impl DnsCache {
         &mut self,
         intf: &MyIntf,
         incoming: DnsRecordBox,
-        _timers: &mut Vec<Instant>,
         is_for_us: bool,
     ) -> Option<(&DnsRecordIntf, bool)> {
         match incoming.get_type() {
             RRType::PTR | RRType::SRV | RRType::TXT | RRType::A | RRType::AAAA | RRType::NSEC => {}
             _ => return None,
         }
-        if !is_for_us {
+        if !is_for_us || incoming.get_class() != CLASS_IN {
             return None;
         }
         let key = (intf.index, RrsetKey::new(incoming.as_ref()));
@@ -439,7 +414,6 @@ impl DnsCache {
         if self.max_records == 0 || charge > self.max_bytes {
             return None;
         }
-        self.evict_expired(Instant::now());
         loop {
             let (count, bytes) = self.usage();
             if count < self.max_records && charge <= self.max_bytes.saturating_sub(bytes) {
@@ -481,15 +455,6 @@ impl DnsCache {
             !records.is_empty()
         });
         self.compact();
-        removed
-    }
-
-    pub(crate) fn remove(&mut self, record: &DnsRecordBox) -> bool {
-        let indices: Vec<_> = self.records.keys().map(|(scope, _)| *scope).collect();
-        let mut removed = false;
-        for index in indices {
-            removed |= self.remove_on_intf(record, index);
-        }
         removed
     }
 
@@ -594,100 +559,22 @@ impl DnsCache {
         }
     }
 
-    pub(crate) fn evict_expired_services(
-        &mut self,
+    fn refresh_interests(
+        &self,
+        service_types: &[&str],
         now: Instant,
-    ) -> HashMap<String, HashSet<String>> {
-        self.evict_expired(now).expired_services
-    }
-    pub(crate) fn evict_expired_addr(
-        &mut self,
-        now: Instant,
-    ) -> HashMap<String, HashSet<ScopedIp>> {
-        self.evict_expired(now).expired_addrs
-    }
-
-    pub(crate) fn remove_service_type(&mut self, ty_domain: &str) {
-        self.remove_service_type_with_hostnames(ty_domain, &[]);
-    }
-
-    pub(crate) fn remove_service_type_with_hostnames(
-        &mut self,
-        ty_domain: &str,
-        hostnames: &[&str],
-    ) {
-        let ty = CanonicalName::new(ty_domain);
-        let mut instances = HashSet::new();
-        self.records.retain(|(scope, key), records| {
-            if key.rr_type == RRType::PTR && key.name == ty {
-                for ptr in records {
-                    if let Some(ptr) = ptr.record.any().downcast_ref::<DnsPointer>() {
-                        instances.insert((*scope, CanonicalName::new(ptr.alias())));
-                    }
-                }
-                false
-            } else {
-                true
-            }
-        });
-        let mut referenced = HashSet::new();
-        for ((scope, key), records) in &self.records {
-            if key.rr_type == RRType::PTR {
-                for ptr in records {
-                    if let Some(ptr) = ptr.record.any().downcast_ref::<DnsPointer>() {
-                        referenced.insert((*scope, CanonicalName::new(ptr.alias())));
-                    }
-                }
-            }
-        }
-        let mut hosts = HashSet::new();
-        self.records.retain(|(scope, key), records| {
-            let remove = (key.rr_type == RRType::SRV || key.rr_type == RRType::TXT)
-                && instances.contains(&(*scope, key.name.clone()))
-                && !referenced.contains(&(*scope, key.name.clone()));
-            if remove && key.rr_type == RRType::SRV {
-                for srv in records {
-                    if let Some(srv) = srv.record.any().downcast_ref::<DnsSrv>() {
-                        hosts.insert((*scope, CanonicalName::new(srv.host())));
-                    }
-                }
-            }
-            !remove
-        });
-        let protected: HashSet<_> = hostnames
-            .iter()
-            .map(|host| CanonicalName::new(host))
-            .collect();
-        let mut used_hosts = HashSet::new();
-        for ((scope, key), records) in &self.records {
-            if key.rr_type == RRType::SRV {
-                for srv in records {
-                    if let Some(srv) = srv.record.any().downcast_ref::<DnsSrv>() {
-                        used_hosts.insert((*scope, CanonicalName::new(srv.host())));
-                    }
-                }
-            }
-        }
-        self.records.retain(|(scope, key), _| {
-            !(key.rr_type == RRType::A || key.rr_type == RRType::AAAA)
-                || !hosts.contains(&(*scope, key.name.clone()))
-                || used_hosts.contains(&(*scope, key.name.clone()))
-                || protected.contains(&key.name)
-        });
-        self.compact();
-    }
-
-    fn refresh_names(&self, service_types: &[&str], now: Instant) -> HashSet<(u32, CanonicalName)> {
+    ) -> HashSet<(u32, CanonicalName, RRType)> {
         let mut names = HashSet::new();
         for ty in service_types {
             for record in self.get_ptr(ty).into_iter().flatten() {
                 if record.record.get_record().is_expired(now) {
                     continue;
                 }
-                names.insert((record.src_intf.index, CanonicalName::new(ty)));
+                names.insert((record.src_intf.index, CanonicalName::new(ty), RRType::PTR));
                 if let Some(ptr) = record.record.any().downcast_ref::<DnsPointer>() {
                     let instance = CanonicalName::new(ptr.alias());
-                    names.insert((record.src_intf.index, instance));
+                    names.insert((record.src_intf.index, instance.clone(), RRType::SRV));
+                    names.insert((record.src_intf.index, instance, RRType::TXT));
                     for srv in self
                         .get_srv_on_intf(ptr.alias(), record.src_intf.index)
                         .into_iter()
@@ -697,7 +584,16 @@ impl DnsCache {
                             continue;
                         }
                         if let Some(srv) = srv.record.any().downcast_ref::<DnsSrv>() {
-                            names.insert((record.src_intf.index, CanonicalName::new(srv.host())));
+                            names.insert((
+                                record.src_intf.index,
+                                CanonicalName::new(srv.host()),
+                                RRType::A,
+                            ));
+                            names.insert((
+                                record.src_intf.index,
+                                CanonicalName::new(srv.host()),
+                                RRType::AAAA,
+                            ));
                         }
                     }
                 }
@@ -712,7 +608,7 @@ impl DnsCache {
         service_types: &[&str],
         hostnames: &[&str],
     ) -> Option<Instant> {
-        let names = self.refresh_names(service_types, now);
+        let names = self.refresh_interests(service_types, now);
         let hosts: HashSet<_> = hostnames
             .iter()
             .map(|host| CanonicalName::new(host))
@@ -720,8 +616,8 @@ impl DnsCache {
         self.records
             .iter()
             .flat_map(|((scope, key), records)| {
-                let interested = key.rr_type != RRType::NSEC
-                    && (names.contains(&(*scope, key.name.clone()))
+                let interested = key.class == CLASS_IN
+                    && (names.contains(&(*scope, key.name.clone(), key.rr_type))
                         || ((key.rr_type == RRType::A || key.rr_type == RRType::AAAA)
                             && hosts.contains(&key.name)));
                 records.iter().map(move |record| {
@@ -736,32 +632,27 @@ impl DnsCache {
             .min()
     }
 
-    fn refresh_type(
-        &mut self,
-        name: &str,
-        ty: RRType,
-        index: Option<u32>,
-        now: Instant,
-    ) -> HashSet<Instant> {
+    fn refresh_type(&mut self, name: &str, ty: RRType, index: Option<u32>, now: Instant) -> bool {
         let name = CanonicalName::new(name);
         self.records
             .iter_mut()
             .filter(|((scope, key), _)| {
-                key.name == name && key.rr_type == ty && index.map_or(true, |index| *scope == index)
+                key.name == name
+                    && key.rr_type == ty
+                    && key.class == CLASS_IN
+                    && index.map_or(true, |index| *scope == index)
             })
             .flat_map(|(_, records)| records)
-            .filter_map(|record| record.record.updated_refresh_time(now))
-            .collect()
+            .fold(false, |due, record| {
+                record.record.updated_refresh_time(now).is_some() || due
+            })
     }
 
-    pub(crate) fn refresh_due_ptr(&mut self, ty: &str) -> HashSet<Instant> {
+    pub(crate) fn refresh_due_ptr(&mut self, ty: &str) -> bool {
         self.refresh_type(ty, RRType::PTR, None, Instant::now())
     }
 
-    pub(crate) fn refresh_due_srv_txt(
-        &mut self,
-        ty: &str,
-    ) -> (HashMap<String, Vec<RRType>>, HashSet<Instant>) {
+    pub(crate) fn refresh_due_srv_txt(&mut self, ty: &str) -> HashMap<String, Vec<RRType>> {
         let now = Instant::now();
         let instances: Vec<_> = self
             .get_ptr(ty)
@@ -777,37 +668,32 @@ impl DnsCache {
             })
             .collect();
         let mut due: HashMap<String, Vec<RRType>> = HashMap::new();
-        let mut timers = HashSet::new();
         for (scope, instance) in instances {
             for record_type in [RRType::SRV, RRType::TXT] {
-                let refresh = self.refresh_type(&instance, record_type, Some(scope), now);
-                if !refresh.is_empty() {
+                if self.refresh_type(&instance, record_type, Some(scope), now) {
                     let types = due.entry(instance.clone()).or_default();
                     if !types.contains(&record_type) {
                         types.push(record_type);
                     }
-                    timers.extend(refresh);
                 }
             }
         }
-        (due, timers)
+        due
     }
 
-    pub(crate) fn refresh_due_hosts(&mut self, ty: &str) -> (HashSet<String>, HashSet<Instant>) {
+    pub(crate) fn refresh_due_hosts(&mut self, ty: &str) -> HashSet<String> {
         let now = Instant::now();
-        let names = self.refresh_names(&[ty], now);
+        let names = self.refresh_interests(&[ty], now);
         let mut due = HashSet::new();
-        let mut timers = HashSet::new();
-        for (scope, hostname) in names {
-            for record_type in [RRType::A, RRType::AAAA] {
-                let refresh = self.refresh_type(hostname.as_str(), record_type, Some(scope), now);
-                if !refresh.is_empty() {
-                    due.insert(hostname.as_str().to_string());
-                    timers.extend(refresh);
-                }
+        for (scope, hostname, record_type) in names {
+            if record_type != RRType::A && record_type != RRType::AAAA {
+                continue;
+            }
+            if self.refresh_type(hostname.as_str(), record_type, Some(scope), now) {
+                due.insert(hostname.as_str().to_string());
             }
         }
-        (due, timers)
+        due
     }
 
     pub(crate) fn refresh_due_hostname_resolutions(
@@ -819,7 +705,9 @@ impl DnsCache {
         self.records
             .iter_mut()
             .filter(|((_, key), _)| {
-                key.name == name && (key.rr_type == RRType::A || key.rr_type == RRType::AAAA)
+                key.name == name
+                    && key.class == CLASS_IN
+                    && (key.rr_type == RRType::A || key.rr_type == RRType::AAAA)
             })
             .flat_map(|(_, records)| records)
             .filter_map(|record| {
@@ -833,14 +721,6 @@ impl DnsCache {
             .collect()
     }
 
-    pub(crate) fn get_known_answers(
-        &self,
-        name: &str,
-        ty: RRType,
-        now: Instant,
-    ) -> Vec<&DnsRecordIntf> {
-        self.known_answers(name, ty, now, None)
-    }
     pub(crate) fn get_known_answers_on_intf(
         &self,
         name: &str,
@@ -848,19 +728,10 @@ impl DnsCache {
         now: Instant,
         index: u32,
     ) -> Vec<&DnsRecordIntf> {
-        self.known_answers(name, ty, now, Some(index))
-    }
-    fn known_answers(
-        &self,
-        name: &str,
-        ty: RRType,
-        now: Instant,
-        index: Option<u32>,
-    ) -> Vec<&DnsRecordIntf> {
         if ty == RRType::ANY {
             return Vec::new();
         }
-        self.records_for(name, ty, index)
+        self.records_for(name, ty, Some(index))
             .into_iter()
             .flatten()
             .filter(|record| {
@@ -973,11 +844,10 @@ mod tests {
         let intf_b = make_intf("en1", 2);
 
         let mut cache = DnsCache::new();
-        let mut timers = Vec::new();
 
         macro_rules! add {
             ($intf:expr, $record:expr) => {
-                cache.add_or_update(&$intf, $record.boxed(), &mut timers, true)
+                cache.add_or_update(&$intf, $record.boxed(), true)
             };
         }
 
@@ -1055,13 +925,12 @@ mod tests {
         };
 
         let mut cache = DnsCache::new();
-        let mut timers = Vec::new();
 
         // Feed PTR / SRV / TXT / ADDR records with `is_for_us = false` and no
         // pre-existing entries. Each must be dropped.
         macro_rules! add_not_for_us {
             ($record:expr) => {{
-                let result = cache.add_or_update(&intf, $record.boxed(), &mut timers, false);
+                let result = cache.add_or_update(&intf, $record.boxed(), false);
                 assert!(
                     result.is_none(),
                     "a not-for-us record should be dropped, got {:?}",
@@ -1113,20 +982,21 @@ mod tests {
         let intf = make_intf("en0", 1);
 
         let mut cache = DnsCache::new();
-        let mut timers = Vec::new();
+
         cache.add_or_update(
             &intf,
             DnsPointer::new(ty_domain, RRType::PTR, CLASS_IN, 4500, instance.to_string()).boxed(),
-            &mut timers,
             true,
         );
         cache.add_or_update(
             &intf,
             DnsSrv::new(instance, CLASS_IN, 30, 0, 0, 80, host.to_string()).boxed(),
-            &mut timers,
             true,
         );
-        assert!(cache.evict_expired_services(Instant::now()).is_empty());
+        assert!(cache
+            .evict_expired(Instant::now())
+            .expired_services
+            .is_empty());
 
         let ptr = &cache.get_ptr(ty_domain).unwrap()[0].record;
         let (ptr_expire, ptr_refresh) = (ptr.get_expire(), ptr.get_record().get_refresh_time());
@@ -1135,7 +1005,7 @@ mod tests {
         let slept = Duration::from_secs(60);
         cache.age_records(slept);
 
-        let expired = cache.evict_expired_services(Instant::now());
+        let expired = cache.evict_expired(Instant::now()).expired_services;
         assert!(
             expired[ty_domain].contains(instance),
             "the SRV record ran out during the sleep"
@@ -1158,7 +1028,7 @@ mod tests {
                 crate::dns_parser::DnsNSec::new(&instance, CLASS_IN, 1, instance.clone(), vec![0])
                     .boxed(),
             ] {
-                cache.add_or_update(&intf, record, &mut Vec::new(), true);
+                cache.add_or_update(&intf, record, true);
             }
         }
         assert_eq!(
@@ -1187,7 +1057,6 @@ mod tests {
                     format!("v={version}").into_bytes(),
                 )
                 .boxed(),
-                &mut Vec::new(),
                 true,
             );
             cache.add_or_update(
@@ -1202,7 +1071,6 @@ mod tests {
                     "host.local.".to_string(),
                 )
                 .boxed(),
-                &mut Vec::new(),
                 true,
             );
             cache.evict_expired(Instant::now() + Duration::from_secs(2));
@@ -1239,7 +1107,7 @@ mod tests {
                 )
                 .boxed(),
             ] {
-                cache.add_or_update(intf, record, &mut Vec::new(), true);
+                cache.add_or_update(intf, record, true);
             }
         }
         assert_eq!(
@@ -1264,7 +1132,6 @@ mod tests {
                 "other.local.".to_string(),
             )
             .boxed(),
-            &mut Vec::new(),
             true,
         );
         assert_eq!(cache.get_srv_on_intf(instance, 1).unwrap().len(), 2);
@@ -1301,7 +1168,7 @@ mod tests {
         for packet in out.to_data_on_wire(MAX_PKT_DEFAULT, true) {
             let message = DnsIncoming::new(packet, intf.into()).unwrap();
             for record in message.all_records() {
-                cache.add_or_update(intf, record, &mut Vec::new(), true);
+                cache.add_or_update(intf, record, true);
             }
         }
     }
@@ -1366,7 +1233,6 @@ mod tests {
             cache.add_or_update(
                 &intf,
                 DnsPointer::new(ty, RRType::PTR, CLASS_IN, ttl, instance.to_string()).boxed(),
-                &mut Vec::new(),
                 true,
             );
         }
@@ -1379,71 +1245,6 @@ mod tests {
         assert!(cache.remove_on_intf(&record, 1));
         assert_eq!(cache.subtype_count(), 0);
         assert_eq!(cache.ptr_count(), 1);
-    }
-
-    #[test]
-    fn stopping_one_browse_preserves_shared_service_and_hostname_interest() {
-        let intf = make_intf("en0", 1);
-        let instance = "service._http._tcp.local.";
-        let host = "host.local.";
-        let ty = "_http._tcp.local.";
-        let sub = "_print._sub._http._tcp.local.";
-        let mut cache = DnsCache::new();
-        for name in [ty, sub] {
-            cache.add_or_update(
-                &intf,
-                DnsPointer::new(name, RRType::PTR, CLASS_IN, 120, instance.to_string()).boxed(),
-                &mut Vec::new(),
-                true,
-            );
-        }
-        cache.add_or_update(
-            &intf,
-            DnsSrv::new(instance, CLASS_IN, 120, 0, 0, 80, host.to_string()).boxed(),
-            &mut Vec::new(),
-            true,
-        );
-        cache.add_or_update(
-            &intf,
-            DnsTxt::new(instance, CLASS_IN, 120, vec![0]).boxed(),
-            &mut Vec::new(),
-            true,
-        );
-        cache.add_or_update(
-            &intf,
-            DnsAddress::new(
-                host,
-                RRType::A,
-                CLASS_IN,
-                120,
-                "192.168.1.1".parse().unwrap(),
-                (&intf).into(),
-            )
-            .boxed(),
-            &mut Vec::new(),
-            true,
-        );
-        cache.remove_service_type(ty);
-        assert_eq!(
-            (
-                cache.ptr_count(),
-                cache.srv_count(),
-                cache.txt_count(),
-                cache.addr_count()
-            ),
-            (1, 1, 1, 1)
-        );
-        cache.remove_service_type_with_hostnames(sub, &[host]);
-        assert_eq!(
-            (
-                cache.ptr_count(),
-                cache.srv_count(),
-                cache.txt_count(),
-                cache.addr_count()
-            ),
-            (0, 0, 0, 1)
-        );
-        assert_eq!(cache.subtype_count(), 0);
     }
 
     #[test]
@@ -1461,7 +1262,6 @@ mod tests {
                 "service._http._tcp.local.".to_string(),
             )
             .boxed(),
-            &mut Vec::new(),
             true,
         );
         let record = cache.get_ptr(name).unwrap()[0];
@@ -1492,7 +1292,6 @@ mod tests {
                     (&intf).into(),
                 )
                 .boxed(),
-                &mut Vec::new(),
                 true,
             );
         }
@@ -1510,7 +1309,6 @@ mod tests {
                 (&intf).into(),
             )
             .boxed(),
-            &mut Vec::new(),
             true,
         );
         cache.evict_expired(Instant::now() + Duration::from_secs(2));
@@ -1527,7 +1325,6 @@ mod tests {
             cache.add_or_update(
                 &intf,
                 DnsSrv::new(instance, class, 120, 0, 0, 80, "Host.local.".to_string()).boxed(),
-                &mut Vec::new(),
                 true,
             );
         }
@@ -1535,7 +1332,6 @@ mod tests {
         cache.add_or_update(
             &intf,
             DnsSrv::new(instance, 3, 120, 0, 0, 80, "Host.local.".to_string()).boxed(),
-            &mut Vec::new(),
             true,
         );
         assert_eq!(cache.srv_count(), 2);
@@ -1552,7 +1348,6 @@ mod tests {
                 "other.local.".to_string(),
             )
             .boxed(),
-            &mut Vec::new(),
             true,
         );
         cache.evict_expired(Instant::now() + Duration::from_secs(2));
@@ -1579,7 +1374,6 @@ mod tests {
             cache.add_or_update(
                 &intf,
                 DnsTxt::new(&name, CLASS_IN, 86400, vec![0]).boxed(),
-                &mut Vec::new(),
                 true,
             );
             let (records, bytes) = cache.usage();
@@ -1587,8 +1381,12 @@ mod tests {
             assert!(bytes <= 1024);
         }
         assert_eq!(cache.txt_count(), 8);
-        assert!(cache.get_txt("service-0._http._tcp.local.").is_none());
-        assert!(cache.get_txt("service-99._http._tcp.local.").is_some());
+        assert!(cache
+            .get_txt_on_intf("service-0._http._tcp.local.", 1)
+            .is_none());
+        assert!(cache
+            .get_txt_on_intf("service-99._http._tcp.local.", 1)
+            .is_some());
         cache.set_limits(2, 1024);
         assert_eq!(cache.txt_count(), 2);
         cache.set_limits(0, 0);
@@ -1603,7 +1401,6 @@ mod tests {
         cache.add_or_update(
             &intf,
             DnsTxt::new("small.local.", CLASS_IN, 120, vec![0]).boxed(),
-            &mut Vec::new(),
             true,
         );
         let before = cache.usage();
@@ -1611,7 +1408,6 @@ mod tests {
             .add_or_update(
                 &intf,
                 DnsTxt::new("large.local.", CLASS_IN, 120, vec![0; 1024]).boxed(),
-                &mut Vec::new(),
                 true
             )
             .is_none());
@@ -1620,10 +1416,74 @@ mod tests {
             cache.add_or_update(
                 &intf,
                 DnsTxt::new("SMALL.local.", CLASS_IN, 120, vec![0]).boxed(),
-                &mut Vec::new(),
                 true,
             );
             assert_eq!(cache.usage(), before);
         }
+    }
+
+    #[test]
+    fn unrelated_types_under_interested_names_do_not_schedule_refresh() {
+        let intf = make_intf("en0", 1);
+        let mut cache = DnsCache::new();
+        let ty = "_http._tcp.local.";
+        let instance = "service._http._tcp.local.";
+        let host = "host.local.";
+        for record in [
+            DnsPointer::new(ty, RRType::PTR, CLASS_IN, 120, instance.to_string()).boxed(),
+            DnsSrv::new(instance, CLASS_IN, 120, 0, 0, 80, host.to_string()).boxed(),
+            DnsAddress::new(
+                host,
+                RRType::A,
+                CLASS_IN,
+                120,
+                "192.168.1.1".parse().unwrap(),
+                (&intf).into(),
+            )
+            .boxed(),
+            DnsTxt::new(host, CLASS_IN, 10, vec![0]).boxed(),
+        ] {
+            cache.add_or_update(&intf, record, true);
+        }
+        cache.age_records(Duration::from_secs(9));
+        let now = Instant::now();
+        let expiry = cache.get_txt_on_intf(host, 1).unwrap()[0]
+            .record
+            .get_expire();
+        assert!(
+            cache.get_txt_on_intf(host, 1).unwrap()[0]
+                .record
+                .get_record()
+                .get_refresh_time()
+                < now
+        );
+        assert_eq!(cache.next_deadline(now, &[ty], &[]), Some(expiry));
+        assert!(expiry > now);
+    }
+
+    #[test]
+    fn capacity_prefers_expired_records_over_older_live_records() {
+        let intf = make_intf("en0", 1);
+        let mut cache = DnsCache::new();
+        cache.set_limits(2, 1024);
+        cache.add_or_update(
+            &intf,
+            DnsTxt::new("older.local.", CLASS_IN, 120, vec![0]).boxed(),
+            true,
+        );
+        cache.add_or_update(
+            &intf,
+            DnsTxt::new("expired.local.", CLASS_IN, 1, vec![0]).boxed(),
+            true,
+        );
+        cache.age_records(Duration::from_secs(2));
+        cache.add_or_update(
+            &intf,
+            DnsTxt::new("new.local.", CLASS_IN, 120, vec![0]).boxed(),
+            true,
+        );
+        assert!(cache.get_txt_on_intf("older.local.", 1).is_some());
+        assert!(cache.get_txt_on_intf("new.local.", 1).is_some());
+        assert_eq!(cache.usage().0, 2);
     }
 }

@@ -6,7 +6,7 @@ use crate::{
     dns_name::{names_equal, CanonicalName, RrsetKey},
     dns_parser::{
         ip_address_rr_type, DnsAddress, DnsIncoming, DnsOutgoing, DnsRecordBox, DnsRecordExt,
-        DnsSrv, DnsTxt, RRType, ScopedIp, CLASS_IN,
+        DnsSrv, DnsTxt, ScopedIp, CLASS_IN,
     },
     Error, IfKind, InterfaceId, Result,
 };
@@ -1064,7 +1064,11 @@ impl Probe {
 
     /// Add a new record with the same probing name in a sorted order.
     pub(crate) fn insert_record(&mut self, record: DnsRecordBox) {
-        if self.records.iter().any(|existing| same_record(existing, &record)) {
+        if self
+            .records
+            .iter()
+            .any(|existing| same_record(existing, &record))
+        {
             return;
         }
         /*
@@ -1078,9 +1082,7 @@ impl Probe {
          */
         let insert_position = self
             .records
-            .binary_search_by(
-                |existing| existing.compare(record.as_ref()),
-            )
+            .binary_search_by(|existing| existing.compare(record.as_ref()))
             .unwrap_or_else(|pos| pos);
 
         self.records.insert(insert_position, record);
@@ -1200,10 +1202,15 @@ struct NameProposal {
 
 impl NameProposal {
     fn add(&mut self, record: DnsRecordBox, service: &ServiceInfo) {
-        if !self.records.iter().any(|existing| same_record(existing, &record)) {
+        if !self
+            .records
+            .iter()
+            .any(|existing| same_record(existing, &record))
+        {
             self.records.push(record);
         }
-        self.waiting_services.insert(registry_key(service.get_fullname()));
+        self.waiting_services
+            .insert(registry_key(service.get_fullname()));
         self.skip_probe |= !service.requires_probe();
     }
 }
@@ -1264,9 +1271,8 @@ impl DnsRegistry {
                 < Duration::from_millis(MULTICAST_RATE_LIMIT_MILLIS)
         });
 
-        let was_multicast = |record: &DnsRecordBox| {
-            last_multicast.contains_key(&rate_limit_key(record))
-        };
+        let was_multicast =
+            |record: &DnsRecordBox| last_multicast.contains_key(&rate_limit_key(record));
         let blocked_rrsets: HashSet<_> = out
             .answers()
             .iter()
@@ -1275,8 +1281,7 @@ impl DnsRegistry {
             .map(|record| RrsetKey::new(record.as_ref()))
             .collect();
         let keep = |record: &DnsRecordBox| {
-            !(record.get_cache_flush()
-                && blocked_rrsets.contains(&RrsetKey::new(record.as_ref())))
+            !(record.get_cache_flush() && blocked_rrsets.contains(&RrsetKey::new(record.as_ref())))
                 && !was_multicast(record)
         };
         out.retain_answers(keep);
@@ -1374,11 +1379,15 @@ impl DnsRegistry {
                 continue;
             }
             let start = now + Duration::from_millis(fastrand::u64(0..250));
-            let probe = self.probing.entry(name).or_insert_with(|| Probe::new(start));
+            let probe = self
+                .probing
+                .entry(name)
+                .or_insert_with(|| Probe::new(start));
             let changed = probe.records.len() != proposal.records.len()
-                || proposal.records.iter().any(|record| {
-                    !probe.records.iter().any(|old| same_record(old, record))
-                });
+                || proposal
+                    .records
+                    .iter()
+                    .any(|record| !probe.records.iter().any(|old| same_record(old, record)));
             if changed {
                 probe.start_time = start;
                 probe.next_send = start;
@@ -1414,6 +1423,7 @@ impl DnsRegistry {
     }
 
     /// Returns the address union contributed by registrations using this hostname.
+    #[cfg(test)]
     pub(crate) fn host_addresses(&self, hostname: &str) -> Vec<IpAddr> {
         let mut addresses: Vec<_> = self
             .records_for_name(hostname)
@@ -1626,11 +1636,20 @@ mod tests {
             assert!(registry.probing.is_empty());
             assert_eq!(registry.unique_records().count(), 3);
             let records = registry.records_for_name(service.get_fullname());
-            let srv = records.iter().find_map(|r| r.any().downcast_ref::<DnsSrv>()).unwrap();
-            let txt = records.iter().find_map(|r| r.any().downcast_ref::<DnsTxt>()).unwrap();
+            let srv = records
+                .iter()
+                .find_map(|r| r.any().downcast_ref::<DnsSrv>())
+                .unwrap();
+            let txt = records
+                .iter()
+                .find_map(|r| r.any().downcast_ref::<DnsTxt>())
+                .unwrap();
             assert_eq!(srv.port(), 8000 + version);
             assert_eq!(txt.text(), service.generate_txt());
-            assert_eq!(registry.host_addresses("shared.local."), vec![address.parse::<std::net::IpAddr>().unwrap()]);
+            assert_eq!(
+                registry.host_addresses("shared.local."),
+                vec![address.parse::<std::net::IpAddr>().unwrap()]
+            );
         }
     }
 
@@ -1670,7 +1689,10 @@ mod tests {
         establish_registry(&mut registry);
         let records = registry.records_for_name(first.get_fullname());
         assert_eq!(records.len(), 2);
-        let txt = records.iter().find_map(|r| r.any().downcast_ref::<DnsTxt>()).unwrap();
+        let txt = records
+            .iter()
+            .find_map(|r| r.any().downcast_ref::<DnsTxt>())
+            .unwrap();
         assert_eq!(txt.text(), first.generate_txt());
     }
 
@@ -1698,10 +1720,13 @@ mod tests {
         establish_registry(&mut registry);
         assert_eq!(registry.unique_records().count(), 7);
         registry.reconcile_services(&[&second], &intf, Instant::now());
-        assert_eq!(registry.host_addresses("SHARED.local."), vec![
-            "127.0.0.2".parse::<std::net::IpAddr>().unwrap(),
-            "127.0.0.3".parse::<std::net::IpAddr>().unwrap(),
-        ]);
+        assert_eq!(
+            registry.host_addresses("SHARED.local."),
+            vec![
+                "127.0.0.2".parse::<std::net::IpAddr>().unwrap(),
+                "127.0.0.3".parse::<std::net::IpAddr>().unwrap(),
+            ]
+        );
         assert_eq!(registry.unique_records().count(), 4);
         assert!(registry.probing.is_empty());
         registry.reconcile_services(&[], &intf, Instant::now());
@@ -1730,8 +1755,13 @@ mod tests {
         let intf = registry_interface();
         let service = registry_service("renamed", "127.0.0.1", 0);
         let mut registry = DnsRegistry::new();
-        registry.name_changes.insert("shared.local.".to_string(), "shared-2.local.".to_string());
-        registry.name_changes.insert(service.get_fullname().to_ascii_lowercase(), "renamed (2)._registry._tcp.local.".to_string());
+        registry
+            .name_changes
+            .insert("shared.local.".to_string(), "shared-2.local.".to_string());
+        registry.name_changes.insert(
+            service.get_fullname().to_ascii_lowercase(),
+            "renamed (2)._registry._tcp.local.".to_string(),
+        );
         registry.reconcile_services(&[&service], &intf, Instant::now());
         assert_eq!(registry.probing.len(), 2);
         assert!(registry.probing.contains_key("shared-2.local."));
@@ -1889,10 +1919,16 @@ mod tests {
     #[test]
     fn test_multicast_rate_limit_preserves_complete_unique_rrsets() {
         let intf = registry_interface();
-        let address = |last| DnsAddress::new(
-            "shared.local.", RRType::A, CLASS_IN | CLASS_CACHE_FLUSH, 120,
-            Ipv4Addr::new(127, 0, 0, last).into(), (&intf).into(),
-        );
+        let address = |last| {
+            DnsAddress::new(
+                "shared.local.",
+                RRType::A,
+                CLASS_IN | CLASS_CACHE_FLUSH,
+                120,
+                Ipv4Addr::new(127, 0, 0, last).into(),
+                (&intf).into(),
+            )
+        };
         let mut registry = DnsRegistry::new();
         let now = Instant::now();
         let mut initial = DnsOutgoing::new(FLAGS_QR_RESPONSE);
@@ -1917,10 +1953,16 @@ mod tests {
     #[test]
     fn test_multicast_rate_limit_groups_answer_and_additional_rrset_members() {
         let intf = registry_interface();
-        let address = |last| DnsAddress::new(
-            "shared.local.", RRType::A, CLASS_IN | CLASS_CACHE_FLUSH, 120,
-            Ipv4Addr::new(127, 0, 0, last).into(), (&intf).into(),
-        );
+        let address = |last| {
+            DnsAddress::new(
+                "shared.local.",
+                RRType::A,
+                CLASS_IN | CLASS_CACHE_FLUSH,
+                120,
+                Ipv4Addr::new(127, 0, 0, last).into(),
+                (&intf).into(),
+            )
+        };
         let mut registry = DnsRegistry::new();
         let now = Instant::now();
         let mut initial = DnsOutgoing::new(FLAGS_QR_RESPONSE);
@@ -1935,7 +1977,10 @@ mod tests {
 
         let mut update = DnsOutgoing::new(FLAGS_QR_RESPONSE);
         update.add_answer_record(DnsPointer::new(
-            "_registry._tcp.local.", RRType::PTR, CLASS_IN, 4500,
+            "_registry._tcp.local.",
+            RRType::PTR,
+            CLASS_IN,
+            4500,
             "other._registry._tcp.local.".to_string(),
         ));
         update.add_additional_answer(address(1));

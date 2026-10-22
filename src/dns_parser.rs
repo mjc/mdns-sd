@@ -334,7 +334,7 @@ const MSG_HEADER_LEN: usize = 12;
 /// Max size of a single DNS label, in bytes.
 ///
 /// Reference: [RFC1035 section 2.3.4](https://datatracker.ietf.org/doc/html/rfc1035#section-2.3.4)
-const MAX_LABEL_BYTES: usize = 63;
+pub(crate) const MAX_LABEL_BYTES: usize = 63;
 
 /// Max size of a whole domain name, in bytes.
 ///
@@ -964,7 +964,7 @@ impl DnsRecordExt for DnsPointer {
 
     fn compare_rdata(&self, other: &dyn DnsRecordExt) -> cmp::Ordering {
         if let Some(other_ptr) = other.any().downcast_ref::<Self>() {
-            self.alias.cmp(&other_ptr.alias)
+            compare_rdata_on_wire(self, other_ptr)
         } else {
             cmp::Ordering::Greater
         }
@@ -1020,10 +1020,6 @@ impl DnsSrv {
     pub fn port(&self) -> u16 {
         self.port
     }
-
-    pub fn set_host(&mut self, host: String) {
-        self.host = host;
-    }
 }
 
 impl DnsRecordExt for DnsSrv {
@@ -1071,32 +1067,7 @@ impl DnsRecordExt for DnsSrv {
         let Some(other_srv) = other.any().downcast_ref::<Self>() else {
             return cmp::Ordering::Greater;
         };
-
-        // 1. compare `priority`
-        match self
-            .priority
-            .to_be_bytes()
-            .cmp(&other_srv.priority.to_be_bytes())
-        {
-            cmp::Ordering::Equal => {
-                // 2. compare `weight`
-                match self
-                    .weight
-                    .to_be_bytes()
-                    .cmp(&other_srv.weight.to_be_bytes())
-                {
-                    cmp::Ordering::Equal => {
-                        // 3. compare `port`.
-                        match self.port.to_be_bytes().cmp(&other_srv.port.to_be_bytes()) {
-                            cmp::Ordering::Equal => self.host.cmp(&other_srv.host),
-                            not_equal => not_equal,
-                        }
-                    }
-                    not_equal => not_equal,
-                }
-            }
-            not_equal => not_equal,
-        }
+        compare_rdata_on_wire(self, other_srv)
     }
 
     fn rdata_print(&self) -> String {
@@ -1382,10 +1353,7 @@ impl DnsRecordExt for DnsNSec {
 
     fn compare_rdata(&self, other: &dyn DnsRecordExt) -> cmp::Ordering {
         if let Some(other_nsec) = other.any().downcast_ref::<Self>() {
-            match self.next_domain.cmp(&other_nsec.next_domain) {
-                cmp::Ordering::Equal => self.type_bitmap.cmp(&other_nsec.type_bitmap),
-                ordering => ordering,
-            }
+            compare_rdata_on_wire(self, other_nsec)
         } else {
             cmp::Ordering::Greater
         }
@@ -2869,6 +2837,22 @@ impl DnsIncoming {
     }
 }
 
+/// Probe ordering compares uncompressed RDATA bytes, including DNS label lengths.
+fn compare_rdata_on_wire(first: &dyn DnsRecordExt, second: &dyn DnsRecordExt) -> cmp::Ordering {
+    let mut first_packet = DnsOutPacket::new(usize::MAX);
+    let mut second_packet = DnsOutPacket::new(usize::MAX);
+    match (
+        first.write(&mut first_packet),
+        second.write(&mut second_packet),
+    ) {
+        (Ok(()), Ok(())) => first_packet.as_bytes()[MSG_HEADER_LEN..]
+            .cmp(&second_packet.as_bytes()[MSG_HEADER_LEN..]),
+        (Ok(()), Err(_)) => cmp::Ordering::Greater,
+        (Err(_), Ok(())) => cmp::Ordering::Less,
+        (Err(_), Err(_)) => cmp::Ordering::Equal,
+    }
+}
+
 const fn u16_from_be_slice(bytes: &[u8]) -> u16 {
     let u8_array: [u8; 2] = [bytes[0], bytes[1]];
     u16::from_be_bytes(u8_array)
@@ -2990,6 +2974,70 @@ mod tests {
         );
         assert!(first.matches(&second));
         assert!(first.rrdata_match(&second));
+    }
+
+    #[test]
+    fn test_probe_order_compares_uncompressed_name_lengths_and_case() {
+        let ptr = |alias: &str| {
+            DnsPointer::new(
+                "_http._tcp.local.",
+                RRType::PTR,
+                CLASS_IN,
+                120,
+                alias.to_string(),
+            )
+        };
+        assert_eq!(
+            ptr("z.local.").compare_rdata(&ptr("aa.local.")),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            ptr(r"\.a.local.").compare_rdata(&ptr("z.local.")),
+            std::cmp::Ordering::Greater
+        );
+        assert!(ptr("Z.local.").rrdata_match(&ptr("z.local.")));
+        assert_eq!(
+            ptr("Z.local.").compare_rdata(&ptr("z.local.")),
+            std::cmp::Ordering::Less
+        );
+
+        let srv = |host: &str| {
+            DnsSrv::new(
+                "instance._http._tcp.local.",
+                CLASS_IN,
+                120,
+                0,
+                0,
+                80,
+                host.to_string(),
+            )
+        };
+        assert_eq!(
+            srv("z.local.").compare_rdata(&srv("aa.local.")),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            srv(r"\.a.local.").compare_rdata(&srv("z.local.")),
+            std::cmp::Ordering::Greater
+        );
+
+        let nsec = |name: &str| {
+            DnsNSec::new(
+                "host.local.",
+                CLASS_IN,
+                120,
+                name.to_string(),
+                vec![0, 1, 0x40],
+            )
+        };
+        assert_eq!(
+            nsec("z.local.").compare_rdata(&nsec("aa.local.")),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            nsec(r"\.a.local.").compare_rdata(&nsec("z.local.")),
+            std::cmp::Ordering::Greater
+        );
     }
 
     #[test]

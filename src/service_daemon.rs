@@ -51,11 +51,15 @@ use if_addrs::{IfAddr, Interface};
 use mio::{event::Source, net::UdpSocket as MioUdpSocket, Interest, Poll, Registry, Token, Waker};
 use socket2::Domain;
 use socket_pktinfo::PktInfoUdpSocket;
+#[cfg(test)]
+mod cache_tests;
+#[cfg(test)]
+mod lifecycle_tests;
 mod publisher;
 
 use std::{
     cmp,
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fmt, io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
     str,
@@ -801,7 +805,10 @@ impl ServiceDaemon {
     /// header bytes and uncompressed RDATA bytes; it is not an RSS measurement.
     /// Oldest received records are evicted when either limit is reached.
     pub fn set_cache_limits(&self, max_records: usize, max_bytes: usize) -> Result<()> {
-        self.send_cmd(Command::SetOption(DaemonOption::CacheLimits(max_records, max_bytes)))
+        self.send_cmd(Command::SetOption(DaemonOption::CacheLimits(
+            max_records,
+            max_bytes,
+        )))
     }
 
     /// Enable or disable the loopback for locally sent multicast packets in IPv6.
@@ -1139,16 +1146,24 @@ struct MaxPacketSizeSelection {
 fn same_resolution(left: &ResolvedService, right: &ResolvedService) -> bool {
     CanonicalName::new(&left.fullname) == CanonicalName::new(&right.fullname)
         && CanonicalName::new(&left.host) == CanonicalName::new(&right.host)
-        && left.port == right.port && left.addresses == right.addresses
-        && left.txt_properties == right.txt_properties && left.sub_ty_domain == right.sub_ty_domain
+        && left.port == right.port
+        && left.addresses == right.addresses
+        && left.txt_properties == right.txt_properties
+        && left.sub_ty_domain == right.sub_ty_domain
 }
 
 fn merge_scoped_address(addresses: &mut HashSet<ScopedIp>, incoming: ScopedIp) {
     if let ScopedIp::V4(v4) = &incoming {
-        if let Some(mut existing) = addresses.iter().find(|addr| addr.to_ip_addr() == incoming.to_ip_addr()).cloned() {
+        if let Some(mut existing) = addresses
+            .iter()
+            .find(|addr| addr.to_ip_addr() == incoming.to_ip_addr())
+            .cloned()
+        {
             addresses.remove(&existing);
             if let ScopedIp::V4(value) = &mut existing {
-                for id in v4.interface_ids() { value.add_interface_id(id.clone()); }
+                for id in v4.interface_ids() {
+                    value.add_interface_id(id.clone());
+                }
             }
             addresses.insert(existing);
             return;
@@ -1165,31 +1180,33 @@ enum BrowseDelivery {
 
 impl BrowseDelivery {
     fn fullname(&self) -> &str {
-        match self { Self::Found(name) => name, Self::Resolved(service) => &service.fullname }
+        match self {
+            Self::Found(name) => name,
+            Self::Resolved(service) => &service.fullname,
+        }
     }
 }
 
 struct ServiceSubscription {
     sender: Sender<ServiceEvent>,
     delivered: HashMap<(u32, String), BrowseDelivery>,
+    querying: bool,
 }
 
 impl From<Sender<ServiceEvent>> for ServiceSubscription {
     fn from(sender: Sender<ServiceEvent>) -> Self {
-        Self { sender, delivered: HashMap::new() }
+        Self {
+            sender,
+            delivered: HashMap::new(),
+            querying: true,
+        }
     }
 }
 
 impl std::ops::Deref for ServiceSubscription {
     type Target = Sender<ServiceEvent>;
-    fn deref(&self) -> &Self::Target { &self.sender }
-}
-
-impl ServiceSubscription {
-    fn is_resolved(&self, instance: &str) -> bool {
-        let name = CanonicalName::new(instance);
-        self.delivered.iter().any(|((_, key), state)| key == name.as_str()
-            && matches!(state, BrowseDelivery::Resolved(_)))
+    fn deref(&self) -> &Self::Target {
+        &self.sender
     }
 }
 
@@ -1263,6 +1280,9 @@ struct Zeroconf {
 
     /// Explicit reconfirmation interests, including calls without a browse.
     verifications: HashMap<String, Instant>,
+
+    /// At most fifteen recent conflicts, for RFC 6762 section 8.1 backoff.
+    conflicts: VecDeque<Instant>,
 
     multicast_loop_v4: bool,
 
@@ -1483,6 +1503,7 @@ impl Zeroconf {
             status,
             pending_resolves: HashSet::new(),
             verifications: HashMap::new(),
+            conflicts: VecDeque::new(),
             multicast_loop_v4: true,
             multicast_loop_v6: true,
             accept_unsolicited: false,
@@ -1511,17 +1532,20 @@ impl Zeroconf {
     }
 
     fn clear_hostname_retransmissions(&mut self, hostname: &str) {
-        let key = hostname.to_ascii_lowercase();
+        let key = CanonicalName::new(&hostname).as_str().to_string();
         self.retransmissions.retain(|r| {
             !matches!(
                 &r.command,
-                Command::ResolveHostname(h, _, _, _) if h.to_ascii_lowercase() == key
+                Command::ResolveHostname(h, _, _, _) if CanonicalName::new(h).as_str() == key
             )
         });
     }
 
     fn remove_service_subscription(&mut self, ty_domain: &str) -> Option<Sender<ServiceEvent>> {
-        let sender = self.service_queriers.remove(ty_domain).map(|subscription| subscription.sender);
+        let sender = self
+            .service_queriers
+            .remove(ty_domain)
+            .map(|subscription| subscription.sender);
         self.clear_service_retransmissions(ty_domain);
         self.reconcile_browse_state();
         sender
@@ -1531,7 +1555,7 @@ impl Zeroconf {
         &mut self,
         hostname: &str,
     ) -> Option<(Sender<HostnameResolutionEvent>, Option<Instant>)> {
-        let key = hostname.to_ascii_lowercase();
+        let key = CanonicalName::new(&hostname).as_str().to_string();
         let entry = self.hostname_resolvers.remove(&key);
         self.clear_hostname_retransmissions(&key);
         entry
@@ -1545,18 +1569,24 @@ impl Zeroconf {
 
     fn hostname_live(&self, hostname: &str, sender: &Sender<HostnameResolutionEvent>) -> bool {
         self.hostname_resolvers
-            .get(&hostname.to_ascii_lowercase())
+            .get(&CanonicalName::new(&hostname).as_str().to_string())
             .is_some_and(|(s, _)| s.same_channel(sender))
     }
 
     fn push_service(&mut self, ty_domain: &str, event: ServiceEvent) {
         let ty_domain = CanonicalName::new(ty_domain).as_str().to_string();
-        let Some(sender) = self.service_queriers.get(&ty_domain).map(|s| s.sender.clone()) else {
+        let Some(sender) = self
+            .service_queriers
+            .get(&ty_domain)
+            .map(|s| s.sender.clone())
+        else {
             return;
         };
         let delivery = match &event {
             ServiceEvent::ServiceFound(_, name) => Some(BrowseDelivery::Found(name.clone())),
-            ServiceEvent::ServiceResolved(service) => Some(BrowseDelivery::Resolved(service.as_ref().clone())),
+            ServiceEvent::ServiceResolved(service) => {
+                Some(BrowseDelivery::Resolved(service.as_ref().clone()))
+            }
             _ => None,
         };
         let removed = match &event {
@@ -1567,37 +1597,58 @@ impl Zeroconf {
             Ok(()) => {
                 if let Some(delivery) = delivery {
                     let key = CanonicalName::new(delivery.fullname()).as_str().to_string();
-                    let scopes: Vec<_> = self.cache.get_ptr(&ty_domain).into_iter().flatten()
+                    let scopes: Vec<_> = self
+                        .cache
+                        .get_ptr(&ty_domain)
+                        .into_iter()
+                        .flatten()
                         .filter(|record| !record.record.get_record().is_expired(Instant::now()))
-                        .filter_map(|record| record.record.any().downcast_ref::<DnsPointer>()
-                            .filter(|ptr| CanonicalName::new(ptr.alias()).as_str() == key)
-                            .map(|_| record.src_intf.index))
+                        .filter_map(|record| {
+                            record
+                                .record
+                                .any()
+                                .downcast_ref::<DnsPointer>()
+                                .filter(|ptr| CanonicalName::new(ptr.alias()).as_str() == key)
+                                .map(|_| record.src_intf.index)
+                        })
                         .filter(|index| match delivery {
                             BrowseDelivery::Found(_) => true,
-                            BrowseDelivery::Resolved(_) => self.resolve_service_on_intf(&ty_domain, &key, *index)
-                                .map(|service| service.is_valid()).unwrap_or(false),
-                        }).collect();
-                    let states: Vec<_> = scopes.into_iter().filter_map(|index| {
-                        let state = match &delivery {
-                            BrowseDelivery::Found(name) => BrowseDelivery::Found(name.clone()),
-                            BrowseDelivery::Resolved(_) => BrowseDelivery::Resolved(
-                                self.resolve_service_on_intf(&ty_domain, &key, index).ok()?),
-                        };
-                        Some((index, state))
-                    }).collect();
+                            BrowseDelivery::Resolved(_) => self
+                                .resolve_service_on_intf(&ty_domain, &key, *index)
+                                .map(|service| service.is_valid())
+                                .unwrap_or(false),
+                        })
+                        .collect();
+                    let states: Vec<_> = scopes
+                        .into_iter()
+                        .filter_map(|index| {
+                            let state = match &delivery {
+                                BrowseDelivery::Found(name) => BrowseDelivery::Found(name.clone()),
+                                BrowseDelivery::Resolved(_) => BrowseDelivery::Resolved(
+                                    self.resolve_service_on_intf(&ty_domain, &key, index).ok()?,
+                                ),
+                            };
+                            Some((index, state))
+                        })
+                        .collect();
                     if let Some(subscription) = self.service_queriers.get_mut(&ty_domain) {
                         for (index, state) in states {
                             if matches!(state, BrowseDelivery::Resolved(_)) {
                                 subscription.delivered.insert((index, key.clone()), state);
                             } else {
-                                subscription.delivered.entry((index, key.clone())).or_insert(state);
+                                subscription
+                                    .delivered
+                                    .entry((index, key.clone()))
+                                    .or_insert(state);
                             }
                         }
                     }
                 }
                 if let Some(removed) = removed {
                     if let Some(subscription) = self.service_queriers.get_mut(&ty_domain) {
-                        subscription.delivered.retain(|(_, name), _| name != removed.as_str());
+                        subscription
+                            .delivered
+                            .retain(|(_, name), _| name != removed.as_str());
                     }
                 }
             }
@@ -1614,31 +1665,64 @@ impl Zeroconf {
         let mut changed = HashSet::new();
         for (ty, subscription) in &self.service_queriers {
             for ((index, instance), delivery) in &subscription.delivered {
-                let ptr_alive = self.cache.get_ptr_on_intf(ty, *index).into_iter().flatten()
-                    .any(|record| !record.record.get_record().is_expired(now)
-                        && record.record.any().downcast_ref::<DnsPointer>().is_some_and(|ptr|
-                            CanonicalName::new(ptr.alias()).as_str() == instance));
-                let valid = ptr_alive && match delivery {
-                    BrowseDelivery::Found(_) => true,
-                    BrowseDelivery::Resolved(previous) => {
-                        if let Ok(current) = self.resolve_service_on_intf(ty, instance, *index) {
-                            if current.is_valid() {
-                                if !same_resolution(previous, &current) { changed.insert((ty.clone(), instance.clone())); }
-                                true
-                            } else { false }
-                        } else { false }
-                    }
-                };
-                if !valid { stale.push((ty.clone(), *index, instance.clone(), delivery.fullname().to_string())); }
+                let ptr_alive = self
+                    .cache
+                    .get_ptr_on_intf(ty, *index)
+                    .into_iter()
+                    .flatten()
+                    .any(|record| {
+                        !record.record.get_record().is_expired(now)
+                            && record
+                                .record
+                                .any()
+                                .downcast_ref::<DnsPointer>()
+                                .is_some_and(|ptr| {
+                                    CanonicalName::new(ptr.alias()).as_str() == instance
+                                })
+                    });
+                let valid = ptr_alive
+                    && match delivery {
+                        BrowseDelivery::Found(_) => true,
+                        BrowseDelivery::Resolved(previous) => {
+                            if let Ok(current) = self.resolve_service_on_intf(ty, instance, *index)
+                            {
+                                if current.is_valid() {
+                                    if !same_resolution(previous, &current) {
+                                        changed.insert((ty.clone(), instance.clone()));
+                                    }
+                                    true
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            }
+                        }
+                    };
+                if !valid {
+                    stale.push((
+                        ty.clone(),
+                        *index,
+                        instance.clone(),
+                        delivery.fullname().to_string(),
+                        matches!(delivery, BrowseDelivery::Resolved(_)),
+                    ));
+                }
             }
         }
         let mut removed = HashMap::new();
-        for (ty, index, instance, fullname) in stale {
+        for (ty, index, instance, fullname, was_resolved) in stale {
             if let Some(subscription) = self.service_queriers.get_mut(&ty) {
                 subscription.delivered.remove(&(index, instance.clone()));
-                if !subscription.delivered.keys().any(|(_, key)| key == &instance) {
+                let remains = subscription.delivered.iter().any(|((_, key), delivery)| {
+                    key == &instance
+                        && (!was_resolved || matches!(delivery, BrowseDelivery::Resolved(_)))
+                });
+                if !remains {
                     removed.insert((ty, instance), fullname);
-                } else { changed.insert((ty, instance)); }
+                } else {
+                    changed.insert((ty, instance));
+                }
             }
         }
         for ((ty, instance), fullname) in removed {
@@ -1652,13 +1736,22 @@ impl Zeroconf {
                 }
             }
         }
-        let wanted: HashSet<_> = self.cache.all_ptr().into_iter()
-            .filter(|(ty, _)| self.service_queriers.contains_key(ty))
+        let wanted: HashSet<_> = self
+            .cache
+            .all_ptr()
+            .into_iter()
+            .filter(|(ty, _)| {
+                self.service_queriers
+                    .get(ty)
+                    .is_some_and(|subscription| subscription.querying)
+            })
             .flat_map(|(_, records)| records)
             .filter(|record| !record.record.get_record().is_expired(now))
             .filter_map(|record| record.record.any().downcast_ref::<DnsPointer>())
-            .map(|ptr| CanonicalName::new(ptr.alias()).as_str().to_string()).collect();
-        self.pending_resolves.retain(|instance| wanted.contains(CanonicalName::new(instance).as_str()));
+            .map(|ptr| CanonicalName::new(ptr.alias()).as_str().to_string())
+            .collect();
+        self.pending_resolves
+            .retain(|instance| wanted.contains(CanonicalName::new(instance).as_str()));
         self.retransmissions.retain(|rerun| match &rerun.command {
             Command::Resolve(instance, _) => wanted.contains(CanonicalName::new(instance).as_str()),
             _ => true,
@@ -1666,7 +1759,7 @@ impl Zeroconf {
     }
 
     fn push_hostname(&mut self, hostname: &str, event: HostnameResolutionEvent) {
-        let key = hostname.to_ascii_lowercase();
+        let key = CanonicalName::new(&hostname).as_str().to_string();
         let Some((sender, _)) = self.hostname_resolvers.get(&key).cloned() else {
             return;
         };
@@ -1713,7 +1806,9 @@ impl Zeroconf {
         debug!("Starting cleanup for shutdown");
 
         let names: Vec<_> = self.my_services.keys().cloned().collect();
-        for name in names { self.remove_registration(name, true); }
+        for name in names {
+            self.remove_registration(name, true);
+        }
 
         // 2. Stop all browse operations
         let browse_types: Vec<String> = self.service_queriers.keys().cloned().collect();
@@ -1883,33 +1978,7 @@ impl Zeroconf {
 
             self.increase_counter(Counter::CacheRefreshAddr, query_count);
 
-            // check and evict expired records in our cache
-            let now = Instant::now();
-
-            // Notify service listeners about the expired records.
-            let expired = self.cache.evict_expired(now);
-            let expired_services = expired.expired_services;
-            if !expired_services.is_empty() {
-                debug!(
-                    "run: send {} service removal to listeners",
-                    expired_services.len()
-                );
-                self.notify_service_removal(expired_services);
-            }
-
-            // Notify hostname listeners about the expired records.
-            let expired_addrs = expired.expired_addrs;
-            for (hostname, addrs) in expired_addrs {
-                self.push_hostname(
-                    &hostname,
-                    HostnameResolutionEvent::AddressesRemoved(hostname.clone(), addrs),
-                );
-                let instances = self.cache.get_instances_on_host(&hostname);
-                let instance_set: HashSet<String> = instances.into_iter().collect();
-                self.resolve_updated_instances(&instance_set);
-            }
-
-            self.reconcile_browse_state();
+            self.expire_cache(Instant::now());
 
             // Send out probing queries.
             self.probing_handler();
@@ -1936,6 +2005,7 @@ impl Zeroconf {
             DaemonOption::MulticastLoopV6(on) => self.set_multicast_loop_v6(on),
             DaemonOption::AcceptUnsolicited(accept) => self.set_accept_unsolicited(accept),
             DaemonOption::CacheLimits(records, bytes) => {
+                self.expire_cache(Instant::now());
                 let previous = self.hostname_snapshot();
                 self.cache.set_limits(records, bytes);
                 self.notify_hostname_changes(previous);
@@ -2078,28 +2148,53 @@ impl Zeroconf {
     /// Poll deadlines belong to live operations; refreshing a record allocates no timer.
     fn peek_earliest_timer(&self) -> Option<Instant> {
         let now = Instant::now();
-        let types: Vec<_> = self.service_queriers.keys().map(String::as_str).collect();
+        let types: Vec<_> = self
+            .service_queriers
+            .iter()
+            .filter(|(_, subscription)| subscription.querying)
+            .map(|(name, _)| name.as_str())
+            .collect();
         let hosts: Vec<_> = self.hostname_resolvers.keys().map(String::as_str).collect();
-        self.cache.next_deadline(now, &types, &hosts)
+        self.cache
+            .next_deadline(now, &types, &hosts)
             .into_iter()
             .chain(self.next_ip_check)
             .chain(self.retransmissions.iter().map(|r| r.next_time))
             .chain(self.delayed_responses.iter().map(|r| r.next_time))
-            .chain(self.hostname_resolvers.values().filter_map(|(_, timeout)| *timeout))
-            .chain(self.dns_registry_map.values().flat_map(|registry| {
-                registry.probing.values().map(|probe| probe.next_send)
-            }))
+            .chain(
+                self.hostname_resolvers
+                    .values()
+                    .filter_map(|(_, timeout)| *timeout),
+            )
+            .chain(
+                self.dns_registry_map
+                    .values()
+                    .flat_map(|registry| registry.probing.values().map(|probe| probe.next_send)),
+            )
             .chain(self.verifications.values().copied())
             .min()
     }
 
     fn scheduled_deadlines(&self) -> usize {
-        self.retransmissions.len() + self.delayed_responses.len()
-            + self.hostname_resolvers.values().filter(|(_, timeout)| timeout.is_some()).count()
-            + self.dns_registry_map.values().map(|r| r.probing.len()).sum::<usize>()
-            + self.verifications.len() + usize::from(self.next_ip_check.is_some())
-            + self.cache.ptr_count() + self.cache.srv_count() + self.cache.txt_count()
-            + self.cache.addr_count() + self.cache.nsec_count()
+        self.retransmissions.len()
+            + self.delayed_responses.len()
+            + self
+                .hostname_resolvers
+                .values()
+                .filter(|(_, timeout)| timeout.is_some())
+                .count()
+            + self
+                .dns_registry_map
+                .values()
+                .map(|r| r.probing.len())
+                .sum::<usize>()
+            + self.verifications.len()
+            + usize::from(self.next_ip_check.is_some())
+            + self.cache.ptr_count()
+            + self.cache.srv_count()
+            + self.cache.txt_count()
+            + self.cache.addr_count()
+            + self.cache.nsec_count()
     }
 
     /// Apply all selections to `interfaces` and return the selected addresses.
@@ -2169,6 +2264,7 @@ impl Zeroconf {
 
     /// Check for IP changes and update [my_intfs] as needed.
     fn check_ip_changes(&mut self) {
+        let previous_addresses = self.hostname_snapshot();
         let publication = self.publication_snapshot();
         // Get the current interfaces.
         let my_ifaddrs = my_ip_interfaces_inner(true, self.include_apple_p2p);
@@ -2293,6 +2389,7 @@ impl Zeroconf {
             }
         }
 
+        self.notify_hostname_changes(previous_addresses);
         // Add newly found interfaces only if in our selections.
         self.apply_intf_selections(my_ifaddrs);
         self.reconcile_registries();
@@ -2303,6 +2400,7 @@ impl Zeroconf {
     /// Remove an interface address when it was down, disabled or removed from the system.
     /// If no more addresses on the interface, remove the interface as well.
     fn del_interface_addr(&mut self, intf: &Interface) {
+        let previous_addresses = self.hostname_snapshot();
         let publication = self.publication_snapshot();
         let if_index = intf.index.unwrap_or(0);
         debug!(
@@ -2358,9 +2456,15 @@ impl Zeroconf {
                 debug!("del_interface_addr: removing interface {}", intf.name);
                 self.my_intfs.remove(&if_index);
                 self.dns_registry_map.remove(&if_index);
-                self.cache.remove_records_on_intf(InterfaceId { name: intf.name.clone(), index: if_index });
-                for service in self.my_services.values_mut() { service.remove_status(if_index); }
-                self.delayed_responses.retain(|response| response.if_index != if_index);
+                self.cache.remove_records_on_intf(InterfaceId {
+                    name: intf.name.clone(),
+                    index: if_index,
+                });
+                for service in self.my_services.values_mut() {
+                    service.remove_status(if_index);
+                }
+                self.delayed_responses
+                    .retain(|response| response.if_index != if_index);
             } else {
                 // Interface still has addresses of the other IP version.
                 // Remove cached address records for the disabled IP version
@@ -2387,6 +2491,7 @@ impl Zeroconf {
         self.reconcile_registries();
         self.finish_publication_change(publication, false);
         self.reconcile_browse_state();
+        self.notify_hostname_changes(previous_addresses);
     }
 
     /// Indexes of the interfaces in `my_intfs` that have `ip`.
@@ -2412,21 +2517,35 @@ impl Zeroconf {
     /// max packet size of the interface before we send anything on it.
     fn add_interface(&mut self, intf: &Interface, interfaces: &[Interface]) {
         let publication = self.publication_snapshot();
-        let sock = if intf.ip().is_ipv4() { &self.ipv4_sock } else { &self.ipv6_sock };
-        let Some(sock) = sock else { return; };
-        if !add_intf_addr(&mut self.my_intfs, &sock.pktinfo, intf) { return; }
+        let sock = if intf.ip().is_ipv4() {
+            &self.ipv4_sock
+        } else {
+            &self.ipv6_sock
+        };
+        let Some(sock) = sock else {
+            return;
+        };
+        if !add_intf_addr(&mut self.my_intfs, &sock.pktinfo, intf) {
+            return;
+        }
         let index = intf.index.unwrap_or(0);
         if let Some(current) = self.my_intfs.get_mut(&index) {
-            current.max_packet_size_v4 = resolve_max_packet_size(&self.max_packet_sizes, interfaces, index, true);
-            current.max_packet_size_v6 = resolve_max_packet_size(&self.max_packet_sizes, interfaces, index, false);
+            current.max_packet_size_v4 =
+                resolve_max_packet_size(&self.max_packet_sizes, interfaces, index, true);
+            current.max_packet_size_v6 =
+                resolve_max_packet_size(&self.max_packet_sizes, interfaces, index, false);
         }
         for service in self.my_services.values_mut() {
-            if service.is_addr_auto() { service.insert_ipaddr(intf); }
+            if service.is_addr_auto() {
+                service.insert_ipaddr(intf);
+            }
         }
         self.reconcile_registries();
         self.finish_publication_change(publication, false);
         if let Some(current) = self.my_intfs.get(&index) {
-            for ty in self.service_queriers.keys() { self.send_query_on_intf(ty, RRType::PTR, current); }
+            for ty in self.service_queriers.keys() {
+                self.send_query_on_intf(ty, RRType::PTR, current);
+            }
         }
         self.notify_monitors(DaemonEvent::IpAdd(intf.ip()));
     }
@@ -2481,7 +2600,10 @@ impl Zeroconf {
 
             for service_name in waiting_services {
                 // service names are lowercase
-                if let Some(info) = self.my_services.get_mut(&service_name.to_ascii_lowercase()) {
+                if let Some(info) = self
+                    .my_services
+                    .get_mut(&CanonicalName::new(&service_name).as_str().to_string())
+                {
                     if info.get_status(*if_index) == ServiceStatus::Announced {
                         debug!("service {} already announced", info.get_fullname());
                         continue;
@@ -2498,11 +2620,11 @@ impl Zeroconf {
                             Ok(announced) => announced,
                             Err(InternalError::IntfAddrInvalid(intf_addr)) => {
                                 invalid_intf_addrs.insert(intf_addr);
-                                false
+                                Announcement::default()
                             }
                         }
                     } else {
-                        false
+                        Announcement::default()
                     };
                     let announced_v6 = if let Some(sock) = self.ipv6_sock.as_mut() {
                         match announce_service_on_intf(
@@ -2515,24 +2637,28 @@ impl Zeroconf {
                             Ok(announced) => announced,
                             Err(InternalError::IntfAddrInvalid(intf_addr)) => {
                                 invalid_intf_addrs.insert(intf_addr);
-                                false
+                                Announcement::default()
                             }
                         }
                     } else {
-                        false
+                        Announcement::default()
                     };
 
-                    if announced_v4 || announced_v6 {
+                    let sent = announced_v4.sent || announced_v6.sent;
+                    if sent || announced_v4.needs_retry || announced_v6.needs_retry {
                         let next_time = now
                             + Duration::from_millis(
                                 ANNOUNCE_SECOND_DELAY_MILLIS
                                     + fastrand::u64(0..ANNOUNCE_SECOND_JITTER_MILLIS),
                             );
-                        let command =
-                            Command::RegisterResend(info.get_fullname().to_string(), *if_index);
-                        self.retransmissions.push(ReRun { next_time, command });
-
-
+                        schedule_register_resend(
+                            &mut self.retransmissions,
+                            info.get_fullname(),
+                            *if_index,
+                            next_time,
+                        );
+                    }
+                    if sent {
                         let fullname = dns_registry.resolve_name(&service_name).to_string();
 
                         let hostname = dns_registry.resolve_name(info.get_hostname());
@@ -2564,8 +2690,10 @@ impl Zeroconf {
         timeout: Option<u64>,
     ) {
         let real_timeout = timeout.map(|t| Instant::now() + Duration::from_millis(t));
-        self.hostname_resolvers
-            .insert(hostname.to_ascii_lowercase(), (listener, real_timeout));
+        self.hostname_resolvers.insert(
+            CanonicalName::new(&hostname).as_str().to_string(),
+            (listener, real_timeout),
+        );
     }
 
     /// Sends a multicast query for `name` with `qtype`.
@@ -2607,7 +2735,10 @@ impl Zeroconf {
         let mut out = DnsOutgoing::new(FLAGS_QR_QUERY);
         for (name, kind) in questions {
             out.add_question(name, *kind);
-            for known in self.cache.get_known_answers_on_intf(name, *kind, now, index) {
+            for known in self
+                .cache
+                .get_known_answers_on_intf(name, *kind, now, index)
+            {
                 let mut record = known.record.clone();
                 record.get_record_mut().update_ttl(now);
                 out.add_answer_box(record);
@@ -2620,14 +2751,20 @@ impl Zeroconf {
         let mut invalid = HashSet::new();
         for (index, intf) in &self.my_intfs {
             let out = self.query_packet_on_intf(questions, *index);
-            for sock in [self.ipv4_sock.as_ref(), self.ipv6_sock.as_ref()].into_iter().flatten() {
+            for sock in [self.ipv4_sock.as_ref(), self.ipv6_sock.as_ref()]
+                .iter()
+                .flatten()
+            {
                 if let Err(InternalError::IntfAddrInvalid(addr)) =
-                    send_dns_outgoing(&out, intf, &sock.pktinfo, self.port, None, None) {
+                    send_dns_outgoing(&out, intf, &sock.pktinfo, self.port, None, None)
+                {
                     invalid.insert(addr);
                 }
             }
         }
-        if !invalid.is_empty() { let _ = self.send_cmd_to_self(Command::InvalidIntfAddrs(invalid)); }
+        if !invalid.is_empty() {
+            let _ = self.send_cmd_to_self(Command::InvalidIntfAddrs(invalid));
+        }
     }
 
     /// Reads one UDP datagram from the socket of `intf`.
@@ -2738,38 +2875,55 @@ impl Zeroconf {
     }
 
     /// Returns true, if sent query. Returns false if SRV already exists.
-    fn query_unresolved(&mut self, instance: &str) -> bool {
-        if !valid_instance_name(instance) { return false; }
+    fn unresolved_questions(&self, instance: &str) -> HashSet<(u32, String, RRType)> {
+        let mut questions = HashSet::new();
+        if !valid_instance_name(instance) {
+            return questions;
+        }
         let mut scopes = HashSet::new();
-        for ty in self.service_queriers.keys() {
+        for (ty, subscription) in &self.service_queriers {
+            if !subscription.querying {
+                continue;
+            }
             for record in self.cache.get_ptr(ty).into_iter().flatten() {
-                if record.record.any().downcast_ref::<DnsPointer>().is_some_and(|ptr|
-                    CanonicalName::new(ptr.alias()) == CanonicalName::new(instance)) {
+                if record
+                    .record
+                    .any()
+                    .downcast_ref::<DnsPointer>()
+                    .is_some_and(|ptr| {
+                        CanonicalName::new(ptr.alias()) == CanonicalName::new(instance)
+                    })
+                {
                     scopes.insert(record.src_intf.index);
                 }
             }
         }
-        let mut pending = false;
         for index in scopes {
-            let Some(intf) = self.my_intfs.get(&index) else { continue; };
-            let records = self.cache.get_srv_on_intf(instance, index);
-            if let Some(records) = records {
+            if let Some(records) = self.cache.get_srv_on_intf(instance, index) {
                 for record in records {
                     if let Some(srv) = record.record.any().downcast_ref::<DnsSrv>() {
                         if self.cache.get_addr_on_intf(srv.host(), index).is_none() {
-                            self.send_query_on_intf(srv.host(), RRType::A, intf);
-                            self.send_query_on_intf(srv.host(), RRType::AAAA, intf);
-                            pending = true;
+                            questions.insert((index, srv.host().to_string(), RRType::A));
+                            questions.insert((index, srv.host().to_string(), RRType::AAAA));
                         }
                     }
                 }
             } else {
-                self.send_query_on_intf(instance, RRType::SRV, intf);
-                self.send_query_on_intf(instance, RRType::TXT, intf);
-                pending = true;
+                questions.insert((index, instance.to_string(), RRType::SRV));
+                questions.insert((index, instance.to_string(), RRType::TXT));
             }
         }
-        pending
+        questions
+    }
+
+    fn query_unresolved(&mut self, instance: &str) -> bool {
+        let questions = self.unresolved_questions(instance);
+        for (index, name, kind) in &questions {
+            if let Some(intf) = self.my_intfs.get(index) {
+                self.send_query_on_intf(name, *kind, intf);
+            }
+        }
+        !questions.is_empty()
     }
 
     /// Re-issues follow-up queries (SRV / address) for every instance of
@@ -2790,9 +2944,7 @@ impl Zeroconf {
         }
 
         for instance in instances {
-            if !self.service_queriers.get(ty_domain).is_some_and(|s| s.is_resolved(&instance)) {
-                self.query_unresolved(&instance);
-            }
+            self.query_unresolved(&instance);
         }
     }
 
@@ -2885,6 +3037,9 @@ impl Zeroconf {
     }
 
     fn add_pending_resolve(&mut self, instance: String) {
+        if self.unresolved_questions(&instance).is_empty() {
+            return;
+        }
         let instance = CanonicalName::new(&instance).as_str().to_string();
         if !self.pending_resolves.contains(&instance) {
             let next_time = Instant::now() + Duration::from_millis(RESOLVE_RETRY_BASE_MILLIS);
@@ -2894,26 +3049,49 @@ impl Zeroconf {
     }
 
     /// Resolve each link independently, merging addresses only for equivalent service data.
-    fn resolve_service_from_cache(&self, ty_domain: &str, fullname: &str) -> Result<ResolvedService> {
-        let mut scopes: Vec<_> = self.cache.get_ptr(ty_domain).into_iter().flatten()
-            .filter_map(|record| record.record.any().downcast_ref::<DnsPointer>()
-                .filter(|ptr| CanonicalName::new(ptr.alias()) == CanonicalName::new(fullname))
-                .map(|_| record.src_intf.index)).collect();
-        scopes.sort_unstable(); scopes.dedup();
+    fn resolve_service_from_cache(
+        &self,
+        ty_domain: &str,
+        fullname: &str,
+    ) -> Result<ResolvedService> {
+        let mut scopes: Vec<_> = self
+            .cache
+            .get_ptr(ty_domain)
+            .into_iter()
+            .flatten()
+            .filter_map(|record| {
+                record
+                    .record
+                    .any()
+                    .downcast_ref::<DnsPointer>()
+                    .filter(|ptr| CanonicalName::new(ptr.alias()) == CanonicalName::new(fullname))
+                    .map(|_| record.src_intf.index)
+            })
+            .collect();
+        scopes.sort_unstable();
+        scopes.dedup();
         let mut result: Option<ResolvedService> = None;
         for scope in scopes {
             let service = self.resolve_service_on_intf(ty_domain, fullname, scope)?;
-            if !service.is_valid() { continue; }
+            if !service.is_valid() {
+                continue;
+            }
             if let Some(current) = &mut result {
-                if current.host.eq_ignore_ascii_case(&service.host) && current.port == service.port
-                    && current.txt_properties == service.txt_properties {
+                if current.host.eq_ignore_ascii_case(&service.host)
+                    && current.port == service.port
+                    && current.txt_properties == service.txt_properties
+                {
                     for address in service.addresses {
                         merge_scoped_address(&mut current.addresses, address);
                     }
                 }
-            } else { result = Some(service); }
+            } else {
+                result = Some(service);
+            }
         }
-        if let Some(service) = result { return Ok(service); }
+        if let Some(service) = result {
+            return Ok(service);
+        }
         self.resolve_service_on_intf(ty_domain, fullname, u32::MAX)
     }
 
@@ -2925,10 +3103,19 @@ impl Zeroconf {
         index: u32,
     ) -> Result<ResolvedService> {
         let now = Instant::now();
+        let display_fullname = self
+            .cache
+            .get_ptr_on_intf(ty_domain, index)
+            .into_iter()
+            .flatten()
+            .filter_map(|record| record.record.any().downcast_ref::<DnsPointer>())
+            .find(|ptr| CanonicalName::new(ptr.alias()) == CanonicalName::new(fullname))
+            .map(|ptr| ptr.alias().to_string())
+            .unwrap_or_else(|| fullname.to_string());
         let mut resolved_service = ResolvedService {
             ty_domain: ty_domain.to_string(),
             sub_ty_domain: None,
-            fullname: fullname.to_string(),
+            fullname: display_fullname,
             host: String::new(),
             port: 0,
             addresses: HashSet::new(),
@@ -2936,7 +3123,12 @@ impl Zeroconf {
         };
 
         // Be sure setting `subtype` if available even when querying for the parent domain.
-        if let Some(subtype) = self.cache.subtypes(fullname, Some(index)).into_iter().next() {
+        if let Some(subtype) = self
+            .cache
+            .subtypes(fullname, Some(index))
+            .into_iter()
+            .next()
+        {
             trace!(
                 "ty_domain: {} found subtype {} for instance: {}",
                 ty_domain,
@@ -2950,7 +3142,10 @@ impl Zeroconf {
 
         // resolve SRV record
         if let Some(records) = self.cache.get_srv_on_intf(fullname, index) {
-            if let Some(answer) = records.iter().find(|r| !r.record.get_record().is_expired(now)) {
+            if let Some(answer) = records
+                .iter()
+                .find(|r| !r.record.get_record().is_expired(now))
+            {
                 if let Some(dns_srv) = answer.record.any().downcast_ref::<DnsSrv>() {
                     resolved_service.host = dns_srv.host().to_string();
                     resolved_service.port = dns_srv.port();
@@ -2960,7 +3155,10 @@ impl Zeroconf {
 
         // resolve TXT record
         if let Some(records) = self.cache.get_txt_on_intf(fullname, index) {
-            if let Some(record) = records.iter().find(|r| !r.record.get_record().is_expired(now)) {
+            if let Some(record) = records
+                .iter()
+                .find(|r| !r.record.get_record().is_expired(now))
+            {
                 if let Some(dns_txt) = record.record.any().downcast_ref::<DnsTxt>() {
                     resolved_service.txt_properties = dns_txt.text().into();
                 }
@@ -3048,7 +3246,11 @@ impl Zeroconf {
     }
 
     /// Find useful records from current operations and their DNS-SD dependencies.
-    fn response_interests(&self, incoming: &[DnsRecordBox], index: u32) -> HashSet<(CanonicalName, RRType)> {
+    fn response_interests(
+        &self,
+        incoming: &[DnsRecordBox],
+        index: u32,
+    ) -> HashSet<(CanonicalName, RRType)> {
         let now = Instant::now();
         let mut questions = HashSet::new();
         for ty in self.service_queriers.keys() {
@@ -3059,15 +3261,25 @@ impl Zeroconf {
             questions.insert((CanonicalName::new(host), RRType::AAAA));
         }
         for (instance, deadline) in &self.verifications {
-            if *deadline > now { questions.insert((CanonicalName::new(instance), RRType::SRV)); }
+            if *deadline > now {
+                questions.insert((CanonicalName::new(instance), RRType::SRV));
+            }
         }
         let cached = self.cache.records_on_intf(index);
         loop {
             let mut dependencies = Vec::new();
-            for record in cached.iter().map(|r| r.record.as_ref())
-                .chain(incoming.iter().map(|r| r.as_ref())) {
-                if record.get_class() != CLASS_IN || record.get_record().is_expired(now) { continue; }
-                if !questions.contains(&(CanonicalName::new(record.get_name()), record.get_type())) { continue; }
+            for record in cached
+                .iter()
+                .map(|r| r.record.as_ref())
+                .chain(incoming.iter().map(|r| r.as_ref()))
+            {
+                if record.get_class() != CLASS_IN || record.get_record().is_expired(now) {
+                    continue;
+                }
+                if !questions.contains(&(CanonicalName::new(record.get_name()), record.get_type()))
+                {
+                    continue;
+                }
                 if let Some(ptr) = record.any().downcast_ref::<DnsPointer>() {
                     dependencies.push((CanonicalName::new(ptr.alias()), RRType::SRV));
                     dependencies.push((CanonicalName::new(ptr.alias()), RRType::TXT));
@@ -3078,48 +3290,88 @@ impl Zeroconf {
             }
             let before = questions.len();
             questions.extend(dependencies);
-            if questions.len() == before { break; }
+            if questions.len() == before {
+                break;
+            }
         }
         questions
     }
 
+    fn expire_cache(&mut self, now: Instant) {
+        let expired = self.cache.evict_expired(now);
+        self.notify_service_removal(expired.expired_services);
+        for (hostname, addrs) in expired.expired_addrs {
+            self.push_hostname(
+                &hostname,
+                HostnameResolutionEvent::AddressesRemoved(hostname.clone(), addrs),
+            );
+            let instances = self.cache.get_instances_on_host(&hostname);
+            self.resolve_updated_instances(&instances.into_iter().collect());
+        }
+        self.reconcile_browse_state();
+    }
+
     fn hostname_snapshot(&self) -> HashMap<String, HashSet<ScopedIp>> {
-        self.hostname_resolvers.keys().map(|host| {
-            let addresses = self.cache.get_addresses_for_host(host).into_values().flatten().collect();
-            (host.clone(), addresses)
-        }).collect()
+        self.hostname_resolvers
+            .keys()
+            .map(|host| {
+                let addresses = self
+                    .cache
+                    .get_addresses_for_host(host)
+                    .into_values()
+                    .flatten()
+                    .collect();
+                (host.clone(), addresses)
+            })
+            .collect()
     }
 
     fn notify_hostname_changes(&mut self, previous: HashMap<String, HashSet<ScopedIp>>) {
         for (host, old) in previous {
-            let current: HashSet<_> = self.cache.get_addresses_for_host(&host).into_values().flatten().collect();
+            let current: HashSet<_> = self
+                .cache
+                .get_addresses_for_host(&host)
+                .into_values()
+                .flatten()
+                .collect();
             let removed = old.difference(&current).cloned().collect::<HashSet<_>>();
             if !removed.is_empty() {
-                self.push_hostname(&host, HostnameResolutionEvent::AddressesRemoved(host.clone(), removed));
+                self.push_hostname(
+                    &host,
+                    HostnameResolutionEvent::AddressesRemoved(host.clone(), removed),
+                );
             }
         }
     }
 
     fn handle_response(&mut self, msg: DnsIncoming, if_index: u32) {
+        self.expire_cache(Instant::now());
         let previous_addresses = self.hostname_snapshot();
         // Conflict detection is required even when no learned data is retained.
         self.conflict_handler(&msg, if_index);
         let records: Vec<_> = msg.all_records().collect();
         let interests = self.response_interests(&records, if_index);
-        let Some(intf) = self.my_intfs.get(&if_index) else { return; };
+        let Some(intf) = self.my_intfs.get(&if_index) else {
+            return;
+        };
         let mut changed = Vec::new();
         let mut found = Vec::new();
-        let mut unused_deadlines = Vec::new();
         for record in records {
             let owner = CanonicalName::new(record.get_name());
-            let useful = record.get_class() == CLASS_IN &&
-                (interests.contains(&(owner.clone(), record.get_type()))
-                 || (record.get_type() == RRType::NSEC && interests.iter().any(|(name, _)| name == &owner)));
-            if !(self.accept_unsolicited || useful || self.cache.has_rrset(record.as_ref(), if_index)) {
+            let useful = record.get_class() == CLASS_IN
+                && (interests.contains(&(owner.clone(), record.get_type()))
+                    || (record.get_type() == RRType::NSEC
+                        && interests.iter().any(|(name, _)| name == &owner)));
+            if !(self.accept_unsolicited
+                || useful
+                || self.cache.has_rrset(record.as_ref(), if_index))
+            {
                 continue;
             }
-            if let Some((cached, inserted)) = self.cache.add_or_update(intf, record, &mut unused_deadlines, true) {
-                if !inserted { continue; }
+            if let Some((cached, inserted)) = self.cache.add_or_update(intf, record, true) {
+                if !inserted {
+                    continue;
+                }
                 let kind = cached.record.get_type();
                 let name = cached.record.get_name().to_string();
                 if let Some(ptr) = cached.record.any().downcast_ref::<DnsPointer>() {
@@ -3133,18 +3385,36 @@ impl Zeroconf {
             }
         }
         for (ty, instance) in found {
-            let retained = self.cache.get_ptr_on_intf(&ty, if_index).into_iter().flatten()
-                .any(|record| record.record.any().downcast_ref::<DnsPointer>().is_some_and(|ptr|
-                    CanonicalName::new(ptr.alias()) == CanonicalName::new(&instance)));
-            if retained { self.push_service(&ty, ServiceEvent::ServiceFound(ty.clone(), instance)); }
+            let retained = self
+                .cache
+                .get_ptr_on_intf(&ty, if_index)
+                .into_iter()
+                .flatten()
+                .any(|record| {
+                    record
+                        .record
+                        .any()
+                        .downcast_ref::<DnsPointer>()
+                        .is_some_and(|ptr| {
+                            CanonicalName::new(ptr.alias()) == CanonicalName::new(&instance)
+                        })
+                });
+            if retained {
+                self.push_service(&ty, ServiceEvent::ServiceFound(ty.clone(), instance));
+            }
         }
         let mut updated = HashSet::new();
         for (kind, name) in changed {
             match kind {
-                RRType::PTR | RRType::SRV | RRType::TXT => { updated.insert(name); }
+                RRType::PTR | RRType::SRV | RRType::TXT => {
+                    updated.insert(name);
+                }
                 RRType::A | RRType::AAAA => {
                     for (display, addresses) in self.cache.get_addresses_for_host(&name) {
-                        self.push_hostname(&name, HostnameResolutionEvent::AddressesFound(display, addresses));
+                        self.push_hostname(
+                            &name,
+                            HostnameResolutionEvent::AddressesFound(display, addresses),
+                        );
                     }
                     updated.extend(self.cache.get_instances_on_host(&name));
                 }
@@ -3157,43 +3427,112 @@ impl Zeroconf {
 
     fn conflict_handler(&mut self, msg: &DnsIncoming, if_index: u32) {
         self.reconcile_registries();
-        let Some(intf) = self.my_intfs.get(&if_index) else { return; };
-        let Some(registry) = self.dns_registry_map.get_mut(&if_index) else { return; };
+        let Some(intf) = self.my_intfs.get(&if_index) else {
+            return;
+        };
+        let Some(registry) = self.dns_registry_map.get_mut(&if_index) else {
+            return;
+        };
         let mut conflicts = HashMap::new();
-        for incoming in msg.answers().iter().chain(msg.authorities()).chain(msg.additionals()) {
+        for incoming in msg
+            .answers()
+            .iter()
+            .chain(msg.authorities())
+            .chain(msg.additionals())
+        {
             let key = CanonicalName::new(incoming.get_name()).as_str().to_string();
-            let proposal = registry.probing.get(&key).map(|p| p.records.as_slice())
+            if registry
+                .probing
+                .get(&key)
+                .is_some_and(|probe| probe.probes_sent == 0)
+            {
+                continue;
+            }
+            let proposal = registry
+                .probing
+                .get(&key)
+                .map(|p| p.records.as_slice())
                 .unwrap_or_else(|| registry.records_for_name(&key));
-            let same_type: Vec<_> = proposal.iter().filter(|record|
-                record.get_type() == incoming.get_type() && record.get_class() == incoming.get_class()).collect();
-            if !same_type.is_empty() && !same_type.iter().any(|record| record.rrdata_match(incoming.as_ref())) {
-                conflicts.insert(key, incoming.get_type());
+            let probing = registry.probing.contains_key(&key);
+            let claimed_class = proposal
+                .iter()
+                .any(|record| record.get_class() == incoming.get_class());
+            let same_type: Vec<_> = proposal
+                .iter()
+                .filter(|record| {
+                    record.get_type() == incoming.get_type()
+                        && record.get_class() == incoming.get_class()
+                })
+                .collect();
+            if ((probing && claimed_class) || !same_type.is_empty())
+                && !same_type
+                    .iter()
+                    .any(|record| record.rrdata_match(incoming.as_ref()))
+            {
+                let hostname = self.my_services.values().any(|service| {
+                    CanonicalName::new(registry.resolve_name(service.get_hostname())).as_str()
+                        == key
+                });
+                conflicts.insert(key, hostname);
             }
         }
-        if conflicts.is_empty() { return; }
-        for (name, kind) in conflicts {
-            let affected: Vec<_> = self.my_services.iter().filter(|(_, service)|
-                CanonicalName::new(registry.resolve_name(service.get_fullname())).as_str() == name
-                || CanonicalName::new(registry.resolve_name(service.get_hostname())).as_str() == name)
-                .map(|(key, _)| key.clone()).collect();
+        if conflicts.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        self.conflicts
+            .retain(|time| now.saturating_duration_since(*time) < Duration::from_secs(10));
+        for (name, hostname) in conflicts {
+            if self.conflicts.len() == 15 {
+                self.conflicts.pop_front();
+            }
+            self.conflicts.push_back(now);
+            let affected: Vec<_> = self
+                .my_services
+                .iter()
+                .filter(|(_, service)| {
+                    CanonicalName::new(registry.resolve_name(service.get_fullname())).as_str()
+                        == name
+                        || CanonicalName::new(registry.resolve_name(service.get_hostname()))
+                            .as_str()
+                            == name
+                })
+                .map(|(key, _)| key.clone())
+                .collect();
             let established = registry.active.remove(&name).is_some();
             if !established {
-                let renamed = if kind == RRType::A || kind == RRType::AAAA {
+                let renamed = if hostname {
                     hostname_change(&name)
-                } else { name_change(&name) };
-                let originals: Vec<_> = self.my_services.values()
+                } else {
+                    name_change(&name)
+                };
+                let originals: Vec<_> = self
+                    .my_services
+                    .values()
                     .flat_map(|service| [service.get_fullname(), service.get_hostname()])
-                    .filter(|original| CanonicalName::new(registry.resolve_name(original)).as_str() == name)
-                    .map(|original| CanonicalName::new(original).as_str().to_string()).collect();
-                for original in originals { registry.name_changes.insert(original, renamed.clone()); }
+                    .filter(|original| {
+                        CanonicalName::new(registry.resolve_name(original)).as_str() == name
+                    })
+                    .map(|original| CanonicalName::new(original).as_str().to_string())
+                    .collect();
+                for original in originals {
+                    registry.name_changes.insert(original, renamed.clone());
+                }
             }
             registry.probing.remove(&name);
             for key in affected {
-                if let Some(service) = self.my_services.get_mut(&key) { service.set_status(if_index, ServiceStatus::Probing); }
+                if let Some(service) = self.my_services.get_mut(&key) {
+                    service.set_status(if_index, ServiceStatus::Probing);
+                }
             }
         }
         let services: Vec<_> = self.my_services.values().collect();
-        registry.reconcile_services(&services, intf, Instant::now());
+        let start = if self.conflicts.len() == 15 {
+            now + Duration::from_secs(5)
+        } else {
+            now
+        };
+        registry.reconcile_services(&services, intf, start);
     }
 
     /// Resolve the updated (including new) instances.
@@ -3203,12 +3542,19 @@ impl Zeroconf {
     /// service type PTR can both point to the same service instance.
     /// This loop automatically handles the sub-type PTRs.
     fn resolve_updated_instances(&mut self, updated_instances: &HashSet<String>) {
-        let updated: HashSet<_> = updated_instances.iter().map(|name| CanonicalName::new(name)).collect();
+        let updated: HashSet<_> = updated_instances
+            .iter()
+            .map(|name| CanonicalName::new(name))
+            .collect();
         let mut instances = HashSet::new();
         for (ty, records) in self.cache.all_ptr() {
-            if !self.service_queriers.contains_key(&ty) { continue; }
+            if !self.service_queriers.contains_key(&ty) {
+                continue;
+            }
             for record in records {
-                if record.record.get_record().is_expired(Instant::now()) { continue; }
+                if record.record.get_record().is_expired(Instant::now()) {
+                    continue;
+                }
                 if let Some(ptr) = record.record.any().downcast_ref::<DnsPointer>() {
                     if updated.contains(&CanonicalName::new(ptr.alias())) {
                         instances.insert((ty.clone(), ptr.alias().to_string()));
@@ -3220,7 +3566,12 @@ impl Zeroconf {
             if let Ok(service) = self.resolve_service_from_cache(&ty, &instance) {
                 if service.is_valid() {
                     self.push_service(&ty, ServiceEvent::ServiceResolved(Box::new(service)));
-                    self.pending_resolves.remove(CanonicalName::new(&instance).as_str());
+                    if self.unresolved_questions(&instance).is_empty() {
+                        self.pending_resolves
+                            .remove(CanonicalName::new(&instance).as_str());
+                    } else {
+                        self.add_pending_resolve(instance.clone());
+                    }
                 } else {
                     self.add_pending_resolve(instance);
                 }
@@ -3281,7 +3632,10 @@ impl Zeroconf {
             } else {
                 // Simultaneous Probe Tiebreaking (RFC 6762 section 8.2)
                 if qtype == RRType::ANY && msg.num_authorities() > 0 {
-                    if let Some(probe) = dns_registry.probing.get_mut(CanonicalName::new(q_name).as_str()) {
+                    if let Some(probe) = dns_registry
+                        .probing
+                        .get_mut(CanonicalName::new(q_name).as_str())
+                    {
                         probe.tiebreaking(&msg, q_name);
                     }
                 }
@@ -3300,11 +3654,14 @@ impl Zeroconf {
                     );
                 }
 
-                let query_name = q_name.to_ascii_lowercase();
+                let query_name = CanonicalName::new(q_name).as_str().to_string();
                 let service_opt = self
                     .my_services
                     .iter()
-                    .find(|(k, _v)| CanonicalName::new(dns_registry.resolve_name(k.as_str())).as_str() == query_name)
+                    .find(|(k, _v)| {
+                        CanonicalName::new(dns_registry.resolve_name(k.as_str())).as_str()
+                            == query_name
+                    })
                     .map(|(_, v)| v);
 
                 let Some(service) = service_opt else {
@@ -3511,7 +3868,6 @@ impl Zeroconf {
 
     fn add_retransmission(&mut self, next_time: Instant, command: Command) {
         self.retransmissions.push(ReRun { next_time, command });
-
     }
 
     /// Sends service removal event to listeners for expired service records.
@@ -3562,9 +3918,9 @@ impl Zeroconf {
 
             Command::StopBrowse(ty_domain) => self.exec_command_stop_browse(ty_domain),
 
-            Command::StopResolveHostname(hostname) => {
-                self.exec_command_stop_resolve_hostname(hostname.to_ascii_lowercase())
-            }
+            Command::StopResolveHostname(hostname) => self.exec_command_stop_resolve_hostname(
+                CanonicalName::new(&hostname).as_str().to_string(),
+            ),
 
             Command::Resolve(instance, try_count) => self.exec_command_resolve(instance, try_count),
 
@@ -3665,6 +4021,7 @@ impl Zeroconf {
         cache_only: bool,
         listener: Sender<ServiceEvent>,
     ) {
+        let ty = CanonicalName::new(&ty).as_str().to_string();
         let pretty_addrs: Vec<String> = self
             .my_intfs
             .iter()
@@ -3688,7 +4045,14 @@ impl Zeroconf {
             // Binds a `listener` to querying mDNS domain type `ty`.
             //
             // If there is already a `listener`, it will be updated, i.e. overwritten.
-            self.service_queriers.insert(ty.clone(), listener.clone().into());
+            self.service_queriers.insert(
+                ty.clone(),
+                ServiceSubscription {
+                    sender: listener.clone(),
+                    delivered: HashMap::new(),
+                    querying: !cache_only,
+                },
+            );
             let now = Instant::now();
             self.query_cache_for_service(&ty, &listener, now);
             if !self.service_live(&ty, &listener) {
@@ -3708,7 +4072,6 @@ impl Zeroconf {
         if cache_only {
             // If cache_only is true, we do not send a query.
             self.push_service(&ty, ServiceEvent::SearchStopped(ty.clone()));
-            self.remove_service_subscription(&ty);
             return;
         }
 
@@ -3794,7 +4157,7 @@ impl Zeroconf {
         // Only add retransmission if it does not exceed the hostname resolver timeout, if any.
         if self
             .hostname_resolvers
-            .get(&hostname.to_ascii_lowercase())
+            .get(&CanonicalName::new(&hostname).as_str().to_string())
             .and_then(|(_sender, timeout)| *timeout)
             .map(|timeout| next_time < timeout)
             .unwrap_or(true)
@@ -3822,7 +4185,12 @@ impl Zeroconf {
         }
     }
 
-    fn exec_command_unregister(&mut self, repeating: bool, fullname: String, sender: Sender<UnregisterStatus>) {
+    fn exec_command_unregister(
+        &mut self,
+        repeating: bool,
+        fullname: String,
+        sender: Sender<UnregisterStatus>,
+    ) {
         let result = self.remove_registration(fullname, repeating);
         let _ = sender.send(result);
     }
@@ -3866,13 +4234,10 @@ impl Zeroconf {
     }
 
     fn exec_command_stop_browse(&mut self, ty_domain: String) {
+        let ty_domain = CanonicalName::new(&ty_domain).as_str().to_string();
         match self.remove_service_subscription(&ty_domain) {
             None => debug!("StopBrowse: cannot find querier for {}", &ty_domain),
             Some(sender) => {
-                // Remove cache entries.
-                let hostnames: Vec<_> = self.hostname_resolvers.keys().map(String::as_str).collect();
-                self.cache.remove_service_type_with_hostnames(&ty_domain, &hostnames);
-
                 trace!("StopBrowse: removed queryer for {}", &ty_domain);
                 match sender.try_send(ServiceEvent::SearchStopped(ty_domain)) {
                     Ok(()) => trace!("Sent SearchStopped to the listener"),
@@ -3893,6 +4258,8 @@ impl Zeroconf {
     }
 
     fn exec_command_register_resend(&mut self, fullname: String, if_index: u32) -> MyResult<()> {
+        self.reconcile_registries();
+        let fullname = CanonicalName::new(&fullname).as_str().to_string();
         let Some(info) = self.my_services.get_mut(&fullname) else {
             trace!("announce: cannot find such service {}", &fullname);
             return Ok(());
@@ -3905,19 +4272,20 @@ impl Zeroconf {
         let Some(intf) = self.my_intfs.get(&if_index) else {
             return Ok(());
         };
+        let was_announced = info.get_status(if_index) == ServiceStatus::Announced;
 
         let announced_v4 = if let Some(sock) = self.ipv4_sock.as_ref() {
             announce_service_on_intf(dns_registry, info, intf, &sock.pktinfo, self.port)?
         } else {
-            false
+            Announcement::default()
         };
         let announced_v6 = if let Some(sock) = self.ipv6_sock.as_ref() {
             announce_service_on_intf(dns_registry, info, intf, &sock.pktinfo, self.port)?
         } else {
-            false
+            Announcement::default()
         };
 
-        if announced_v4 || announced_v6 {
+        if announced_v4.sent || announced_v6.sent {
             let hostname = dns_registry.resolve_name(info.get_hostname());
             let service_name = dns_registry.resolve_name(&fullname).to_string();
 
@@ -3928,8 +4296,17 @@ impl Zeroconf {
                 DaemonEvent::Announce(service_name, format!("{}:{}", hostname, &intf.name)),
             );
             info.set_status(if_index, ServiceStatus::Announced);
-        } else {
-            debug!("register-resend should not fail");
+        }
+        if announced_v4.needs_retry
+            || announced_v6.needs_retry
+            || (!was_announced && (announced_v4.sent || announced_v6.sent))
+        {
+            schedule_register_resend(
+                &mut self.retransmissions,
+                &fullname,
+                if_index,
+                Instant::now() + Duration::from_millis(ANNOUNCE_SECOND_DELAY_MILLIS),
+            );
         }
 
         self.increase_counter(Counter::RegisterResend, 1);
@@ -3947,6 +4324,10 @@ impl Zeroconf {
         record SHOULD be promptly flushed from the cache.
         */
         let now = Instant::now();
+        if !repeating {
+            self.retransmissions.retain(|rerun| !matches!(&rerun.command,
+                Command::Verify(name, _) if CanonicalName::new(name) == CanonicalName::new(&instance)));
+        }
         let expire_at = if repeating {
             None
         } else {
@@ -3964,7 +4345,10 @@ impl Zeroconf {
             self.send_query_vec(&query_vec);
 
             if let Some(new_expire) = expire_at {
-                self.verifications.insert(CanonicalName::new(&instance).as_str().to_string(), new_expire);
+                self.verifications.insert(
+                    CanonicalName::new(&instance).as_str().to_string(),
+                    new_expire,
+                );
 
                 // schedule a resend 1 second later
                 self.add_retransmission(
@@ -3981,15 +4365,17 @@ impl Zeroconf {
         let mut query_srv_count = 0;
         let mut query_addr_count = 0;
 
-        for (ty_domain, _sender) in self.service_queriers.iter() {
-            let refreshed_timers = self.cache.refresh_due_ptr(ty_domain);
-            if !refreshed_timers.is_empty() {
+        for (ty_domain, subscription) in self.service_queriers.iter() {
+            if !subscription.querying {
+                continue;
+            }
+            if self.cache.refresh_due_ptr(ty_domain) {
                 trace!("sending refresh query for PTR: {}", ty_domain);
                 self.send_query(ty_domain, RRType::PTR);
                 query_ptr_count += 1;
             }
 
-            let (instances, _) = self.cache.refresh_due_srv_txt(ty_domain);
+            let instances = self.cache.refresh_due_srv_txt(ty_domain);
             for (instance, types) in instances {
                 trace!("sending refresh query for: {}", &instance);
                 let query_vec = types
@@ -3999,7 +4385,7 @@ impl Zeroconf {
                 self.send_query_vec(&query_vec);
                 query_srv_count += 1;
             }
-            let (hostnames, _) = self.cache.refresh_due_hosts(ty_domain);
+            let hostnames = self.cache.refresh_due_hosts(ty_domain);
             for hostname in hostnames.iter() {
                 trace!("sending refresh queries for A and AAAA:  {}", hostname);
                 self.send_query_vec(&[(hostname, RRType::A), (hostname, RRType::AAAA)]);
@@ -4024,8 +4410,12 @@ fn add_answer_of_service(
     let instance = registry.resolve_name(service.get_fullname());
     for kind in [RRType::SRV, RRType::TXT] {
         if qtype == kind || qtype == RRType::ANY {
-            let records: Vec<_> = registry.records_for_name(instance).iter()
-                .filter(|record| record.get_type() == kind).cloned().collect();
+            let records: Vec<_> = registry
+                .records_for_name(instance)
+                .iter()
+                .filter(|record| record.get_type() == kind)
+                .cloned()
+                .collect();
             out.add_unique_rrset(msg, &records);
         }
     }
@@ -4053,17 +4443,26 @@ fn answer_hostname_question(
     msg: &DnsIncoming,
 ) {
     let name = question.entry_name();
-    if !services.values().any(|service| service.get_status(intf.index) == ServiceStatus::Announced
-        && CanonicalName::new(registry.resolve_name(service.get_hostname())) == CanonicalName::new(name)) {
+    if !services.values().any(|service| {
+        service.get_status(intf.index) == ServiceStatus::Announced
+            && CanonicalName::new(registry.resolve_name(service.get_hostname()))
+                == CanonicalName::new(name)
+    }) {
         return;
     }
     let records = registry.records_for_name(name);
     let v4 = records.iter().any(|record| record.get_type() == RRType::A);
-    let v6 = records.iter().any(|record| record.get_type() == RRType::AAAA);
+    let v6 = records
+        .iter()
+        .any(|record| record.get_type() == RRType::AAAA);
     let kind = question.entry_type();
     for rr_type in [RRType::A, RRType::AAAA] {
         if kind == rr_type || kind == RRType::ANY {
-            let rrset: Vec<_> = records.iter().filter(|r| r.get_type() == rr_type).cloned().collect();
+            let rrset: Vec<_> = records
+                .iter()
+                .filter(|r| r.get_type() == rr_type)
+                .cloned()
+                .collect();
             out.add_unique_rrset(msg, &rrset);
         }
     }
@@ -4074,9 +4473,27 @@ fn answer_hostname_question(
         _ => false,
     };
     if absent && (v4 || v6) {
-        let ttl = records.iter().map(|r| r.get_record().get_ttl()).min().unwrap_or(120);
-        let bitmap = if v6 { vec![if v4 { 0x40 } else { 0 }, 0, 0, 0x08] } else { vec![0x40] };
-        out.add_answer(msg, DnsNSec::new(name, CLASS_IN | CLASS_CACHE_FLUSH, ttl, name.to_string(), bitmap));
+        let name = records[0].get_name();
+        let ttl = records
+            .iter()
+            .map(|r| r.get_record().get_ttl())
+            .min()
+            .unwrap_or(120);
+        let bitmap = if v6 {
+            vec![if v4 { 0x40 } else { 0 }, 0, 0, 0x08]
+        } else {
+            vec![0x40]
+        };
+        out.add_answer(
+            msg,
+            DnsNSec::new(
+                name,
+                CLASS_IN | CLASS_CACHE_FLUSH,
+                ttl,
+                name.to_string(),
+                bitmap,
+            ),
+        );
     }
 }
 
@@ -4628,19 +5045,41 @@ fn prepare_announce(
     registry: &mut DnsRegistry,
     is_ipv4: bool,
 ) -> Option<DnsOutgoing> {
-    let usable = if is_ipv4 { info.get_addrs_on_my_intf_v4(intf) } else { info.get_addrs_on_my_intf_v6(intf) };
-    if usable.is_empty() { return None; }
+    let usable = if is_ipv4 {
+        info.get_addrs_on_my_intf_v4(intf)
+    } else {
+        info.get_addrs_on_my_intf_v6(intf)
+    };
+    if usable.is_empty() {
+        return None;
+    }
     let fullname = registry.resolve_name(info.get_fullname());
     let hostname = registry.resolve_name(info.get_hostname());
-    if !registry.is_claimed(fullname) || !registry.is_claimed(hostname) { return None; }
-    let mut out = DnsOutgoing::new(FLAGS_QR_RESPONSE | FLAGS_AA);
-    out.add_answer_record(DnsPointer::new(info.get_type(), RRType::PTR, CLASS_IN,
-        info.get_other_ttl(), fullname.to_string()));
-    if let Some(subtype) = info.get_subtype() {
-        out.add_answer_record(DnsPointer::new(subtype, RRType::PTR, CLASS_IN,
-            info.get_other_ttl(), fullname.to_string()));
+    if !registry.is_claimed(fullname) || !registry.is_claimed(hostname) {
+        return None;
     }
-    for record in registry.records_for_name(fullname).iter().chain(registry.records_for_name(hostname)) {
+    let mut out = DnsOutgoing::new(FLAGS_QR_RESPONSE | FLAGS_AA);
+    out.add_answer_record(DnsPointer::new(
+        info.get_type(),
+        RRType::PTR,
+        CLASS_IN,
+        info.get_other_ttl(),
+        fullname.to_string(),
+    ));
+    if let Some(subtype) = info.get_subtype() {
+        out.add_answer_record(DnsPointer::new(
+            subtype,
+            RRType::PTR,
+            CLASS_IN,
+            info.get_other_ttl(),
+            fullname.to_string(),
+        ));
+    }
+    for record in registry
+        .records_for_name(fullname)
+        .iter()
+        .chain(registry.records_for_name(hostname))
+    {
         let mut record = record.clone();
         record.get_record_mut().set_cache_flush(true);
         out.add_answer_box(record);
@@ -4649,26 +5088,67 @@ fn prepare_announce(
 }
 
 /// Send an unsolicited response for owned service via `intf` and `sock`.
-/// Returns true if sent out successfully for IPv4 or IPv6.
+/// Reports actual transmission and records deferred by the multicast rate limit.
+#[derive(Default)]
+struct Announcement {
+    sent: bool,
+    needs_retry: bool,
+}
+
+fn schedule_register_resend(
+    retransmissions: &mut Vec<ReRun>,
+    fullname: &str,
+    index: u32,
+    mut next_time: Instant,
+) {
+    let key = CanonicalName::new(fullname);
+    retransmissions.retain(|rerun| match &rerun.command {
+        Command::RegisterResend(name, current)
+            if *current == index && CanonicalName::new(name) == key =>
+        {
+            next_time = next_time.min(rerun.next_time);
+            false
+        }
+        _ => true,
+    });
+    retransmissions.push(ReRun {
+        next_time,
+        command: Command::RegisterResend(key.as_str().to_string(), index),
+    });
+}
+
 fn announce_service_on_intf(
     dns_registry: &mut DnsRegistry,
     info: &ServiceInfo,
     intf: &MyIntf,
     sock: &PktInfoUdpSocket,
     port: u16,
-) -> MyResult<bool> {
+) -> MyResult<Announcement> {
     let is_ipv4 = sock.domain() == Domain::IPV4;
+    if (is_ipv4 && intf.next_ifaddr_v4().is_none()) || (!is_ipv4 && intf.next_ifaddr_v6().is_none())
+    {
+        return Ok(Announcement::default());
+    }
     if let Some(mut out) = prepare_announce(info, intf, dns_registry, is_ipv4) {
         // RFC 6762 §6: a record MUST NOT be multicast on an interface more than
         // once per second. Announcements are unsolicited multicast responses.
+        let complete = out.answers_count();
         dns_registry.apply_multicast_rate_limit(&mut out, Instant::now(), is_ipv4);
-        if out.answers_count() > 0 {
-            let _ = send_dns_outgoing(&out, intf, sock, port, None, None)?;
+        let needs_retry = out.answers_count() < complete;
+        if out.answers_count() == 0 {
+            return Ok(Announcement {
+                sent: false,
+                needs_retry,
+            });
         }
-        return Ok(true);
+        let sent = !send_dns_outgoing(&out, intf, sock, port, None, None)?.is_empty();
+        return Ok(Announcement {
+            sent,
+            needs_retry: sent && needs_retry,
+        });
     }
 
-    Ok(false)
+    Ok(Announcement::default())
 }
 
 /// Returns a new name based on the `original` to avoid conflicts.
@@ -4679,32 +5159,22 @@ fn announce_service_on_intf(
 /// - `foo (2).local.` becomes `foo (3).local.`
 /// - `foo (9)` becomes `foo (10)`
 fn name_change(original: &str) -> String {
-    let mut parts: Vec<_> = original.split('.').collect();
-    let Some(first_part) = parts.get_mut(0) else {
-        return format!("{original} (2)");
-    };
-
-    let mut new_name = format!("{first_part} (2)");
-
-    // check if there is already has `(<num>)` suffix.
-    if let Some(paren_pos) = first_part.rfind(" (") {
-        // Check if there's a closing parenthesis
-        if let Some(end_paren) = first_part[paren_pos..].find(')') {
-            let absolute_end_pos = paren_pos + end_paren;
-            // Only process if the closing parenthesis is the last character
-            if absolute_end_pos == first_part.len() - 1 {
-                let num_start = paren_pos + 2; // Skip " ("
-                                               // Try to parse the number between parentheses
-                if let Ok(number) = first_part[num_start..absolute_end_pos].parse::<u32>() {
-                    let base_name = &first_part[..paren_pos];
-                    new_name = format!("{} ({})", base_name, number + 1)
-                }
-            }
+    rename_first_label(original, |first| {
+        let incremented = first
+            .strip_suffix(')')
+            .and_then(|name| name.rsplit_once(" ("))
+            .and_then(|(base, number)| {
+                number
+                    .parse::<u32>()
+                    .ok()?
+                    .checked_add(1)
+                    .map(|next| (base, next))
+            });
+        match incremented {
+            Some((base, next)) => label_with_suffix(base, &format!(" ({next})")),
+            None => label_with_suffix(first, " (2)"),
         }
-    }
-
-    *first_part = &new_name;
-    parts.join(".")
+    })
 }
 
 /// Returns a new name based on the `original` to avoid conflicts.
@@ -4715,32 +5185,64 @@ fn name_change(original: &str) -> String {
 /// - `foo-2.local.` becomes `foo-3.local.`
 /// - `foo` becomes `foo-2`
 fn hostname_change(original: &str) -> String {
-    let mut parts: Vec<_> = original.split('.').collect();
-    let Some(first_part) = parts.get_mut(0) else {
-        return format!("{original}-2");
-    };
-
-    let mut new_name = format!("{first_part}-2");
-
-    // check if there is already a `-<num>` suffix
-    if let Some(hyphen_pos) = first_part.rfind('-') {
-        // Try to parse everything after the hyphen as a number
-        if let Ok(number) = first_part[hyphen_pos + 1..].parse::<u32>() {
-            let base_name = &first_part[..hyphen_pos];
-            new_name = format!("{}-{}", base_name, number + 1);
+    rename_first_label(original, |first| {
+        let incremented = first.rsplit_once('-').and_then(|(base, number)| {
+            number
+                .parse::<u32>()
+                .ok()?
+                .checked_add(1)
+                .map(|next| (base, next))
+        });
+        match incremented {
+            Some((base, next)) => label_with_suffix(base, &format!("-{next}")),
+            None => label_with_suffix(first, "-2"),
         }
-    }
+    })
+}
 
-    *first_part = &new_name;
-    parts.join(".")
+/// Leaves room for the suffix without splitting a UTF-8 character.
+fn label_with_suffix(stem: &str, suffix: &str) -> String {
+    let mut end = stem
+        .len()
+        .min(crate::dns_parser::MAX_LABEL_BYTES - suffix.len());
+    while !stem.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{suffix}", &stem[..end])
+}
+
+fn rename_first_label(original: &str, rename: impl FnOnce(&str) -> String) -> String {
+    let absolute = original.strip_suffix('.').map_or(false, |prefix| {
+        prefix
+            .as_bytes()
+            .iter()
+            .rev()
+            .take_while(|byte| **byte == b'\\')
+            .count()
+            % 2
+            == 0
+    });
+    let mut labels = crate::dns_name::labels(original);
+    if labels.is_empty() {
+        labels.push(String::new());
+    }
+    labels[0] = rename(&labels[0]);
+    let mut result = String::new();
+    for label in labels {
+        if !result.is_empty() {
+            result.push('.');
+        }
+        crate::dns_name::append_escaped_label(&mut result, &label);
+    }
+    if absolute {
+        result.push('.');
+    }
+    result
 }
 
 /// Check probes in a registry and returns: a probing packet to send out, and a list of probe names
 /// that are finished.
-fn check_probing(
-    dns_registry: &mut DnsRegistry,
-    now: Instant,
-) -> (DnsOutgoing, Vec<String>) {
+fn check_probing(dns_registry: &mut DnsRegistry, now: Instant) -> (DnsOutgoing, Vec<String>) {
     let mut expired_probes = Vec::new();
     let mut out = DnsOutgoing::new(FLAGS_QR_QUERY);
 
@@ -4764,7 +5266,6 @@ fn check_probing(
                 }
 
                 probe.update_next_send(now);
-
             }
         }
     }
@@ -4792,9 +5293,12 @@ fn handle_expired_probes(
         // send notifications about name changes
         for record in probe.records.iter() {
             if let Some(new_name) = record.get_record().get_new_name() {
-                dns_registry
-                    .name_changes
-                    .insert(CanonicalName::new(record.get_record().get_original_name()).as_str().to_string(), new_name.to_string());
+                dns_registry.name_changes.insert(
+                    CanonicalName::new(record.get_record().get_original_name())
+                        .as_str()
+                        .to_string(),
+                    new_name.to_string(),
+                );
 
                 let event = DnsNameChange {
                     original: record.get_record().get_original_name().to_string(),
@@ -4918,7 +5422,7 @@ mod tests {
 
     /// Builds a daemon on a private port. `Zeroconf::new` joins the mDNS group on
     /// every host interface, loopback included.
-    fn new_test_zeroconf() -> super::Zeroconf {
+    pub(super) fn new_test_zeroconf() -> super::Zeroconf {
         let (daemon, _receiver) = new_test_zeroconf_with_receiver();
         daemon
     }
@@ -5329,18 +5833,7 @@ mod tests {
                 ServiceStatus::Probing
             );
             assert!(!daemon.dns_registry_map[&index].probing.is_empty());
-            // Finish real registration probes without waiting for wall-clock timers.
-            for probe in daemon
-                .dns_registry_map
-                .get_mut(&index)
-                .unwrap()
-                .probing
-                .values_mut()
-            {
-                probe.start_time = Instant::now() - Duration::from_millis(1000);
-                probe.next_send = probe.start_time;
-            }
-            daemon.probing_handler();
+            super::lifecycle_tests::finish(&mut daemon, index);
             assert_eq!(
                 daemon.my_services[&fullname].get_status(index),
                 ServiceStatus::Announced
@@ -6302,6 +6795,113 @@ mod tests {
     }
 
     #[test]
+    fn test_conflict_renaming_preserves_escaped_labels() {
+        assert_eq!(
+            name_change(r"A\.B._http._tcp.local."),
+            r"A\.B (2)._http._tcp.local."
+        );
+        assert_eq!(
+            name_change(r"A\\B._http._tcp.local."),
+            r"A\\B (2)._http._tcp.local."
+        );
+        assert_eq!(hostname_change(r"A\.B.local."), r"A\.B-2.local.");
+        assert_eq!(hostname_change(r"A\\B.local."), r"A\\B-2.local.");
+        assert_eq!(name_change(r"A\\."), r"A\\ (2).");
+        assert_eq!(name_change(r"A\."), r"A\. (2)");
+    }
+
+    #[test]
+    fn test_conflict_renaming_does_not_overflow_numeric_suffixes() {
+        assert_eq!(
+            name_change("foo (4294967295).local."),
+            "foo (4294967295) (2).local."
+        );
+        assert_eq!(
+            hostname_change("foo-4294967295.local."),
+            "foo-4294967295-2.local."
+        );
+    }
+
+    #[test]
+    fn test_conflict_renaming_maximum_labels_roundtrip() {
+        for label in ["a".repeat(63), "\u{754c}".repeat(21)] {
+            let original = format!("{label}._http._tcp.local.");
+            for renamed in [name_change(&original), hostname_change(&original)] {
+                let labels = crate::dns_name::labels(&renamed);
+                assert!(labels[0].len() <= crate::dns_parser::MAX_LABEL_BYTES);
+                assert_eq!(&labels[1..], &["_http", "_tcp", "local"]);
+                let mut query = DnsOutgoing::new(FLAGS_QR_QUERY);
+                query.add_question(&renamed, RRType::ANY);
+                let packets = query.to_data_on_wire(MAX_PKT_DEFAULT, true);
+                let parsed =
+                    DnsIncoming::new(packets[0].clone(), crate::InterfaceId::default()).unwrap();
+                assert_eq!(parsed.questions()[0].entry_name(), renamed);
+            }
+        }
+        assert_eq!(
+            name_change(&"a".repeat(63)),
+            format!("{} (2)", "a".repeat(59))
+        );
+        assert_eq!(
+            hostname_change(&"\u{754c}".repeat(21)),
+            format!("{}-2", "\u{754c}".repeat(20))
+        );
+    }
+
+    #[test]
+    fn test_scoped_resolution_preserves_ptr_instance_presentation() {
+        let mut daemon = new_test_zeroconf();
+        daemon.accept_unsolicited = true;
+        let intf = daemon
+            .my_intfs
+            .values()
+            .find(|intf| {
+                intf.addrs
+                    .iter()
+                    .any(|address| address.ip() == IpAddr::V4(Ipv4Addr::LOCALHOST))
+            })
+            .unwrap();
+        let index = intf.index;
+        let interface = crate::InterfaceId::from(intf);
+        let ty = "_display._tcp.local.";
+        let fullname = r"MiXeD\.Name._display._tcp.local.";
+        let mut outgoing = DnsOutgoing::new(FLAGS_QR_RESPONSE);
+        outgoing.add_answer_record(DnsPointer::new(
+            ty,
+            RRType::PTR,
+            CLASS_IN,
+            120,
+            fullname.to_string(),
+        ));
+        outgoing.add_answer_record(DnsSrv::new(
+            fullname,
+            CLASS_IN,
+            120,
+            0,
+            0,
+            80,
+            "Host.local.".to_string(),
+        ));
+        outgoing.add_answer_record(DnsAddress::new(
+            "Host.local.",
+            RRType::A,
+            CLASS_IN,
+            120,
+            Ipv4Addr::LOCALHOST.into(),
+            interface.clone(),
+        ));
+        for packet in outgoing.to_data_on_wire(MAX_PKT_DEFAULT, true) {
+            daemon.handle_response(DnsIncoming::new(packet, interface.clone()).unwrap(), index);
+        }
+        let canonical = fullname.to_ascii_lowercase();
+        let service = daemon
+            .resolve_service_on_intf(ty, &canonical, index)
+            .unwrap();
+        assert!(service.is_valid());
+        assert_eq!(service.fullname, fullname);
+    }
+
+    #[test]
     fn test_add_answer_txt_ttl() {
         // construct a simple service info
         let service_type = "_test_add_answer._udp.local.";
@@ -6334,9 +6934,11 @@ mod tests {
         let mut my_service = my_service;
         my_service.set_requires_probe(false);
         let intf = crate::service_info::MyIntf {
-            name: service_intf.name.clone(), index: service_intf.index.unwrap(),
+            name: service_intf.name.clone(),
+            index: service_intf.index.unwrap(),
             addrs: HashSet::from([service_intf.addr.clone()]),
-            max_packet_size_v4: MAX_PKT_DEFAULT, max_packet_size_v6: MAX_PKT_DEFAULT,
+            max_packet_size_v4: MAX_PKT_DEFAULT,
+            max_packet_size_v6: MAX_PKT_DEFAULT,
         };
         let mut registry = crate::service_info::DnsRegistry::new();
         registry.reconcile_services(&[&my_service], &intf, Instant::now());
@@ -6912,18 +7514,7 @@ mod tests {
         .unwrap();
         let fullname = service.get_fullname().to_ascii_lowercase();
         daemon.register_service(service);
-        // Complete actual registration probes deterministically.
-        for probe in daemon
-            .dns_registry_map
-            .get_mut(&index)
-            .unwrap()
-            .probing
-            .values_mut()
-        {
-            probe.start_time = Instant::now() - Duration::from_millis(1000);
-            probe.next_send = probe.start_time;
-        }
-        daemon.probing_handler();
+        super::lifecycle_tests::finish(daemon, index);
         assert_eq!(
             daemon.my_services[&fullname].get_status(index),
             crate::service_info::ServiceStatus::Announced
@@ -7095,6 +7686,7 @@ mod tests {
                 index + 1,
                 test_ifaddr_v6("2001:db8::1".parse().unwrap()),
             ));
+        daemon.reconcile_registries();
         let reply = query_negative_answer_test_daemon(
             &mut daemon,
             index,
@@ -7117,7 +7709,8 @@ mod tests {
         let mut zc = new_test_zeroconf();
         let ty = "_blocked._tcp.local.";
         let (sender, receiver) = flume::bounded(10);
-        zc.service_queriers.insert(ty.to_string(), sender.clone().into());
+        zc.service_queriers
+            .insert(ty.to_string(), sender.clone().into());
         zc.add_retransmission(
             Instant::now() + Duration::from_secs(60),
             super::Command::Browse(ty.to_string(), 1, false, sender.clone()),
@@ -7278,7 +7871,8 @@ mod tests {
         let mut zc = new_test_zeroconf();
         let ty = "_retr._tcp.local.";
         let (sender, receiver) = flume::bounded(10);
-        zc.service_queriers.insert(ty.to_string(), sender.clone().into());
+        zc.service_queriers
+            .insert(ty.to_string(), sender.clone().into());
         for i in 0..10 {
             sender
                 .try_send(ServiceEvent::ServiceFound(ty.to_string(), format!("i{i}")))
@@ -7382,7 +7976,8 @@ mod tests {
         let mut zc = new_test_zeroconf();
         let ty = "_restall._tcp.local.";
         let (sender, receiver) = flume::bounded(10);
-        zc.service_queriers.insert(ty.to_string(), sender.clone().into());
+        zc.service_queriers
+            .insert(ty.to_string(), sender.clone().into());
         zc.add_retransmission(
             Instant::now() + Duration::from_secs(60),
             super::Command::Browse(ty.to_string(), 1, false, sender.clone()),
@@ -7446,7 +8041,8 @@ mod tests {
         let mut zc = new_test_zeroconf();
         let ty = "_cleanup._tcp.local.";
         let (sender, _receiver) = flume::bounded(10);
-        zc.service_queriers.insert(ty.to_string(), sender.clone().into());
+        zc.service_queriers
+            .insert(ty.to_string(), sender.clone().into());
         for i in 0..10 {
             sender
                 .try_send(ServiceEvent::ServiceFound(ty.to_string(), format!("i{i}")))
