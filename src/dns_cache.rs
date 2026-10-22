@@ -2,7 +2,9 @@
 
 use crate::{
     dns_name::{CanonicalName, RrsetKey, SERVICE_TYPE_ENUMERATION},
-    dns_parser::{DnsAddress, DnsPointer, DnsRecordBox, DnsSrv, InterfaceId, RRType, CLASS_IN},
+    dns_parser::{
+        DnsAddress, DnsPointer, DnsRecordBox, DnsRecordExt, DnsSrv, InterfaceId, RRType, CLASS_IN,
+    },
     service_info::{split_sub_domain, MyIntf},
     ScopedIp,
 };
@@ -46,6 +48,11 @@ pub(crate) struct DnsRecordIntf {
     pub(crate) record: DnsRecordBox,
     pub(crate) src_intf: InterfaceId,
     charge: usize,
+}
+
+pub(crate) enum CacheUpdate<'a> {
+    Inserted(&'a DnsRecordIntf),
+    Refreshed,
 }
 
 /// Each RRset has one owner here. Types and interfaces share the same expiry path.
@@ -400,7 +407,7 @@ impl DnsCache {
         intf: &MyIntf,
         incoming: DnsRecordBox,
         is_for_us: bool,
-    ) -> Option<(&DnsRecordIntf, bool)> {
+    ) -> Option<CacheUpdate<'_>> {
         match incoming.get_type() {
             RRType::PTR | RRType::SRV | RRType::TXT | RRType::A | RRType::AAAA | RRType::NSEC => {}
             _ => return None,
@@ -414,24 +421,33 @@ impl DnsCache {
                 .iter()
                 .position(|record| record.record.matches(incoming.as_ref()))
         });
-        if let Some(index) = existing {
-            let records = self.records.get_mut(&key).unwrap();
-            if incoming.get_cache_flush() {
-                apply_cache_flush(records, Instant::now());
+        match existing {
+            Some(index) => {
+                let records = self.records.get_mut(&key).expect("matched RRset exists");
+                apply_cache_flush(records, incoming.as_ref());
+                let record = &mut records[index];
+                record.record.reset_ttl(incoming.as_ref());
+                Some(CacheUpdate::Refreshed)
             }
-            records[index].record.reset_ttl(incoming.as_ref());
-            return Some((&records[index], false));
+            None => self
+                .insert_record(key, intf, incoming)
+                .map(CacheUpdate::Inserted),
         }
+    }
 
+    fn insert_record(
+        &mut self,
+        key: (u32, RrsetKey),
+        intf: &MyIntf,
+        incoming: DnsRecordBox,
+    ) -> Option<&DnsRecordIntf> {
         let charge = incoming.cache_charge();
-        if self.max_records == 0 || charge > self.max_bytes {
-            return None;
-        }
-        self.trim_to_limits(self.max_records - 1, self.max_bytes - charge);
+        let remaining_records = self.max_records.checked_sub(1)?;
+        let remaining_bytes = self.max_bytes.checked_sub(charge)?;
+        self.trim_to_limits(remaining_records, remaining_bytes);
+
         let records = self.records.entry(key).or_default();
-        if incoming.get_cache_flush() {
-            apply_cache_flush(records, Instant::now());
-        }
+        apply_cache_flush(records, incoming.as_ref());
         records.insert(
             0,
             DnsRecordIntf {
@@ -440,7 +456,7 @@ impl DnsCache {
                 charge,
             },
         );
-        Some((&records[0], true))
+        records.first()
     }
 
     #[cfg(test)]
@@ -792,7 +808,11 @@ impl DnsCache {
     }
 }
 
-fn apply_cache_flush(records: &mut [DnsRecordIntf], now: Instant) {
+fn apply_cache_flush(records: &mut [DnsRecordIntf], incoming: &dyn DnsRecordExt) {
+    if !incoming.get_cache_flush() {
+        return;
+    }
+    let now = Instant::now();
     let expiry = now + Duration::from_secs(1);
     for record in records {
         if now > record.record.get_created() + Duration::from_secs(1)
@@ -1404,11 +1424,14 @@ mod tests {
         let intf = make_intf("en0", 1);
         let mut cache = DnsCache::new();
         cache.set_limits(8, 128);
-        cache.add_or_update(
-            &intf,
-            DnsTxt::new("small.local.", CLASS_IN, 120, vec![0]).boxed(),
-            true,
-        );
+        assert!(matches!(
+            cache.add_or_update(
+                &intf,
+                DnsTxt::new("small.local.", CLASS_IN, 120, vec![0]).boxed(),
+                true,
+            ),
+            Some(CacheUpdate::Inserted(_))
+        ));
         let before = cache.usage();
         assert!(cache
             .add_or_update(
@@ -1419,11 +1442,14 @@ mod tests {
             .is_none());
         assert_eq!(cache.usage(), before);
         for _ in 0..100 {
-            cache.add_or_update(
-                &intf,
-                DnsTxt::new("SMALL.local.", CLASS_IN, 120, vec![0]).boxed(),
-                true,
-            );
+            assert!(matches!(
+                cache.add_or_update(
+                    &intf,
+                    DnsTxt::new("SMALL.local.", CLASS_IN, 120, vec![0]).boxed(),
+                    true,
+                ),
+                Some(CacheUpdate::Refreshed)
+            ));
             assert_eq!(cache.usage(), before);
         }
     }

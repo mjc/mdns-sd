@@ -32,7 +32,7 @@ use crate::dns_name::SERVICE_TYPE_ENUMERATION;
 #[cfg(feature = "logging")]
 use crate::log::{debug, trace};
 use crate::{
-    dns_cache::{DnsCache, IpType},
+    dns_cache::{CacheUpdate, DnsCache, IpType},
     dns_name::CanonicalName,
     dns_parser::{
         ip_address_rr_type, max_pkt_absolute, DnsAddress, DnsEntryExt, DnsIncoming, DnsNSec,
@@ -3438,10 +3438,9 @@ impl Zeroconf {
             {
                 continue;
             }
-            if let Some((cached, inserted)) = self.cache.add_or_update(intf, record, true) {
-                if !inserted {
-                    continue;
-                }
+            if let Some(CacheUpdate::Inserted(cached)) =
+                self.cache.add_or_update(intf, record, true)
+            {
                 mutated = true;
                 let kind = cached.record.get_type();
                 let name = cached.record.get_name().to_string();
