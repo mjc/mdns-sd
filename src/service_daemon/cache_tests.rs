@@ -1023,3 +1023,54 @@ fn duplicate_found_retires_a_disconnected_passive_subscription() {
     assert!(daemon.pending_resolves.is_empty());
     assert!(daemon.retransmissions.is_empty());
 }
+
+#[test]
+fn cached_complete_service_replays_once_across_links_and_alias_case() {
+    for cache_only in [false, true] {
+        let (mut daemon, first) = daemon();
+        let second = second_interface(&mut daemon, first);
+        daemon.accept_unsolicited = true;
+        let instance = format!("MiXeD.{TY}");
+        for (index, alias) in [
+            (first, instance.clone()),
+            (second, instance.to_ascii_uppercase()),
+        ] {
+            let records = discovery_records(&daemon, index, &alias, "startup.local.", 120, true);
+            receive(&mut daemon, index, records);
+        }
+        assert_eq!(daemon.cache.get_ptr(TY).unwrap().len(), 2);
+        let (sender, receiver) = flume::unbounded();
+        daemon.exec_command_browse(false, TY.to_string(), 1, cache_only, sender);
+        let events: Vec<_> = receiver.try_iter().collect();
+        let found: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                ServiceEvent::ServiceFound(_, name) => Some(name),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(found, vec![&instance]);
+        let resolved: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                ServiceEvent::ServiceResolved(service) => Some(service),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(resolved.len(), 1, "cache_only={cache_only}");
+        assert_eq!(resolved[0].fullname, instance);
+        assert_eq!(resolved[0].host, "startup.local.");
+        assert_eq!(resolved[0].port, 8080);
+        assert_eq!(resolved[0].addresses.len(), 1);
+        match resolved[0].addresses.iter().next().unwrap() {
+            ScopedIp::V4(address) => {
+                let indices: HashSet<_> =
+                    address.interface_ids().iter().map(|id| id.index).collect();
+                assert_eq!(indices, HashSet::from([first, second]));
+            }
+            ScopedIp::V6(_) => panic!("test service only has an IPv4 address"),
+        }
+        assert_eq!(daemon.service_queriers[TY].delivered.len(), 2);
+        assert!(daemon.pending_resolves.is_empty());
+    }
+}

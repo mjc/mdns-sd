@@ -3047,7 +3047,7 @@ impl Zeroconf {
         sender: &Sender<ServiceEvent>,
         now: Instant,
     ) {
-        let aliases: Vec<String> = self
+        let mut aliases: Vec<String> = self
             .cache
             .get_ptr(ty_domain)
             .map(|records| {
@@ -3063,6 +3063,8 @@ impl Zeroconf {
                     .collect()
             })
             .unwrap_or_default();
+        let mut seen = HashSet::new();
+        aliases.retain(|alias| seen.insert(CanonicalName::new(alias)));
 
         for alias in aliases {
             let resolved_event = if ty_domain == SERVICE_TYPE_ENUMERATION {
