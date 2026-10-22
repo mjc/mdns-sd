@@ -7,6 +7,7 @@
 #[cfg(feature = "logging")]
 use crate::log::{debug, trace};
 
+use crate::dns_name::{labels, names_equal};
 use crate::error::{e_fmt, Error, Result};
 use crate::service_info::{decode_txt, is_unicast_link_local, DnsRegistry, MyIntf, ServiceInfo};
 
@@ -346,7 +347,8 @@ const MAX_NAME_BYTES: usize = 255;
 /// whatever was written and skips the item.
 #[derive(Debug, PartialEq, Eq)]
 pub enum WriteError {
-    /// A label in a name is longer than [`MAX_LABEL_BYTES`].
+    /// A label exceeds [`MAX_LABEL_BYTES`] or the complete encoded name exceeds
+    /// [`MAX_NAME_BYTES`].
     NameTooLong,
 
     /// The packet would exceed its max size with this record.
@@ -407,12 +409,18 @@ pub const fn ip_address_rr_type(address: &IpAddr) -> RRType {
     }
 }
 
-#[derive(Eq, PartialEq, Debug, Clone)]
+#[derive(Eq, Debug, Clone)]
 pub struct DnsEntry {
-    pub(crate) name: String, // always lower case.
+    pub(crate) name: String,
     pub(crate) ty: RRType,
     class: u16,
     cache_flush: bool,
+}
+
+impl PartialEq for DnsEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.ty == other.ty && self.class == other.class && names_equal(&self.name, &other.name)
+    }
 }
 
 impl DnsEntry {
@@ -541,7 +549,7 @@ impl DnsRecord {
 
         trace!(
             "{} qtype {} is due to refresh",
-            &self.entry.name,
+            self.entry.name,
             self.entry.ty
         );
 
@@ -653,8 +661,15 @@ pub trait DnsRecordExt: fmt::Debug {
     fn write(&self, packet: &mut DnsOutPacket) -> WriteResult;
     fn any(&self) -> &dyn Any;
 
-    /// Returns whether `other` record is considered the same except TTL.
+    /// Compares record identity and data, ignoring TTL and the cache-flush flag.
     fn matches(&self, other: &dyn DnsRecordExt) -> bool;
+
+    /// Compares the effective owner, type and class, excluding packet flags and TTL.
+    fn same_rrset(&self, other: &dyn DnsRecordExt) -> bool {
+        self.get_type() == other.get_type()
+            && self.get_class() == other.get_class()
+            && names_equal(self.get_name(), other.get_name())
+    }
 
     /// Returns whether `other` record has the same rdata.
     fn rrdata_match(&self, other: &dyn DnsRecordExt) -> bool;
@@ -837,7 +852,7 @@ impl DnsRecordExt for DnsAddress {
     fn matches(&self, other: &dyn DnsRecordExt) -> bool {
         if let Some(other_a) = other.any().downcast_ref::<Self>() {
             return self.address == other_a.address
-                && self.record.entry == other_a.record.entry
+                && self.same_rrset(other_a)
                 && self.interface_id == other_a.interface_id;
         }
         false
@@ -908,14 +923,14 @@ impl DnsRecordExt for DnsPointer {
 
     fn matches(&self, other: &dyn DnsRecordExt) -> bool {
         if let Some(other_ptr) = other.any().downcast_ref::<Self>() {
-            return self.alias == other_ptr.alias && self.record.entry == other_ptr.record.entry;
+            return names_equal(&self.alias, &other_ptr.alias) && self.same_rrset(other_ptr);
         }
         false
     }
 
     fn rrdata_match(&self, other: &dyn DnsRecordExt) -> bool {
         if let Some(other_ptr) = other.any().downcast_ref::<Self>() {
-            return self.alias == other_ptr.alias;
+            return names_equal(&self.alias, &other_ptr.alias);
         }
         false
     }
@@ -1006,18 +1021,18 @@ impl DnsRecordExt for DnsSrv {
 
     fn matches(&self, other: &dyn DnsRecordExt) -> bool {
         if let Some(other_svc) = other.any().downcast_ref::<Self>() {
-            return self.host == other_svc.host
+            return names_equal(&self.host, &other_svc.host)
                 && self.port == other_svc.port
                 && self.weight == other_svc.weight
                 && self.priority == other_svc.priority
-                && self.record.entry == other_svc.record.entry;
+                && self.same_rrset(other_svc);
         }
         false
     }
 
     fn rrdata_match(&self, other: &dyn DnsRecordExt) -> bool {
         if let Some(other_srv) = other.any().downcast_ref::<Self>() {
-            return self.host == other_srv.host
+            return names_equal(&self.host, &other_srv.host)
                 && self.port == other_srv.port
                 && self.weight == other_srv.weight
                 && self.priority == other_srv.priority;
@@ -1124,7 +1139,7 @@ impl DnsRecordExt for DnsTxt {
 
     fn matches(&self, other: &dyn DnsRecordExt) -> bool {
         if let Some(other_txt) = other.any().downcast_ref::<Self>() {
-            return self.text == other_txt.text && self.record.entry == other_txt.record.entry;
+            return self.text == other_txt.text && self.same_rrset(other_txt);
         }
         false
     }
@@ -1193,7 +1208,7 @@ impl DnsRecordExt for DnsHostInfo {
     }
 
     fn write(&self, packet: &mut DnsOutPacket) -> WriteResult {
-        debug!("Writing HInfo: cpu {} os {}", &self.cpu, &self.os);
+        debug!("Writing HInfo: cpu {} os {}", self.cpu, self.os);
         packet.write_bytes(self.cpu.as_bytes());
         packet.write_bytes(self.os.as_bytes());
         Ok(())
@@ -1207,7 +1222,7 @@ impl DnsRecordExt for DnsHostInfo {
         if let Some(other_hinfo) = other.any().downcast_ref::<Self>() {
             return self.cpu == other_hinfo.cpu
                 && self.os == other_hinfo.os
-                && self.record.entry == other_hinfo.record.entry;
+                && self.same_rrset(other_hinfo);
         }
         false
     }
@@ -1323,16 +1338,16 @@ impl DnsRecordExt for DnsNSec {
 
     fn matches(&self, other: &dyn DnsRecordExt) -> bool {
         if let Some(other_record) = other.any().downcast_ref::<Self>() {
-            return self.next_domain == other_record.next_domain
+            return names_equal(&self.next_domain, &other_record.next_domain)
                 && self.type_bitmap == other_record.type_bitmap
-                && self.record.entry == other_record.record.entry;
+                && self.same_rrset(other_record);
         }
         false
     }
 
     fn rrdata_match(&self, other: &dyn DnsRecordExt) -> bool {
         if let Some(other_record) = other.any().downcast_ref::<Self>() {
-            return self.next_domain == other_record.next_domain
+            return names_equal(&self.next_domain, &other_record.next_domain)
                 && self.type_bitmap == other_record.type_bitmap;
         }
         false
@@ -1506,50 +1521,7 @@ impl DnsOutPacket {
     /// - \\. becomes . (literal dot)
     /// - \\\\ becomes \\ (literal backslash)
     fn parse_escaped_name(name: &str) -> Vec<String> {
-        let mut labels = Vec::new();
-        let mut current_label = String::new();
-        let mut chars = name.chars().peekable();
-
-        while let Some(ch) = chars.next() {
-            match ch {
-                '\\' => {
-                    // Backslash escape sequence
-                    if let Some(&next_ch) = chars.peek() {
-                        match next_ch {
-                            '.' | '\\' => {
-                                // \\. or \\\\ - consume the backslash and add the escaped char
-                                chars.next();
-                                current_label.push(next_ch);
-                            }
-                            _ => {
-                                // Not a recognized escape - treat backslash literally
-                                current_label.push(ch);
-                            }
-                        }
-                    } else {
-                        // Trailing backslash - add it literally
-                        current_label.push(ch);
-                    }
-                }
-                '.' => {
-                    // Unescaped dot - label separator
-                    if !current_label.is_empty() {
-                        labels.push(current_label.clone());
-                        current_label.clear();
-                    }
-                }
-                _ => {
-                    current_label.push(ch);
-                }
-            }
-        }
-
-        // Add the last label if not empty
-        if !current_label.is_empty() {
-            labels.push(current_label);
-        }
-
-        labels
+        labels(name)
     }
 
     // Write name to packet
@@ -2337,7 +2309,7 @@ impl DnsIncoming {
     }
 
     fn read_questions(&mut self) -> Result<()> {
-        trace!("read_questions: {}", &self.num_questions);
+        trace!("read_questions: {}", self.num_questions);
         for i in 0..self.num_questions {
             let name = self.read_name()?;
 
@@ -2420,7 +2392,7 @@ impl DnsIncoming {
             if slice.len() < RR_HEADER_REMAIN {
                 return Err(Error::Msg(format!(
                     "read_others: RR '{}' is too short after name: {} bytes",
-                    &name,
+                    name,
                     slice.len()
                 )));
             }
@@ -2455,22 +2427,22 @@ impl DnsIncoming {
             match self.read_rdata(ty, class, ttl, rdata_len, &name) {
                 Ok(Some(record)) => {
                     if self.offset == next_offset {
-                        trace!("read_rr_records: {:?}", &record);
+                        trace!("read_rr_records: {:?}", record);
                         rr_records.push(record);
                     } else {
                         debug!(
                             "skipping record '{}' (type {}): RDATA ended at {}, expected {}",
-                            &name, ty, self.offset, next_offset
+                            name, ty, self.offset, next_offset
                         );
                     }
                 }
                 Ok(None) => {
-                    trace!("Unsupported DNS record type: {} name: {}", ty, &name);
+                    trace!("Unsupported DNS record type: {} name: {}", ty, name);
                 }
                 Err(e) => {
                     debug!(
                         "skipping record '{}' (type {}) with invalid RDATA: {}",
-                        &name, ty, e,
+                        name, ty, e,
                     );
                 }
             }
@@ -2874,9 +2846,10 @@ fn get_expiration_time(created: Instant, ttl: u32, percent: u32) -> Instant {
 #[cfg(test)]
 mod tests {
     use super::{
-        u16_from_be_slice, DnsAddress, DnsHostInfo, DnsIncoming, DnsOutPacket, DnsOutgoing,
-        DnsPointer, DnsTxt, RRType, CLASS_CACHE_FLUSH, CLASS_IN, FLAGS_QR_QUERY, FLAGS_QR_RESPONSE,
-        FLAGS_TC, MAX_PKT_ABSOLUTE_IPV6, MAX_PKT_DEFAULT, MSG_HEADER_LEN,
+        u16_from_be_slice, DnsAddress, DnsHostInfo, DnsIncoming, DnsNSec, DnsOutPacket,
+        DnsOutgoing, DnsPointer, DnsRecordExt, DnsSrv, DnsTxt, RRType, CLASS_CACHE_FLUSH, CLASS_IN,
+        FLAGS_QR_QUERY, FLAGS_QR_RESPONSE, FLAGS_TC, MAX_PKT_ABSOLUTE_IPV6, MAX_PKT_DEFAULT,
+        MSG_HEADER_LEN,
     };
     use crate::InterfaceId;
     use std::collections::HashMap;
@@ -2885,6 +2858,96 @@ mod tests {
     /// The `is_ipv4` argument of `to_packets`. IPv6 has the smaller of the two
     /// absolute ceilings, so it is the stricter one to encode for.
     const IPV6: bool = false;
+
+    #[test]
+    fn test_record_identity_ignores_flush_ttl_and_ascii_case() {
+        let first = DnsTxt::new(
+            "Printer._http._tcp.local.",
+            CLASS_IN,
+            120,
+            vec![3, b'A', b'=', b'B'],
+        );
+        let second = DnsTxt::new(
+            "printer._HTTP._tcp.LOCAL.",
+            CLASS_IN | CLASS_CACHE_FLUSH,
+            4500,
+            vec![3, b'A', b'=', b'B'],
+        );
+        assert!(first.matches(&second));
+        assert!(second.matches(&first));
+        let different_data = DnsTxt::new(
+            "printer._http._tcp.local.",
+            CLASS_IN,
+            120,
+            vec![3, b'A', b'=', b'b'],
+        );
+        assert!(!first.matches(&different_data));
+        let different_unicode =
+            DnsTxt::new("Pr\u{e4}nter._http._tcp.local.", CLASS_IN, 120, vec![0]);
+        let uppercase_unicode =
+            DnsTxt::new("Pr\u{c4}nter._http._tcp.local.", CLASS_IN, 120, vec![0]);
+        assert!(!different_unicode.matches(&uppercase_unicode));
+    }
+
+    #[test]
+    fn test_record_identity_compares_embedded_names_without_ascii_case() {
+        let first = DnsPointer::new(
+            "_http._tcp.local.",
+            RRType::PTR,
+            CLASS_IN,
+            120,
+            "Printer._http._tcp.local.".to_string(),
+        );
+        let second = DnsPointer::new(
+            "_HTTP._tcp.LOCAL.",
+            RRType::PTR,
+            CLASS_IN,
+            120,
+            "printer._HTTP._tcp.LOCAL.".to_string(),
+        );
+        assert!(first.matches(&second));
+        assert!(first.rrdata_match(&second));
+        assert_ne!(first.compare_rdata(&second), std::cmp::Ordering::Equal);
+
+        let first = DnsSrv::new(
+            "Printer._http._tcp.local.",
+            CLASS_IN,
+            120,
+            0,
+            0,
+            80,
+            "Host.local.".to_string(),
+        );
+        let second = DnsSrv::new(
+            "printer._http._tcp.local.",
+            CLASS_IN | CLASS_CACHE_FLUSH,
+            120,
+            0,
+            0,
+            80,
+            "host.LOCAL.".to_string(),
+        );
+        assert!(first.matches(&second));
+        assert!(first.rrdata_match(&second));
+        assert_ne!(first.compare_rdata(&second), std::cmp::Ordering::Equal);
+
+        let first = DnsNSec::new(
+            "Host.local.",
+            CLASS_IN,
+            120,
+            "Host.local.".to_string(),
+            vec![0, 1, 0x40],
+        );
+        let second = DnsNSec::new(
+            "host.LOCAL.",
+            CLASS_IN | CLASS_CACHE_FLUSH,
+            120,
+            "host.LOCAL.".to_string(),
+            vec![0, 1, 0x40],
+        );
+        assert!(first.matches(&second));
+        assert!(first.rrdata_match(&second));
+    }
 
     /// Found by fuzzing the packet parser.
     ///
@@ -2926,7 +2989,7 @@ mod tests {
         let out = DnsOutgoing::new(0);
         let packets = out.to_packets(MAX_PKT_DEFAULT, IPV6);
         assert_eq!(packets.len(), 1);
-        assert_eq!(packets[0].as_bytes(), &[0; 12]);
+        assert_eq!(packets[0].as_bytes(), &[0; MSG_HEADER_LEN]);
         let expected_names = HashMap::new();
         assert_eq!(&packets[0].names, &expected_names);
     }
@@ -3139,10 +3202,7 @@ mod tests {
         assert_eq!(incoming.answers().len(), 1);
     }
 
-    /// A name learned from the network can hold a label that ends with a
-    /// backslash, which escapes the following label separator. Unescaping such
-    /// a name on the way out merges two 63-byte labels into a 127-byte one.
-    /// This used to panic the daemon thread. See issue #483.
+    /// A trailing backslash in a wire label must not escape the next separator.
     #[test]
     fn test_incoming_name_with_merged_labels_does_not_panic() {
         // A query with one question: "aa..a\" + "bb..b", 63 bytes each.
