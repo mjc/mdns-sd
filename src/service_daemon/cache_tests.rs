@@ -795,3 +795,29 @@ fn type_enumeration_does_not_resolve_type_names_as_instances() {
         .try_iter()
         .any(|event| matches!(event, ServiceEvent::ServiceFound(..))));
 }
+
+#[test]
+fn cached_type_enumeration_replays_found_without_instance_resolution() {
+    let (mut daemon, index) = daemon();
+    daemon.accept_unsolicited = true;
+    let alias = format!("misleading.{TY}");
+    let mut records = discovery_records(&daemon, index, &alias, "cached.local.", 120, false);
+    records
+        .push(DnsPointer::new(SERVICE_TYPE_ENUMERATION, RRType::PTR, CLASS_IN, 120, alias).boxed());
+    receive(&mut daemon, index, records);
+    let (sender, receiver) = flume::unbounded();
+    daemon.exec_command_browse(false, SERVICE_TYPE_ENUMERATION.to_string(), 1, true, sender);
+    let events: Vec<_> = receiver.try_iter().collect();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, ServiceEvent::ServiceFound(..)))
+            .count(),
+        1
+    );
+    assert!(!events
+        .iter()
+        .any(|event| matches!(event, ServiceEvent::ServiceResolved(..))));
+    assert!(daemon.pending_resolves.is_empty());
+    assert!(daemon.retransmissions.is_empty());
+}

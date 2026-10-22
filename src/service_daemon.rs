@@ -3029,23 +3029,27 @@ impl Zeroconf {
             .unwrap_or_default();
 
         for alias in aliases {
-            let resolved_event = match self.resolve_service_from_cache(ty_domain, &alias) {
-                Ok(resolved_service) if resolved_service.is_valid() => {
-                    debug!("Resolved service from cache: {}", alias);
-                    Some(ServiceEvent::ServiceResolved(Box::new(resolved_service)))
-                }
-                Ok(resolved_service) => {
-                    debug!(
+            let resolved_event = if ty_domain == SERVICE_TYPE_ENUMERATION {
+                None
+            } else {
+                match self.resolve_service_from_cache(ty_domain, &alias) {
+                    Ok(resolved_service) if resolved_service.is_valid() => {
+                        debug!("Resolved service from cache: {}", alias);
+                        Some(ServiceEvent::ServiceResolved(Box::new(resolved_service)))
+                    }
+                    Ok(resolved_service) => {
+                        debug!(
                         "query_cache_for_service: not valid: {} (host_empty={}, addrs_empty={})",
                         alias,
                         resolved_service.get_hostname().is_empty(),
                         resolved_service.get_addresses().is_empty(),
                     );
-                    None
-                }
-                Err(err) => {
-                    debug!("Error while resolving service from cache: {}", err);
-                    continue;
+                        None
+                    }
+                    Err(err) => {
+                        debug!("Error while resolving service from cache: {}", err);
+                        continue;
+                    }
                 }
             };
 
@@ -3065,7 +3069,7 @@ impl Zeroconf {
                 }
                 debug!("sent service resolved: {}", alias);
                 self.pending_resolves.remove(&alias);
-            } else {
+            } else if ty_domain != SERVICE_TYPE_ENUMERATION {
                 self.add_pending_resolve(alias);
             }
         }
