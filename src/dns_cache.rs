@@ -106,26 +106,26 @@ impl DnsCache {
             .records
             .iter()
             .flat_map(|(key, records)| {
-                records.iter().enumerate().map(move |(index, record)| {
-                    (
-                        key,
-                        index,
-                        !record.record.get_record().is_expired(now),
-                        record.record.get_created(),
-                    )
-                })
+                records
+                    .iter()
+                    .enumerate()
+                    .map(move |(index, record)| (key, index, record))
             })
-            .min_by_key(|(_, _, live, received)| (*live, *received))
-            .map(|(key, index, _, _)| (key.clone(), index));
-        if let Some((key, index)) = oldest {
-            if let Some(records) = self.records.get_mut(&key) {
-                records.remove(index);
-            }
-            self.compact();
-            true
-        } else {
-            false
-        }
+            // Expired records sort first, then the oldest receipt time.
+            .min_by_key(|(_, _, record)| {
+                let record = &record.record;
+                (!record.get_record().is_expired(now), record.get_created())
+            })
+            .map(|(key, index, _)| (key.clone(), index));
+        let Some((key, index)) = oldest else {
+            return false;
+        };
+        self.records
+            .get_mut(&key)
+            .expect("selected RRset exists")
+            .remove(index);
+        self.compact();
+        true
     }
 
     fn records_for(
