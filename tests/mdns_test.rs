@@ -50,7 +50,7 @@ fn integration_success() {
     let my_addrs_count = my_ifaddrs.len();
     println!("My IP {} addr(s):", my_ifaddrs.len());
     for item in my_ifaddrs.iter() {
-        println!("{}", &item);
+        println!("{}", item);
     }
 
     let host_name = "INTEGRATION_host.local.";
@@ -82,10 +82,10 @@ fn integration_success() {
     while let Ok(event) = browse_chan.recv_timeout(timeout) {
         match event {
             ServiceEvent::SearchStarted(ty_domain) => {
-                println!("Search started for {}", &ty_domain);
+                println!("Search started for {}", ty_domain);
             }
             ServiceEvent::ServiceFound(_ty_domain, fullname) => {
-                println!("Found a new service: {}", &fullname);
+                println!("Found a new service: {}", fullname);
             }
             ServiceEvent::ServiceResolved(info) => {
                 let addrs: HashSet<_> = info
@@ -144,30 +144,37 @@ fn integration_success() {
     assert!(matches!(response, UnregisterStatus::OK));
 
     let mut remove_count = 0;
-    let mut resolved = false;
+    let mut resolved_after_removal = false;
     while let Ok(event) = browse_chan.recv_timeout(timeout) {
         match event {
-            ServiceEvent::ServiceRemoved(_ty_domain, fullname) => {
-                println!("Removed service: {}", &fullname);
-                if fullname.contains(&instance_name) {
-                    remove_count += 1;
-                }
-                break;
+            ServiceEvent::ServiceRemoved(_, instance) if instance == fullname => {
+                remove_count += 1;
             }
-            ServiceEvent::ServiceResolved(info) => {
-                if info.get_fullname() == fullname {
-                    println!("Received a resolved service event after unregister");
-                    resolved = true;
-                }
+            ServiceEvent::ServiceResolved(info) if info.get_fullname() == fullname => {
+                // Other links remain valid during the one-second goodbye grace period.
+                resolved_after_removal |= remove_count > 0;
             }
             _ => {}
         }
+        if remove_count > 0 {
+            while let Ok(event) = browse_chan.recv_timeout(Duration::from_secs(1)) {
+                match event {
+                    ServiceEvent::ServiceResolved(info) if info.get_fullname() == fullname => {
+                        resolved_after_removal = true;
+                    }
+                    ServiceEvent::ServiceRemoved(_, instance) if instance == fullname => {
+                        remove_count += 1;
+                    }
+                    _ => {}
+                }
+            }
+            break;
+        }
     }
-
     assert_eq!(remove_count, 1);
     assert!(
-        !resolved,
-        "Resolved event should not be received after unregister"
+        !resolved_after_removal,
+        "Service resolved again after its removal"
     );
 
     // Stop browsing the service.
@@ -177,7 +184,7 @@ fn integration_success() {
 
     while let Ok(event) = browse_chan.recv_timeout(timeout) {
         if let ServiceEvent::SearchStopped(ty) = event {
-            println!("Search stopped for {}", &ty);
+            println!("Search stopped for {}", ty);
             stopped_count += 1;
             break;
         }
@@ -188,7 +195,7 @@ fn integration_success() {
     // Verify metrics.
     let metrics_receiver = d.get_metrics().unwrap();
     let metrics = metrics_receiver.recv().unwrap();
-    println!("metrics: {:?}", &metrics);
+    println!("metrics: {:?}", metrics);
     assert_eq!(metrics["register"], 1);
     assert_eq!(metrics["unregister"], 1);
     assert!(metrics["register-resend"] >= 1);
@@ -206,10 +213,10 @@ fn integration_success() {
     assert!(*respond_count >= 2 || *known_answer_count > 0);
 
     // Test the special meta-query of "_services._dns-sd._udp.local."
-    let service2_type = "_my-service2._udp.local.";
+    let service2_type = format!("_s2{:x}._udp.local.", fastrand::u32(..));
     let service2_instance = "instance2";
     let service2 = ServiceInfo::new(
-        service2_type,
+        &service2_type,
         service2_instance,
         host_name,
         &my_ifaddrs[..],
@@ -223,13 +230,14 @@ fn integration_success() {
     // Browse using the special meta-query.
     let meta_query = "_services._dns-sd._udp.local.";
     let browse_chan = d.browse(meta_query).unwrap();
-    let timeout = Duration::from_secs(2);
+    // A query can precede probe completion, then back off for two seconds.
+    let timeout = Duration::from_secs(5);
 
     loop {
         match browse_chan.recv_timeout(timeout) {
             Ok(event) => match event {
                 ServiceEvent::ServiceFound(ty_domain, fullname) => {
-                    println!("Found a service of {}: {}", &ty_domain, &fullname);
+                    println!("Found a service of {}: {}", ty_domain, fullname);
                     // Among all services found, should have our 2nd service.
                     if fullname == service2_type {
                         break;
@@ -241,7 +249,11 @@ fn integration_success() {
                 }
             },
             Err(e) => {
-                panic!("browse error: {}", e);
+                let metrics = d
+                    .get_metrics()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(1));
+                panic!("browse error: {}; metrics: {:?}", e, metrics);
             }
         }
     }
@@ -282,7 +294,7 @@ fn service_without_properties_with_alter_net_v4() {
     let fullname = my_service.get_fullname().to_string();
     d.register(my_service)
         .expect("Failed to register our service");
-    println!("Registered service with host_ip: {:?}", &host_ip);
+    println!("Registered service with host_ip: {:?}", host_ip);
 
     // Browse for a service
     let browse_chan = d.browse(ty_domain).unwrap();
@@ -295,7 +307,7 @@ fn service_without_properties_with_alter_net_v4() {
                 ServiceEvent::ServiceResolved(info) => {
                     println!(
                         "Resolved a service of {} addr(s): {:?}",
-                        &info.get_fullname(),
+                        info.get_fullname(),
                         info.get_addresses()
                     );
                     // match only our service and not v6 one
@@ -355,7 +367,7 @@ fn service_without_properties_with_alter_net_v6() {
     let fullname = my_service.get_fullname().to_string();
     d.register(my_service)
         .expect("Failed to register our service");
-    println!("Registered service with host_ip: {:?}", &host_ip);
+    println!("Registered service with host_ip: {:?}", host_ip);
 
     // Browse for a service
     let browse_chan = d.browse(ty_domain).unwrap();
@@ -368,7 +380,7 @@ fn service_without_properties_with_alter_net_v6() {
                 ServiceEvent::ServiceResolved(info) => {
                     println!(
                         "Resolved a service of {} addr(s): {:?}",
-                        &info.get_fullname(),
+                        info.get_fullname(),
                         info.get_addresses()
                     );
                     // match only our service and not v4 one
@@ -574,7 +586,7 @@ fn service_with_named_interface_only() {
                 resolved = true;
                 println!(
                     "Resolved a service of {} addr(s): {:?}",
-                    &info.get_fullname(),
+                    info.get_fullname(),
                     addrs
                 );
                 break;
@@ -595,7 +607,7 @@ fn service_with_named_interface_only() {
     let if_name = if_addrs[0].name.clone();
 
     // Enable the named interface.
-    println!("Enable interface with name {}", &if_name);
+    println!("Enable interface with name {}", if_name);
     d.enable_interface(&if_name).unwrap();
 
     // Browse again.
@@ -610,7 +622,7 @@ fn service_with_named_interface_only() {
                 resolved = true;
                 println!(
                     "Resolved a service of {} addr(s): {:?}",
-                    &info.get_fullname(),
+                    info.get_fullname(),
                     addrs
                 );
                 break;
@@ -666,7 +678,7 @@ fn service_with_ipv4_only() {
                 resolved = true;
                 println!(
                     "Resolved a service of {} addr(s): {:?}",
-                    &info.get_fullname(),
+                    info.get_fullname(),
                     addrs
                 );
                 assert!(!info.get_addresses().is_empty());
@@ -722,7 +734,7 @@ fn service_ipv6_link_local_only() {
                 resolved = true;
                 println!(
                     "Resolved a service of {} addr(s): {:?}",
-                    &info.get_fullname(),
+                    info.get_fullname(),
                     addrs
                 );
                 assert!(!info.get_addresses().is_empty());
@@ -785,6 +797,8 @@ fn test_disable_interface_cache() {
     // Disable the interface for the client.
     println!("Disabling interface with IP: {:?}", ipv4_list);
     client.disable_interface(ipv4_list).unwrap();
+    // A records can also arrive over IPv6 on the same link.
+    client.disable_interface(IfKind::IPv6).unwrap();
 
     // Browse for the service.
     let handle = client.browse(ty_domain).unwrap();
@@ -796,7 +810,7 @@ fn test_disable_interface_cache() {
         if let ServiceEvent::ServiceResolved(info) = event {
             println!(
                 "Resolved a service of {} addr(s): {:?}",
-                &info.get_fullname(),
+                info.get_fullname(),
                 info.get_addresses()
             );
             resolved = true;
@@ -845,7 +859,7 @@ fn service_with_invalid_addr_v4() {
                 ServiceEvent::ServiceResolved(info) => {
                     println!(
                         "Resolved a service of {} addr(s): {:?}",
-                        &info.get_fullname(),
+                        info.get_fullname(),
                         info.get_addresses()
                     );
                     resolved = true;
@@ -902,7 +916,7 @@ fn service_with_invalid_addr_v6() {
                 ServiceEvent::ServiceResolved(info) => {
                     println!(
                         "Resolved a service of {} addr(s): {:?}",
-                        &info.get_fullname(),
+                        info.get_fullname(),
                         info.get_addresses()
                     );
                     resolved = true;
@@ -1034,7 +1048,7 @@ fn subtype() {
                     ServiceEvent::ServiceResolved(info) => {
                         println!(
                             "Resolved a service of {} subdomain {:?}",
-                            &info.get_fullname(),
+                            info.get_fullname(),
                             info.get_subtype()
                         );
                         assert_eq!(fullname.as_str(), info.get_fullname());
@@ -1151,7 +1165,7 @@ fn service_new_publish_after_browser() {
                 ServiceEvent::ServiceResolved(info) => {
                     println!(
                         "Resolved a service of {} addr(s): {:?} props: {:?}",
-                        &info.get_fullname(),
+                        info.get_fullname(),
                         info.get_addresses(),
                         info.get_properties()
                     );
@@ -1476,7 +1490,7 @@ fn test_cache_flush_record() {
         match event {
             ServiceEvent::ServiceResolved(info) => {
                 resolved = true;
-                timed_println(format!("Resolved a service of {}", &info.get_fullname()));
+                timed_println(format!("Resolved a service of {}", info.get_fullname()));
                 timed_println(format!("JLN service: {:?}", info));
                 break;
             }
@@ -1515,7 +1529,7 @@ fn test_cache_flush_record() {
 
     timed_println(format!(
         "Re-registered with updated IPv4 addr: {}",
-        &service_ip_addr
+        service_ip_addr
     ));
 
     // Wait for the new registration sent out and cache flushed.
@@ -1596,7 +1610,7 @@ fn test_cache_flush_remove_one_addr() {
         match event {
             ServiceEvent::ServiceResolved(info) => {
                 resolved = true;
-                println!("Resolved a service of {}", &info.get_fullname());
+                println!("Resolved a service of {}", info.get_fullname());
                 break;
             }
             e => {
@@ -1721,6 +1735,7 @@ fn test_cache_flush_srv() {
 
     // Browse for the updated SRV record
     let timeout = Duration::from_secs(2);
+    resolved = false;
     let mut removed = false;
     while let Ok(event) = browse_chan.recv_timeout(timeout) {
         println!("Received event {:?}", event);
@@ -1785,7 +1800,7 @@ fn test_known_answer_suppression() {
         match event {
             ServiceEvent::ServiceResolved(info) => {
                 resolved = true;
-                println!("Resolved a service of {}", &info.get_fullname());
+                println!("Resolved a service of {}", info.get_fullname());
                 break;
             }
             other => {
@@ -1802,7 +1817,7 @@ fn test_known_answer_suppression() {
     while let Ok(event) = browse_chan.recv_timeout(timeout) {
         if let ServiceEvent::ServiceResolved(info) = event {
             resolved = true;
-            println!("Resolved a service of {}", &info.get_fullname());
+            println!("Resolved a service of {}", info.get_fullname());
             break;
         }
     }
@@ -1814,7 +1829,7 @@ fn test_known_answer_suppression() {
     // Verify Known Answer Suppression happened.
     let metrics_receiver = mdns_server.get_metrics().unwrap();
     let metrics = metrics_receiver.recv().unwrap();
-    println!("metrics: {:?}", &metrics);
+    println!("metrics: {:?}", metrics);
     assert!(metrics["known-answer-suppression"] > 0);
 }
 
@@ -2220,6 +2235,7 @@ fn test_multicast_loop_v4() {
 
     // Register the first service.
     let server = ServiceDaemon::new().expect("failed to start server");
+    server.disable_interface(IfKind::IPv6).unwrap();
     server.set_multicast_loop_v4(false).unwrap();
 
     // Get a single IPv4 address
@@ -2242,6 +2258,7 @@ fn test_multicast_loop_v4() {
     // start a client i.e. querier.
     let mut resolved = false;
     let client = ServiceDaemon::new().expect("failed to create mdns client");
+    client.disable_interface(IfKind::IPv6).unwrap();
 
     // For Windows, IP_MULTICAST_LOOP option works only on the receive path.
     client.set_multicast_loop_v4(false).unwrap();
@@ -2297,6 +2314,7 @@ fn test_multicast_loop_v6() {
 
     // Register the first service.
     let server = ServiceDaemon::new().expect("failed to start server");
+    server.disable_interface(IfKind::IPv4).unwrap();
     server.set_multicast_loop_v6(false).unwrap();
 
     // Get a single IPv6 address
@@ -2319,6 +2337,7 @@ fn test_multicast_loop_v6() {
     // start a client i.e. querier.
     let mut resolved = false;
     let client = ServiceDaemon::new().expect("failed to create mdns client");
+    client.disable_interface(IfKind::IPv4).unwrap();
 
     // For Windows, IP_MULTICAST_LOOP option works only on the receive path.
     client.set_multicast_loop_v6(false).unwrap();

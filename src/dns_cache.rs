@@ -12,6 +12,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Bitflags for selecting address families.
 #[derive(Clone, Copy)]
 pub(crate) struct IpType(u8);
 
@@ -31,25 +32,24 @@ impl BitOr for IpType {
     }
 }
 
-pub(crate) struct IntfRemovalResult {
-    pub(crate) removed_instances: HashMap<String, HashSet<String>>,
-    pub(crate) modified_instances: HashSet<String>,
-}
-
+/// Changes reported by the cache expiry sweep.
 pub(crate) struct CacheEviction {
+    /// Whether any record expired, including records without an address.
     pub(crate) changed: bool,
-    pub(crate) expired_services: HashMap<String, HashSet<String>>,
+    /// Expired address records grouped by hostname.
     pub(crate) expired_addrs: HashMap<String, HashSet<ScopedIp>>,
 }
 
+/// A received record, its receiving interface and retained-data charge in bytes.
 pub(crate) struct DnsRecordIntf {
     pub(crate) record: DnsRecordBox,
     pub(crate) src_intf: InterfaceId,
     charge: usize,
 }
 
-/// Each RRset has one owner here. Types and interfaces share the same expiry path.
+/// Received RRsets share one expiry path across record types and interfaces.
 pub(crate) struct DnsCache {
+    /// Records keyed by receiving interface index and RRset identity.
     records: HashMap<(u32, RrsetKey), Vec<DnsRecordIntf>>,
     max_records: usize,
     max_bytes: usize,
@@ -79,6 +79,7 @@ impl DnsCache {
         }
     }
 
+    /// Returns the retained record count and charged bytes, excluding allocator overhead.
     pub(crate) fn usage(&self) -> (usize, usize) {
         self.records
             .values()
@@ -128,6 +129,9 @@ impl DnsCache {
         }
     }
 
+    /// Returns unexpired IN-class records, optionally restricted to one interface.
+    /// `RRType::ANY` selects A and AAAA records for address lookups.
+    /// Returns `None` when no matching live records remain.
     fn records_for(
         &self,
         name: &str,
@@ -192,6 +196,8 @@ impl DnsCache {
         self.records.contains_key(&(index, RrsetKey::new(record)))
     }
 
+    /// Groups PTR records by service type across interfaces, including expired records.
+    /// Callers must check expiry until the next cache sweep removes those records.
     pub(crate) fn all_ptr(&self) -> HashMap<String, Vec<&DnsRecordIntf>> {
         let mut result: HashMap<String, Vec<&DnsRecordIntf>> = HashMap::new();
         for ((_, key), records) in &self.records {
@@ -213,6 +219,7 @@ impl DnsCache {
             .sum()
     }
 
+    /// Counts retained PTR records across interfaces.
     pub(crate) fn ptr_count(&self) -> usize {
         self.count(RRType::PTR)
     }
@@ -338,6 +345,8 @@ impl DnsCache {
         self.addresses_for_host(host, None)
     }
 
+    /// Returns SRV queries for an instance and address queries for its cached targets.
+    /// When `expire_at` is set, shortens those records' expiry times on their links.
     pub(crate) fn service_verify_queries(
         &mut self,
         instance: &str,
@@ -383,6 +392,11 @@ impl DnsCache {
     }
 
     /// Admission is decided by the caller; only records in the admitted RRset are refreshed here.
+    ///
+    /// Returns the cached record and `true` for insertion or `false` for a TTL refresh.
+    /// Returns `None` for records that are not for us, unsupported types or classes,
+    /// or a new record that cannot fit within the cache limits. A refresh keeps
+    /// the existing record's data charge and does not evict other records.
     pub(crate) fn add_or_update(
         &mut self,
         intf: &MyIntf,
@@ -460,6 +474,7 @@ impl DnsCache {
         removed
     }
 
+    /// Ages cached records by the time spent asleep.
     pub(crate) fn age_records(&mut self, elapsed: Duration) {
         for record in self.records.values_mut().flatten() {
             record.record.age_by(elapsed);
@@ -481,85 +496,29 @@ impl DnsCache {
             })
     }
 
-    fn has_service(&self, ty: &str, instance: &str, now: Instant) -> bool {
-        self.records_for(ty, RRType::PTR, None)
-            .into_iter()
-            .flatten()
-            .any(|ptr| {
-                !ptr.record.get_record().is_expired(now)
-                    && ptr
-                        .record
-                        .any()
-                        .downcast_ref::<DnsPointer>()
-                        .is_some_and(|ptr| {
-                            CanonicalName::new(ptr.alias()) == CanonicalName::new(instance)
-                        })
-                    && self
-                        .get_srv_on_intf(instance, ptr.src_intf.index)
-                        .into_iter()
-                        .flatten()
-                        .any(|srv| !srv.record.get_record().is_expired(now))
-            })
-    }
-
     /// All record types expire through this pass, independently of PTR relationships.
     pub(crate) fn evict_expired(&mut self, now: Instant) -> CacheEviction {
         let mut changed = false;
-        let mut candidates = Vec::new();
-        let mut lost_srv = HashSet::new();
         let mut expired_addrs: HashMap<String, HashSet<ScopedIp>> = HashMap::new();
-        self.records.retain(|(scope, key), records| {
+        self.records.retain(|_, records| {
             records.retain(|record| {
                 if !record.record.get_record().is_expired(now) {
                     return true;
                 }
                 changed = true;
-                match key.rr_type {
-                    RRType::PTR => {
-                        if let Some(ptr) = record.record.any().downcast_ref::<DnsPointer>() {
-                            candidates
-                                .push((key.name.as_str().to_string(), ptr.alias().to_string()));
-                        }
-                    }
-                    RRType::SRV => {
-                        lost_srv.insert((*scope, key.name.clone()));
-                    }
-                    RRType::A | RRType::AAAA => {
-                        if let Some(addr) = record.record.any().downcast_ref::<DnsAddress>() {
-                            expired_addrs
-                                .entry(record.record.get_name().to_string())
-                                .or_default()
-                                .insert(addr.address());
-                        }
-                    }
-                    _ => {}
+                if let Some(addr) = record.record.any().downcast_ref::<DnsAddress>() {
+                    expired_addrs
+                        .entry(record.record.get_name().to_string())
+                        .or_default()
+                        .insert(addr.address());
                 }
                 false
             });
             !records.is_empty()
         });
         self.compact();
-        for ((scope, key), records) in &self.records {
-            if key.rr_type != RRType::PTR {
-                continue;
-            }
-            for record in records {
-                if let Some(ptr) = record.record.any().downcast_ref::<DnsPointer>() {
-                    if lost_srv.contains(&(*scope, CanonicalName::new(ptr.alias()))) {
-                        candidates.push((key.name.as_str().to_string(), ptr.alias().to_string()));
-                    }
-                }
-            }
-        }
-        let mut expired_services: HashMap<String, HashSet<String>> = HashMap::new();
-        for (ty, instance) in candidates {
-            if !self.has_service(&ty, &instance, now) {
-                expired_services.entry(ty).or_default().insert(instance);
-            }
-        }
         CacheEviction {
             changed,
-            expired_services,
             expired_addrs,
         }
     }
@@ -761,7 +720,9 @@ impl DnsCache {
         self.compact();
     }
 
-    pub(crate) fn remove_records_on_intf(&mut self, intf: InterfaceId) -> IntfRemovalResult {
+    /// Removes a link's records and returns instances that may need re-resolution.
+    /// Subscription reconciliation determines which services have disappeared.
+    pub(crate) fn remove_records_on_intf(&mut self, intf: InterfaceId) -> HashSet<String> {
         let mut ptrs = Vec::new();
         let mut modified_instances = HashSet::new();
         let mut hosts = HashSet::new();
@@ -791,19 +752,13 @@ impl DnsCache {
             modified_instances.extend(self.get_instances_on_host(host.as_str()));
         }
         let now = Instant::now();
-        let mut removed_instances: HashMap<String, HashSet<String>> = HashMap::new();
         for (ty, instance) in ptrs {
-            if !self.has_ptr(&ty, &instance, None, now) {
-                removed_instances.entry(ty).or_default().insert(instance);
-            } else {
+            if self.has_ptr(&ty, &instance, None, now) {
                 modified_instances.insert(instance);
             }
         }
         self.compact();
-        IntfRemovalResult {
-            removed_instances,
-            modified_instances,
-        }
+        modified_instances
     }
 }
 
@@ -894,17 +849,13 @@ mod tests {
         let result = cache.remove_records_on_intf(intf_a_id);
 
         // PTR still exists via intf_b — instance is not fully removed.
-        assert!(
-            result.removed_instances.is_empty(),
-            "expected no removed instances, got {:?}",
-            result.removed_instances
-        );
+        assert!(cache.get_ptr_on_intf(ty_domain, intf_b.index).is_some());
 
         // addr_a was removed, so the instance is in modified_instances.
         assert!(
-            result.modified_instances.contains(instance),
+            result.contains(instance),
             "expected {instance} in modified_instances, got {:?}",
-            result.modified_instances
+            result
         );
 
         // Only addr_b remains in the cache.
@@ -1003,10 +954,8 @@ mod tests {
             DnsSrv::new(instance, CLASS_IN, 30, 0, 0, 80, host.to_string()).boxed(),
             true,
         );
-        assert!(cache
-            .evict_expired(Instant::now())
-            .expired_services
-            .is_empty());
+        assert!(!cache.evict_expired(Instant::now()).changed);
+        assert!(cache.get_srv_on_intf(instance, intf.index).is_some());
 
         let ptr = &cache.get_ptr(ty_domain).unwrap()[0].record;
         let (ptr_expire, ptr_refresh) = (ptr.get_expire(), ptr.get_record().get_refresh_time());
@@ -1015,9 +964,9 @@ mod tests {
         let slept = Duration::from_secs(60);
         cache.age_records(slept);
 
-        let expired = cache.evict_expired(Instant::now()).expired_services;
+        assert!(cache.evict_expired(Instant::now()).changed);
         assert!(
-            expired[ty_domain].contains(instance),
+            cache.get_srv_on_intf(instance, intf.index).is_none(),
             "the SRV record ran out during the sleep"
         );
 

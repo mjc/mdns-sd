@@ -655,17 +655,6 @@ impl PartialEq for DnsRecord {
 
 /// Common methods for DNS resource records.
 pub trait DnsRecordExt: fmt::Debug {
-    fn cache_charge(&self) -> usize {
-        let mut packet = DnsOutPacket::new(usize::MAX);
-        if self.write(&mut packet).is_err() {
-            return usize::MAX;
-        }
-        self.get_name()
-            .len()
-            .saturating_add(10)
-            .saturating_add(packet.size().saturating_sub(MSG_HEADER_LEN))
-    }
-
     fn get_record(&self) -> &DnsRecord;
     fn get_record_mut(&mut self) -> &mut DnsRecord;
     /// Writes the rdata of this record into `packet`.
@@ -684,6 +673,20 @@ pub trait DnsRecordExt: fmt::Debug {
 
     /// Returns whether `other` record has the same rdata.
     fn rrdata_match(&self, other: &dyn DnsRecordExt) -> bool;
+
+    /// Returns the cache charge in bytes for the owner presentation, RR header
+    /// and uncompressed RDATA, excluding allocator overhead.
+    /// Returns `usize::MAX` if the RDATA cannot be encoded.
+    fn cache_charge(&self) -> usize {
+        let mut packet = DnsOutPacket::new(usize::MAX);
+        if self.write(&mut packet).is_err() {
+            return usize::MAX;
+        }
+        self.get_name()
+            .len()
+            .saturating_add(10)
+            .saturating_add(packet.size().saturating_sub(MSG_HEADER_LEN))
+    }
 
     /// Returns the result based on a byte-level comparison of `rdata`.
     /// If `other` is not valid, returns `Greater`.
