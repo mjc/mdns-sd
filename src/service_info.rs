@@ -574,10 +574,6 @@ impl ServiceInfo {
             .unwrap_or(ServiceStatus::Unknown)
     }
 
-    pub(crate) fn remove_status(&mut self, if_index: u32) {
-        self.status.remove(&if_index);
-    }
-
     pub(crate) fn retain_statuses(&mut self, interfaces: &HashSet<u32>) {
         self.status.retain(|index, _| interfaces.contains(index));
     }
@@ -1910,8 +1906,10 @@ mod tests {
     fn test_service_status_drops_removed_interface() {
         let mut service = registry_service("status", "127.0.0.1", 0);
         service.set_status(1, ServiceStatus::Announced);
-        service.remove_status(1);
+        service.set_status(2, ServiceStatus::Announced);
+        service.retain_statuses(&std::collections::HashSet::from([2]));
         assert_eq!(service.get_status(1), ServiceStatus::Unknown);
+        assert_eq!(service.get_status(2), ServiceStatus::Announced);
     }
 
     #[test]

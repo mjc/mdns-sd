@@ -317,6 +317,7 @@ impl DnsCache {
         self.addr.get(CanonicalName::new(hostname).as_str())
     }
 
+    #[cfg(test)]
     pub(crate) fn get_ptr_on_intf(&self, name: &str, index: u32) -> Option<Vec<&DnsRecordIntf>> {
         self.records_for(name, RRType::PTR, Some(index))
     }
@@ -341,6 +342,7 @@ impl DnsCache {
     pub(crate) fn get_srv_on_intf(&self, name: &str, index: u32) -> Option<Vec<&DnsRecordIntf>> {
         self.records_for(name, RRType::SRV, Some(index))
     }
+    #[cfg(test)]
     pub(crate) fn get_txt_on_intf(&self, name: &str, index: u32) -> Option<Vec<&DnsRecordIntf>> {
         self.records_for(name, RRType::TXT, Some(index))
     }
