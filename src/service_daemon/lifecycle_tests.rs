@@ -272,6 +272,21 @@ fn case_only_updates_reuse_dns_record_identity() {
         assert_eq!(daemon.my_services.len(), 1);
         assert_eq!(active_count(&daemon), 3);
     }
+    unregister(&mut daemon, "case._lifecycle._tcp.local.");
+    let (sender, commands) = flume::unbounded();
+    let handle = ServiceDaemon {
+        sender,
+        waker: daemon.waker.clone(),
+    };
+    let published = service("École", "school.local.", "127.0.0.1", "A");
+    let fullname = published.get_fullname().to_string();
+    handle.register(published).unwrap();
+    daemon.exec_command(commands.recv().unwrap(), false);
+    finish(&mut daemon, index);
+    let result = handle.unregister(&fullname).unwrap();
+    daemon.exec_command(commands.recv().unwrap(), false);
+    assert!(matches!(result.recv().unwrap(), UnregisterStatus::OK));
+    assert_eq!(active_count(&daemon), 0);
 }
 
 #[test]

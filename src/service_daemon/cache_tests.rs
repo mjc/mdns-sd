@@ -543,6 +543,17 @@ fn hostname_subscription_matches_normalized_backslash_presentation() {
     assert!(receiver
         .try_iter()
         .any(|event| matches!(event, HostnameResolutionEvent::SearchStopped(..))));
+
+    let (sender, _receiver) = flume::unbounded();
+    let hostname = "École.local.".to_string();
+    daemon.exec_command(
+        Command::ResolveHostname(hostname.clone(), 1, sender, None),
+        false,
+    );
+    assert_eq!(daemon.hostname_resolvers.len(), 1);
+    daemon.exec_command(Command::StopResolveHostname(hostname), false);
+    assert!(daemon.hostname_resolvers.is_empty());
+    assert!(daemon.retransmissions.is_empty());
 }
 
 #[test]

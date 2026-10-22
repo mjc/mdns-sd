@@ -577,7 +577,7 @@ impl ServiceDaemon {
     /// Returns [`Error::DaemonShutdown`] if the daemon thread has already exited.
     pub fn unregister(&self, fullname: &str) -> Result<Receiver<UnregisterStatus>> {
         let (resp_s, resp_r) = bounded(1);
-        self.send_cmd(Command::Unregister(fullname.to_lowercase(), resp_s))?;
+        self.send_cmd(Command::Unregister(registry_key(fullname), resp_s))?;
         Ok(resp_r)
     }
 
@@ -1226,7 +1226,7 @@ struct Zeroconf {
     /// Active "ResolveHostname" commands.
     ///
     /// The timestamps are set at the future timestamp when the command should timeout.
-    /// `hostname` is case-insensitive and stored in lowercase.
+    /// Hostnames are keyed by their canonical DNS names.
     hostname_resolvers: HashMap<String, (Sender<HostnameResolutionEvent>, Option<Instant>)>, // <hostname, (channel::sender, timeout)>
 
     /// All repeating transmissions.
@@ -2123,11 +2123,11 @@ impl Zeroconf {
     }
 
     fn clear_hostname_retransmissions(&mut self, hostname: &str) {
-        let key = hostname.to_lowercase();
+        let key = registry_key(hostname);
         self.retransmissions.retain(|r| {
             !matches!(
                 &r.command,
-                Command::ResolveHostname(h, _, _, _) if h.to_lowercase() == key
+                Command::ResolveHostname(h, _, _, _) if registry_key(h) == key
             )
         });
     }
@@ -4182,11 +4182,13 @@ impl Zeroconf {
                     );
                 }
 
-                let query_name = q_name.to_lowercase();
+                let query_name = registry_key(q_name);
                 let service_opt = self
                     .my_services
                     .iter()
-                    .find(|(k, _v)| dns_registry.resolve_name(k.as_str()) == query_name)
+                    .find(|(k, _v)| {
+                        registry_key(dns_registry.resolve_name(k.as_str())) == query_name
+                    })
                     .map(|(_, v)| v);
 
                 let Some(service) = service_opt else {
@@ -4445,7 +4447,7 @@ impl Zeroconf {
             Command::StopBrowse(ty_domain) => self.exec_command_stop_browse(ty_domain),
 
             Command::StopResolveHostname(hostname) => {
-                self.exec_command_stop_resolve_hostname(hostname.to_lowercase())
+                self.exec_command_stop_resolve_hostname(registry_key(&hostname))
             }
 
             Command::Resolve(instance, try_count) => self.exec_command_resolve(instance, try_count),
@@ -4689,7 +4691,7 @@ impl Zeroconf {
         // Only add retransmission if it does not exceed the hostname resolver timeout, if any.
         if self
             .hostname_resolvers
-            .get(&hostname.to_lowercase())
+            .get(&registry_key(&hostname))
             .and_then(|(_sender, timeout)| *timeout)
             .map(|timeout| next_time < timeout)
             .unwrap_or(true)
@@ -5673,7 +5675,7 @@ fn prepare_announce(
 }
 
 /// Send an unsolicited response for owned service via `intf` and `sock`.
-/// Returns true if sent out successfully for IPv4 or IPv6.
+/// Reports whether packets were sent and whether the announcement needs a retry.
 fn announce_service_on_intf(
     dns_registry: &mut DnsRegistry,
     info: &ServiceInfo,
