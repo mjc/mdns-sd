@@ -865,7 +865,7 @@ fn an_instance_has_one_found_and_removed_lifetime_across_links() {
                     ServiceEvent::ServiceResolved(service) => Some(service),
                     _ => None,
                 })
-                .last()
+                .next_back()
                 .unwrap();
             assert_eq!(surviving.host, "linked.local.");
             assert_eq!(surviving.port, 8080);
