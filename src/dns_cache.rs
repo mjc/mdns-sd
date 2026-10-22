@@ -68,15 +68,7 @@ impl DnsCache {
     pub(crate) fn set_limits(&mut self, max_records: usize, max_bytes: usize) {
         self.max_records = max_records;
         self.max_bytes = max_bytes;
-        loop {
-            let (records, bytes) = self.usage();
-            if records <= max_records && bytes <= max_bytes {
-                break;
-            }
-            if !self.evict_oldest() {
-                break;
-            }
-        }
+        self.trim_to_limits(max_records, max_bytes);
     }
 
     pub(crate) fn usage(&self) -> (usize, usize) {
@@ -86,6 +78,17 @@ impl DnsCache {
             .fold((0, 0usize), |(count, bytes), record| {
                 (count + 1, bytes.saturating_add(record.charge))
             })
+    }
+
+    fn exceeds_limits(&self, max_records: usize, max_bytes: usize) -> bool {
+        let (records, bytes) = self.usage();
+        records > max_records || bytes > max_bytes
+    }
+
+    fn trim_to_limits(&mut self, max_records: usize, max_bytes: usize) {
+        while self.exceeds_limits(max_records, max_bytes) {
+            self.evict_oldest();
+        }
     }
 
     fn compact(&mut self) {
@@ -100,7 +103,7 @@ impl DnsCache {
         }
     }
 
-    fn evict_oldest(&mut self) -> bool {
+    fn evict_oldest(&mut self) {
         let now = Instant::now();
         let oldest = self
             .records
@@ -118,14 +121,13 @@ impl DnsCache {
             })
             .map(|(key, index, _)| (key.clone(), index));
         let Some((key, index)) = oldest else {
-            return false;
+            return;
         };
         self.records
             .get_mut(&key)
             .expect("selected RRset exists")
             .remove(index);
         self.compact();
-        true
     }
 
     fn records_for(
@@ -168,11 +170,7 @@ impl DnsCache {
             records.sort_by_key(|record| record.src_intf.index);
         }
         records.retain(|record| !record.record.get_record().is_expired(now));
-        if records.is_empty() {
-            None
-        } else {
-            Some(records)
-        }
+        (!records.is_empty()).then_some(records)
     }
 
     pub(crate) fn records_on_intf(&self, index: u32) -> Vec<&DnsRecordIntf> {
@@ -411,15 +409,7 @@ impl DnsCache {
         if self.max_records == 0 || charge > self.max_bytes {
             return None;
         }
-        loop {
-            let (count, bytes) = self.usage();
-            if count < self.max_records && charge <= self.max_bytes.saturating_sub(bytes) {
-                break;
-            }
-            if !self.evict_oldest() {
-                return None;
-            }
-        }
+        self.trim_to_limits(self.max_records - 1, self.max_bytes - charge);
         let records = self.records.entry(key).or_default();
         if incoming.get_cache_flush() {
             apply_cache_flush(records, Instant::now());
