@@ -172,6 +172,7 @@ mod log {
 }
 
 mod dns_cache;
+mod dns_name;
 mod dns_parser;
 mod error;
 mod service_daemon;
