@@ -64,7 +64,7 @@ fn repeated_ptr_refreshes_keep_one_record_and_one_live_deadline() {
             vec![DnsPointer::new(TY, RRType::PTR, CLASS_IN, 4500, format!("fixed.{TY}")).boxed()],
         );
         assert_eq!(daemon.cache.ptr_count(), 1);
-        assert_eq!(daemon.cache.usage().0, 1);
+        assert_eq!(daemon.cache.record_count(), 1);
         assert_eq!(daemon.scheduled_deadlines(), baseline + 1);
     }
 }
@@ -93,7 +93,7 @@ fn parsed_orphan_records_expire_without_discovery_subscriptions() {
     );
     daemon.cache.age_records(Duration::from_secs(121));
     daemon.cache.evict_expired(Instant::now());
-    assert_eq!(daemon.cache.usage(), (0, 0));
+    assert_eq!(daemon.cache.record_count(), 0);
     assert_eq!(daemon.scheduled_deadlines(), baseline);
 }
 
@@ -124,7 +124,7 @@ fn resolved_batches_leave_no_delivery_or_pending_resolution_history() {
         );
         daemon.cache.age_records(Duration::from_secs(121));
         daemon.expire_cache(Instant::now());
-        assert_eq!(daemon.cache.usage(), (0, 0));
+        assert_eq!(daemon.cache.record_count(), 0);
         assert!(daemon.resolved.is_empty());
         assert!(daemon.pending_resolves.is_empty());
         assert!(!daemon

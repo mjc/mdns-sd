@@ -55,7 +55,6 @@ pub(crate) struct CacheEviction {
 pub(crate) struct DnsRecordIntf {
     pub(crate) record: DnsRecordBox,
     pub(crate) src_intf: InterfaceId,
-    charge: usize,
 }
 
 /// A cache for all types of DNS records.
@@ -74,10 +73,6 @@ pub(crate) struct DnsCache {
 
     /// Negative responses indexed by canonical owner name.
     nsec: HashMap<String, Vec<DnsRecordIntf>>,
-    record_count: usize,
-    charged_bytes: usize,
-    max_records: usize,
-    max_bytes: usize,
 }
 
 impl DnsCache {
@@ -88,10 +83,6 @@ impl DnsCache {
             txt: HashMap::new(),
             addr: HashMap::new(),
             nsec: HashMap::new(),
-            record_count: 0,
-            charged_bytes: 0,
-            max_records: 4096,
-            max_bytes: 4 * 1024 * 1024,
         }
     }
 
@@ -150,34 +141,8 @@ impl DnsCache {
             .len()
     }
 
-    #[cfg(test)]
-    /// Limits retained record count and charged data bytes, excluding allocator overhead.
-    pub(crate) fn set_limits(&mut self, max_records: usize, max_bytes: usize) {
-        self.max_records = max_records;
-        self.max_bytes = max_bytes;
-        self.trim_to_limits(max_records, max_bytes);
-    }
-
-    /// Returns the retained record count and charged bytes, excluding allocator overhead.
-    pub(crate) fn usage(&self) -> (usize, usize) {
-        (self.record_count, self.charged_bytes)
-    }
-
-    fn trim_to_limits(&mut self, max_records: usize, max_bytes: usize) -> bool {
-        let mut changed = false;
-        while self.record_count > max_records || self.charged_bytes > max_bytes {
-            if !self.evict_oldest() {
-                if changed {
-                    self.compact();
-                }
-                return false;
-            }
-            changed = true;
-        }
-        if changed {
-            self.compact();
-        }
-        true
+    pub(crate) fn record_count(&self) -> usize {
+        self.records().count()
     }
 
     fn compact(&mut self) {
@@ -195,55 +160,13 @@ impl DnsCache {
     }
 
     fn retain_records(&mut self, mut retain: impl FnMut(&DnsRecordIntf) -> bool) {
-        let mut removed_count = 0;
-        let mut removed_bytes = 0;
         for table in self.tables_mut() {
             table.retain(|_, records| {
-                records.retain(|record| {
-                    let keep = retain(record);
-                    if !keep {
-                        removed_count += 1;
-                        removed_bytes += record.charge;
-                    }
-                    keep
-                });
+                records.retain(&mut retain);
                 !records.is_empty()
             });
         }
-        self.record_count -= removed_count;
-        self.charged_bytes -= removed_bytes;
         self.compact();
-    }
-
-    fn evict_oldest(&mut self) -> bool {
-        let now = Instant::now();
-        let oldest = IntoIterator::into_iter(self.tables())
-            .flat_map(|table| table.iter())
-            .flat_map(|(name, records)| {
-                records
-                    .iter()
-                    .enumerate()
-                    .map(move |(index, record)| (name, index, record))
-            })
-            .min_by_key(|(_, _, record)| {
-                (
-                    !record.record.get_record().is_expired(now),
-                    record.record.get_created(),
-                )
-            })
-            .map(|(name, index, record)| (record.record.get_type(), name.clone(), index));
-        let Some((ty, name, index)) = oldest else {
-            return false;
-        };
-        let record = self
-            .table_mut(ty)
-            .unwrap()
-            .get_mut(&name)
-            .unwrap()
-            .remove(index);
-        self.record_count -= 1;
-        self.charged_bytes -= record.charge;
-        true
     }
 
     /// Returns unexpired IN-class records, optionally restricted to one interface.
@@ -487,9 +410,7 @@ impl DnsCache {
     /// Update a DNSRecord TTL if already exists, otherwise insert a new record.
     ///
     /// Returns the cached record and `true` for insertion or `false` for a TTL refresh.
-    /// Returns `None` for records that are not for us, unsupported types or classes,
-    /// or a new record that cannot fit within the cache limits. A refresh keeps
-    /// the existing record's data charge and does not evict other records.
+    /// Returns `None` for records that are not for us or have unsupported types or classes.
     pub(crate) fn add_or_update(
         &mut self,
         intf: &MyIntf,
@@ -520,15 +441,6 @@ impl DnsCache {
         if !is_for_us {
             return None;
         }
-        let charge = incoming.cache_charge();
-        if self.max_records == 0 || charge > self.max_bytes {
-            return None;
-        }
-        if !self.trim_to_limits(self.max_records - 1, self.max_bytes - charge) {
-            return None;
-        }
-        self.record_count += 1;
-        self.charged_bytes += charge;
         let records = self.table_mut(ty).unwrap().entry(name).or_default();
         if incoming.get_cache_flush() {
             apply_cache_flush(&incoming, records, intf.index);
@@ -538,7 +450,6 @@ impl DnsCache {
             DnsRecordIntf {
                 record: incoming,
                 src_intf: intf.into(),
-                charge,
             },
         );
         Some((&records[0], true))
@@ -1542,64 +1453,6 @@ mod tests {
     }
 
     #[test]
-    fn long_lived_distinct_records_obey_cache_limits() {
-        let intf = make_intf("en0", 1);
-        let mut cache = DnsCache::new();
-        cache.set_limits(8, 1024);
-        for version in 0..100 {
-            let name = format!("service-{version}._http._tcp.local.");
-            cache.add_or_update(
-                &intf,
-                DnsTxt::new(&name, CLASS_IN, 86400, vec![0]).boxed(),
-                true,
-            );
-            let (records, bytes) = cache.usage();
-            assert!(records <= 8);
-            assert!(bytes <= 1024);
-        }
-        assert_eq!(cache.txt_count(), 8);
-        assert!(cache
-            .get_txt_on_intf("service-0._http._tcp.local.", 1)
-            .is_none());
-        assert!(cache
-            .get_txt_on_intf("service-99._http._tcp.local.", 1)
-            .is_some());
-        cache.set_limits(2, 1024);
-        assert_eq!(cache.txt_count(), 2);
-        cache.set_limits(0, 0);
-        assert!(cache.tables().iter().all(|table| table.is_empty()));
-    }
-
-    #[test]
-    fn oversized_records_are_rejected_without_evicting_existing_data() {
-        let intf = make_intf("en0", 1);
-        let mut cache = DnsCache::new();
-        cache.set_limits(8, 128);
-        cache.add_or_update(
-            &intf,
-            DnsTxt::new("small.local.", CLASS_IN, 120, vec![0]).boxed(),
-            true,
-        );
-        let before = cache.usage();
-        assert!(cache
-            .add_or_update(
-                &intf,
-                DnsTxt::new("large.local.", CLASS_IN, 120, vec![0; 1024]).boxed(),
-                true
-            )
-            .is_none());
-        assert_eq!(cache.usage(), before);
-        for _ in 0..100 {
-            cache.add_or_update(
-                &intf,
-                DnsTxt::new("SMALL.local.", CLASS_IN, 120, vec![0]).boxed(),
-                true,
-            );
-            assert_eq!(cache.usage(), before);
-        }
-    }
-
-    #[test]
     fn unrelated_types_under_interested_names_do_not_schedule_refresh() {
         let intf = make_intf("en0", 1);
         let mut cache = DnsCache::new();
@@ -1636,31 +1489,5 @@ mod tests {
         );
         assert_eq!(cache.next_deadline(now, &[ty], &[]), Some(expiry));
         assert!(expiry > now);
-    }
-
-    #[test]
-    fn capacity_prefers_expired_records_over_older_live_records() {
-        let intf = make_intf("en0", 1);
-        let mut cache = DnsCache::new();
-        cache.set_limits(2, 1024);
-        cache.add_or_update(
-            &intf,
-            DnsTxt::new("older.local.", CLASS_IN, 120, vec![0]).boxed(),
-            true,
-        );
-        cache.add_or_update(
-            &intf,
-            DnsTxt::new("expired.local.", CLASS_IN, 1, vec![0]).boxed(),
-            true,
-        );
-        cache.age_records(Duration::from_secs(2));
-        cache.add_or_update(
-            &intf,
-            DnsTxt::new("new.local.", CLASS_IN, 120, vec![0]).boxed(),
-            true,
-        );
-        assert!(cache.get_txt_on_intf("older.local.", 1).is_some());
-        assert!(cache.get_txt_on_intf("new.local.", 1).is_some());
-        assert_eq!(cache.usage().0, 2);
     }
 }

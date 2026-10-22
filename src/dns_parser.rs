@@ -690,20 +690,6 @@ pub trait DnsRecordExt: fmt::Debug {
     /// Returns whether `other` record has the same rdata.
     fn rrdata_match(&self, other: &dyn DnsRecordExt) -> bool;
 
-    /// Returns the cache charge in bytes for the owner presentation, RR header
-    /// and uncompressed RDATA, excluding allocator overhead.
-    /// Returns `usize::MAX` if the RDATA cannot be encoded.
-    fn cache_charge(&self) -> usize {
-        let mut packet = DnsOutPacket::new(usize::MAX);
-        if self.write(&mut packet).is_err() {
-            return usize::MAX;
-        }
-        self.get_name()
-            .len()
-            .saturating_add(10)
-            .saturating_add(packet.size().saturating_sub(MSG_HEADER_LEN))
-    }
-
     /// Returns the result based on a byte-level comparison of `rdata`.
     /// If `other` is not valid, returns `Greater`.
     fn compare_rdata(&self, other: &dyn DnsRecordExt) -> cmp::Ordering;
@@ -3051,21 +3037,6 @@ mod tests {
             incoming.answers()[0].get_record().get_refresh_time()
         );
         assert!(original.matches(incoming.answers()[0].as_ref()));
-    }
-
-    #[test]
-    fn test_cache_charge_counts_owned_name_and_serialized_data() {
-        let name = "printer.local.";
-        let txt = DnsTxt::new(name, CLASS_IN, 120, vec![3, b'k', b'=', b'v']);
-        assert_eq!(txt.cache_charge(), name.len() + 10 + 4);
-        let ptr = DnsPointer::new(
-            "_http._tcp.local.",
-            RRType::PTR,
-            CLASS_IN,
-            120,
-            r"A\.B.local.".to_string(),
-        );
-        assert_eq!(ptr.cache_charge(), "_http._tcp.local.".len() + 10 + 11);
     }
 
     /// Found by fuzzing the packet parser.

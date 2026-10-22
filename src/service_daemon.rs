@@ -1354,7 +1354,7 @@ impl Zeroconf {
                 .map(|r| r.probing.len() + r.last_multicast_v4.len() + r.last_multicast_v6.len())
                 .sum::<usize>()
             + usize::from(self.next_ip_check.is_some())
-            + self.cache.usage().0
+            + self.cache.record_count()
     }
 
     fn cancel_registration_resends(&mut self, fullname: &str) {
