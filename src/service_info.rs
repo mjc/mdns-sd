@@ -1407,13 +1407,22 @@ fn rate_limit_key(record: &DnsRecordBox) -> String {
 
 /// Returns a tuple of (service_type_domain, optional_sub_domain)
 pub(crate) fn split_sub_domain(domain: &str) -> (&str, Option<&str>) {
-    if let Some((_, ty_domain)) = domain.rsplit_once("._sub.") {
-        (ty_domain, Some(domain))
-    } else {
-        (domain, None)
+    let bytes = domain.as_bytes();
+    for index in (0..bytes.len().saturating_sub(5)).rev() {
+        if !bytes[index..index + 6].eq_ignore_ascii_case(b"._sub.") {
+            continue;
+        }
+        let escapes = bytes[..index]
+            .iter()
+            .rev()
+            .take_while(|byte| **byte == b'\\')
+            .count();
+        if escapes % 2 == 0 {
+            return (&domain[index + 6..], Some(domain));
+        }
     }
+    (domain, None)
 }
-
 /// Returns true if `addr` is a unicast link-local IPv6 address.
 /// Replicates the logic from `std::net::Ipv6Addr::is_unicast_link_local()`, which is not
 /// stable on the current mdns-sd Rust version (1.71.0).

@@ -210,7 +210,7 @@ impl fmt::Display for ScopedIp {
 /// DNS resource record types, stored as `u16`. Can do `as u16` when needed.
 ///
 /// See [RFC 1035 section 3.2.2](https://datatracker.ietf.org/doc/html/rfc1035#section-3.2.2)
-#[derive(Debug, PartialEq, Eq, Clone, Copy, PartialOrd, Ord)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
 #[repr(u16)]
 pub enum RRType {
@@ -655,6 +655,17 @@ impl PartialEq for DnsRecord {
 
 /// Common methods for DNS resource records.
 pub trait DnsRecordExt: fmt::Debug {
+    fn cache_charge(&self) -> usize {
+        let mut packet = DnsOutPacket::new(usize::MAX);
+        if self.write(&mut packet).is_err() {
+            return usize::MAX;
+        }
+        self.get_name()
+            .len()
+            .saturating_add(10)
+            .saturating_add(packet.size().saturating_sub(MSG_HEADER_LEN))
+    }
+
     fn get_record(&self) -> &DnsRecord;
     fn get_record_mut(&mut self) -> &mut DnsRecord;
     /// Writes the rdata of this record into `packet`.
