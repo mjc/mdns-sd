@@ -1735,6 +1735,7 @@ fn test_cache_flush_srv() {
 
     // Browse for the updated SRV record
     let timeout = Duration::from_secs(2);
+    resolved = false;
     let mut removed = false;
     while let Ok(event) = browse_chan.recv_timeout(timeout) {
         println!("Received event {:?}", event);

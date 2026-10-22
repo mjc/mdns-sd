@@ -1394,6 +1394,15 @@ impl DnsRegistry {
             .collect();
         self.name_changes.retain(|name, _| originals.contains(name));
 
+        let published_hosts: HashSet<_> = services
+            .iter()
+            .filter(|service| {
+                !service.get_addrs_on_my_intf_v4(intf).is_empty()
+                    || !service.get_addrs_on_my_intf_v6(intf).is_empty()
+            })
+            .map(|service| registry_key(self.resolve_name(service.get_hostname())))
+            .collect();
+
         let mut proposals: HashMap<String, NameProposal> = HashMap::new();
         for (service, publish_instance) in services
             .iter()
@@ -1410,6 +1419,11 @@ impl DnsRegistry {
             }
             let fullname = self.resolve_name(service.get_fullname());
             let hostname = self.resolve_name(service.get_hostname());
+            // A staged update must not change an RRset that is already published
+            // by another registration. Its addresses join that set at commit.
+            if !publish_instance && published_hosts.contains(&registry_key(hostname)) {
+                continue;
+            }
             if publish_instance {
                 let mut srv = DnsSrv::new(
                     service.get_fullname(),

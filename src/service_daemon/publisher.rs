@@ -488,4 +488,106 @@ mod tests {
         assert_eq!(updates.len(), 1);
         assert_eq!(updates[0].get_record().get_ttl(), 60);
     }
+
+    #[test]
+    fn staged_shared_hostname_addresses_wait_for_commit_on_every_link() {
+        use super::super::lifecycle_tests::{daemon, service, unregister};
+        use if_addrs::Ifv4Addr;
+
+        let (mut daemon, first_link) = daemon();
+        let second_link = first_link + 100_000;
+        let second = MyIntf {
+            index: second_link,
+            name: "second-link".to_string(),
+            max_packet_size_v4: MAX_PKT_DEFAULT,
+            max_packet_size_v6: MAX_PKT_DEFAULT,
+            addrs: HashSet::from([IfAddr::V4(Ifv4Addr {
+                ip: Ipv4Addr::new(10, 92, 0, 1),
+                netmask: Ipv4Addr::new(255, 255, 255, 0),
+                broadcast: None,
+                prefixlen: 24,
+            })]),
+        };
+        daemon.my_intfs.insert(second_link, second);
+        let shared = service("shared", "b.local.", "127.0.0.1", "A");
+        let original = service("moving", "a.local.", "127.0.0.1,10.92.0.1", "A");
+        let fullname = registry_key(original.get_fullname());
+        daemon
+            .my_services
+            .insert(registry_key(shared.get_fullname()), shared);
+        daemon
+            .my_services
+            .insert(fullname.clone(), original.clone());
+        daemon.reconcile_registries();
+        // Establish the fixture on two links without using a nonexistent OS interface.
+        for registry in daemon.dns_registry_map.values_mut() {
+            let names: Vec<_> = registry.probing.keys().cloned().collect();
+            for name in names {
+                registry.complete_probe(&name).unwrap();
+            }
+        }
+
+        for host in ["b.local.", "c.local.", "b.local."] {
+            daemon.register_service(service("moving", host, "127.0.0.2,10.92.0.1", "B"));
+            assert_eq!(daemon.pending_registrations.len(), 1);
+            assert_eq!(daemon.my_services[&fullname].get_hostname(), "a.local.");
+            assert_eq!(
+                daemon.dns_registry_map[&first_link].host_addresses("b.local."),
+                vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]
+            );
+        }
+        daemon.register_service(original);
+        assert!(daemon.pending_registrations.is_empty());
+        assert!(!daemon.dns_registry_map[&second_link]
+            .probing
+            .contains_key("b.local."));
+        assert_eq!(
+            daemon.dns_registry_map[&first_link].host_addresses("b.local."),
+            vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]
+        );
+
+        daemon.register_service(service("moving", "b.local.", "127.0.0.3,10.92.0.1", "C"));
+        daemon
+            .dns_registry_map
+            .get_mut(&second_link)
+            .unwrap()
+            .complete_probe("b.local.")
+            .unwrap();
+        daemon.reconcile_registries();
+        assert!(daemon.dns_registry_map[&second_link].is_claimed("b.local."));
+        assert_eq!(
+            daemon.dns_registry_map[&first_link].host_addresses("b.local."),
+            vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]
+        );
+        let before = daemon.publication_snapshot();
+        daemon.commit_ready_registrations();
+        assert!(daemon.pending_registrations.is_empty());
+        assert_eq!(daemon.my_services[&fullname].get_hostname(), "b.local.");
+        assert_eq!(
+            daemon.dns_registry_map[&first_link].host_addresses("b.local."),
+            vec![
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                IpAddr::V4(Ipv4Addr::new(127, 0, 0, 3))
+            ]
+        );
+        let after = daemon.publication_snapshot();
+        let (withdrawals, updates, _) =
+            publication_delta(&before[&first_link], &after[&first_link]);
+        let address_updates: Vec<_> = updates
+            .iter()
+            .filter(|record| {
+                record.get_type() == RRType::A && names_equal(record.get_name(), "b.local.")
+            })
+            .collect();
+        assert_eq!(address_updates.len(), 2);
+        assert!(!withdrawals
+            .iter()
+            .any(|record| names_equal(record.get_name(), "b.local.")));
+        unregister(&mut daemon, &fullname);
+        unregister(&mut daemon, "shared._lifecycle._tcp.local.");
+        assert!(daemon
+            .dns_registry_map
+            .values()
+            .all(|registry| registry.active.is_empty() && registry.probing.is_empty()));
+    }
 }
