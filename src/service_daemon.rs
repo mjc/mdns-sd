@@ -186,10 +186,6 @@ enum Counter {
     CachedTxt,
     CachedNSec,
     CachedSubtype,
-    CachedRecords,
-    CachedBytes,
-    Resolved,
-    PendingResolves,
     DnsRegistryProbe,
     DnsRegistryActive,
     DnsRegistryTimer,
@@ -217,10 +213,6 @@ impl fmt::Display for Counter {
             Self::CachedTxt => write!(f, "cached-txt"),
             Self::CachedNSec => write!(f, "cached-nsec"),
             Self::CachedSubtype => write!(f, "cached-subtype"),
-            Self::CachedRecords => write!(f, "cached-records"),
-            Self::CachedBytes => write!(f, "cached-bytes"),
-            Self::Resolved => write!(f, "resolved"),
-            Self::PendingResolves => write!(f, "pending-resolves"),
             Self::DnsRegistryProbe => write!(f, "dns-registry-probe"),
             Self::DnsRegistryActive => write!(f, "dns-registry-active"),
             Self::DnsRegistryTimer => write!(f, "dns-registry-timer"),
@@ -339,14 +331,6 @@ fn enqueue_and_wake(sender: &Sender<Command>, waker: &Waker, cmd: Command) -> Re
 }
 
 impl ServiceDaemon {
-    /// Limits cached record count and retained data bytes.
-    pub fn set_cache_limits(&self, max_records: usize, max_bytes: usize) -> Result<()> {
-        self.send_cmd(Command::SetOption(DaemonOption::CacheLimits(
-            max_records,
-            max_bytes,
-        )))
-    }
-
     /// Creates a new daemon and spawns a thread to run the daemon.
     ///
     /// Creates a new mDNS service daemon using the default port (5353).
@@ -1882,11 +1866,6 @@ impl Zeroconf {
             DaemonOption::MulticastLoopV4(on) => self.set_multicast_loop_v4(on),
             DaemonOption::MulticastLoopV6(on) => self.set_multicast_loop_v6(on),
             DaemonOption::AcceptUnsolicited(accept) => self.set_accept_unsolicited(accept),
-            DaemonOption::CacheLimits(records, bytes) => {
-                self.expire_cache(Instant::now());
-                self.cache.set_limits(records, bytes);
-                self.reconcile_browse_state();
-            }
             DaemonOption::IncludeAppleP2P(enable) => self.set_apple_p2p(enable),
             #[cfg(test)]
             DaemonOption::TestDownInterface(ifname) => {
@@ -4038,11 +4017,6 @@ impl Zeroconf {
         self.set_counter(Counter::CachedTxt, self.cache.txt_count() as i64);
         self.set_counter(Counter::CachedNSec, self.cache.nsec_count() as i64);
         self.set_counter(Counter::CachedSubtype, self.cache.subtype_count() as i64);
-        let (cached_records, cached_bytes) = self.cache.usage();
-        self.set_counter(Counter::CachedRecords, cached_records as i64);
-        self.set_counter(Counter::CachedBytes, cached_bytes as i64);
-        self.set_counter(Counter::Resolved, self.resolved.len() as i64);
-        self.set_counter(Counter::PendingResolves, self.pending_resolves.len() as i64);
         self.set_counter(Counter::Timer, self.scheduled_deadlines() as i64);
 
         let dns_registry_probe_count: usize = self
@@ -4816,7 +4790,6 @@ enum DaemonOption {
     MulticastLoopV6(bool),
     AcceptUnsolicited(bool),
     IncludeAppleP2P(bool),
-    CacheLimits(usize, usize),
     #[cfg(test)]
     TestDownInterface(String),
     #[cfg(test)]

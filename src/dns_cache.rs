@@ -150,6 +150,7 @@ impl DnsCache {
             .len()
     }
 
+    #[cfg(test)]
     /// Limits retained record count and charged data bytes, excluding allocator overhead.
     pub(crate) fn set_limits(&mut self, max_records: usize, max_bytes: usize) {
         self.max_records = max_records;
