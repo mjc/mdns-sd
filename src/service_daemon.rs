@@ -1214,8 +1214,6 @@ struct Zeroconf {
 
     verifications: HashMap<String, Instant>,
 
-    conflicts: std::collections::VecDeque<Instant>,
-
     /// Received DNS records.
     cache: DnsCache,
 
@@ -1412,26 +1410,6 @@ fn same_resolution(left: &ResolvedService, right: &ResolvedService) -> bool {
         && left.sub_ty_domain == right.sub_ty_domain
 }
 
-fn merge_scoped_address(addresses: &mut HashSet<ScopedIp>, incoming: ScopedIp) {
-    if let ScopedIp::V4(v4) = &incoming {
-        if let Some(mut existing) = addresses
-            .iter()
-            .find(|addr| addr.to_ip_addr() == incoming.to_ip_addr())
-            .cloned()
-        {
-            addresses.remove(&existing);
-            if let ScopedIp::V4(value) = &mut existing {
-                for id in v4.interface_ids() {
-                    value.add_interface_id(id.clone());
-                }
-            }
-            addresses.insert(existing);
-            return;
-        }
-    }
-    addresses.insert(incoming);
-}
-
 fn schedule_register_resend(
     retransmissions: &mut Vec<ReRun>,
     fullname: &str,
@@ -1467,57 +1445,41 @@ fn publication_delta(
     previous: &[DnsRecordBox],
     current: &[DnsRecordBox],
 ) -> (Vec<DnsRecordBox>, Vec<DnsRecordBox>, HashSet<RrsetKey>) {
-    let group = |records: &[DnsRecordBox]| -> HashMap<RrsetKey, Vec<DnsRecordBox>> {
-        let mut groups = HashMap::<_, Vec<_>>::new();
-        for record in records {
-            groups
-                .entry(RrsetKey::new(record.as_ref()))
-                .or_default()
-                .push(record.clone());
-        }
-        groups
+    let unchanged = |record: &DnsRecordBox, records: &[DnsRecordBox]| {
+        records.iter().any(|other| {
+            record.matches(other.as_ref())
+                && record.get_record().get_ttl() == other.get_record().get_ttl()
+        })
     };
-    let old_groups = group(previous);
-    let new_groups = group(current);
-    let withdrawals: Vec<_> = previous
+    let changed: HashSet<_> = previous
         .iter()
-        .filter(|old| {
-            if old.get_type() == RRType::PTR {
-                !current.iter().any(|new| old.matches(new.as_ref()))
-            } else {
-                !new_groups.contains_key(&RrsetKey::new(old.as_ref()))
-            }
+        .filter(|record| !unchanged(record, current))
+        .chain(current.iter().filter(|record| !unchanged(record, previous)))
+        .map(|record| RrsetKey::new(record.as_ref()))
+        .collect();
+    let withdrawals = previous
+        .iter()
+        .filter(|record| {
+            !current.iter().any(|other| {
+                if record.get_type() == RRType::PTR {
+                    record.matches(other.as_ref())
+                } else {
+                    record.same_rrset(other.as_ref())
+                }
+            })
         })
         .cloned()
         .collect();
-    let mut updates = Vec::new();
-    for (key, records) in new_groups {
-        if key.rr_type == RRType::PTR {
-            updates.extend(records.into_iter().filter(|record| {
-                !previous.iter().any(|old| {
-                    old.matches(record.as_ref())
-                        && old.get_record().get_ttl() == record.get_record().get_ttl()
-                })
-            }));
-        } else {
-            let unchanged = old_groups.get(&key).is_some_and(|old| {
-                old.len() == records.len()
-                    && records.iter().all(|record| {
-                        old.iter().any(|old| {
-                            old.matches(record.as_ref())
-                                && old.get_record().get_ttl() == record.get_record().get_ttl()
-                        })
-                    })
-            });
-            if !unchanged {
-                updates.extend(records);
-            }
-        }
-    }
-    let changed = withdrawals
+    let updates = current
         .iter()
-        .chain(&updates)
-        .map(|record| RrsetKey::new(record.as_ref()))
+        .filter(|record| {
+            if record.get_type() == RRType::PTR {
+                !unchanged(record, previous)
+            } else {
+                changed.contains(&RrsetKey::new(record.as_ref()))
+            }
+        })
+        .cloned()
         .collect();
     (withdrawals, updates, changed)
 }
@@ -1819,107 +1781,41 @@ impl Zeroconf {
             }
         }
         let cached = self.cache.records_on_intf(index);
-        loop {
-            let mut dependencies = Vec::new();
+        for ty in [RRType::PTR, RRType::SRV] {
             for record in cached
                 .iter()
-                .map(|r| r.record.as_ref())
-                .chain(incoming.iter().map(|r| r.as_ref()))
+                .map(|record| record.record.as_ref())
+                .chain(incoming.iter().map(|record| record.as_ref()))
+                .filter(|record| {
+                    record.get_type() == ty
+                        && record.get_class() == CLASS_IN
+                        && !record.get_record().is_expired(now)
+                })
             {
-                if record.get_class() != CLASS_IN || record.get_record().is_expired(now) {
-                    continue;
-                }
                 let owner = CanonicalName::new(record.get_name());
-                let subtype_for_browser = if record.get_type() == RRType::PTR {
+                if ty == RRType::PTR {
                     let (base, subtype) = crate::service_info::split_sub_domain(owner.as_str());
-                    subtype.is_some()
+                    if subtype.is_some()
                         && questions.contains(&(CanonicalName::new(base), RRType::PTR))
-                } else {
-                    false
-                };
-                if subtype_for_browser {
-                    dependencies.push((owner.clone(), RRType::PTR));
+                    {
+                        questions.insert((owner.clone(), RRType::PTR));
+                    }
                 }
-                if !subtype_for_browser && !questions.contains(&(owner, record.get_type())) {
+                if !questions.contains(&(owner, ty)) {
                     continue;
                 }
                 if let Some(ptr) = record.any().downcast_ref::<DnsPointer>() {
-                    if CanonicalName::new(record.get_name()).as_str() == SERVICE_TYPE_ENUMERATION {
-                        continue;
+                    if CanonicalName::new(record.get_name()).as_str() != SERVICE_TYPE_ENUMERATION {
+                        questions.insert((CanonicalName::new(ptr.alias()), RRType::SRV));
+                        questions.insert((CanonicalName::new(ptr.alias()), RRType::TXT));
                     }
-                    dependencies.push((CanonicalName::new(ptr.alias()), RRType::SRV));
-                    dependencies.push((CanonicalName::new(ptr.alias()), RRType::TXT));
                 } else if let Some(srv) = record.any().downcast_ref::<DnsSrv>() {
-                    dependencies.push((CanonicalName::new(srv.host()), RRType::A));
-                    dependencies.push((CanonicalName::new(srv.host()), RRType::AAAA));
+                    questions.insert((CanonicalName::new(srv.host()), RRType::A));
+                    questions.insert((CanonicalName::new(srv.host()), RRType::AAAA));
                 }
-            }
-            let before = questions.len();
-            questions.extend(dependencies);
-            if questions.len() == before {
-                break;
             }
         }
         questions
-    }
-
-    fn resolve_service_on_intf(
-        &self,
-        ty_domain: &str,
-        fullname: &str,
-        index: u32,
-    ) -> ResolvedService {
-        let display_fullname = self
-            .cache
-            .pointers(ty_domain, Some(index))
-            .find(|(_, ptr)| CanonicalName::new(ptr.alias()) == CanonicalName::new(fullname))
-            .map(|(_, ptr)| ptr.alias().to_string())
-            .unwrap_or_else(|| fullname.to_string());
-        let mut resolved_service = ResolvedService {
-            ty_domain: ty_domain.to_string(),
-            sub_ty_domain: None,
-            fullname: display_fullname,
-            host: String::new(),
-            port: 0,
-            addresses: HashSet::new(),
-            txt_properties: TxtProperties::new(),
-        };
-
-        resolved_service.sub_ty_domain = self
-            .cache
-            .subtypes(fullname, Some(index))
-            .into_iter()
-            .next()
-            .map(str::to_string);
-        if let Some(srv) = self
-            .cache
-            .get_srv_on_intf(fullname, index)
-            .into_iter()
-            .flatten()
-            .find_map(|record| record.record.any().downcast_ref::<DnsSrv>())
-        {
-            resolved_service.host = srv.host().to_string();
-            resolved_service.port = srv.port();
-        }
-        if let Some(txt) = self
-            .cache
-            .get_txt_on_intf(fullname, index)
-            .into_iter()
-            .flatten()
-            .find_map(|record| record.record.any().downcast_ref::<DnsTxt>())
-        {
-            resolved_service.txt_properties = txt.text().into();
-        }
-        for address in self
-            .cache
-            .get_addr_on_intf(&resolved_service.host, index)
-            .into_iter()
-            .flatten()
-            .filter_map(|record| record.record.any().downcast_ref::<DnsAddress>())
-        {
-            merge_scoped_address(&mut resolved_service.addresses, address.address());
-        }
-        resolved_service
     }
 
     fn unresolved_questions(&self, instance: &str) -> HashSet<(u32, String, RRType)> {
@@ -1976,7 +1872,7 @@ impl Zeroconf {
                 } else if ty == SERVICE_TYPE_ENUMERATION {
                     None
                 } else {
-                    let current = self.resolve_service_from_cache(ty, instance);
+                    let current = self.resolve_service_from_cache(ty, delivery.fullname());
                     match delivery {
                         BrowseDelivery::Found(_) if current.is_valid() => {
                             Some(ServiceEvent::ServiceResolved(Box::new(current)))
@@ -2140,7 +2036,6 @@ impl Zeroconf {
             my_services: HashMap::new(),
             pending_registrations: HashMap::new(),
             verifications: HashMap::new(),
-            conflicts: std::collections::VecDeque::new(),
             cache: DnsCache::new(),
             dns_registry_map,
             hostname_resolvers: HashMap::new(),
@@ -3713,37 +3608,87 @@ impl Zeroconf {
 
     /// Creates a `ResolvedService` from the cache.
     fn resolve_service_from_cache(&self, ty_domain: &str, fullname: &str) -> ResolvedService {
-        let mut scopes: Vec<_> = self
+        let now = Instant::now();
+        let mut resolved_service = ResolvedService {
+            ty_domain: ty_domain.to_string(),
+            sub_ty_domain: None,
+            fullname: fullname.to_string(),
+            host: String::new(),
+            port: 0,
+            addresses: HashSet::new(),
+            txt_properties: TxtProperties::new(),
+        };
+
+        resolved_service.sub_ty_domain = self
             .cache
-            .pointers(ty_domain, None)
-            .filter(|(_, ptr)| CanonicalName::new(ptr.alias()) == CanonicalName::new(fullname))
-            .map(|(record, _)| record.src_intf.index)
-            .collect();
-        scopes.sort_unstable();
-        scopes.dedup();
-        let mut result: Option<ResolvedService> = None;
-        for scope in scopes {
-            let service = self.resolve_service_on_intf(ty_domain, fullname, scope);
-            if !service.is_valid() {
-                continue;
+            .subtypes(fullname, None)
+            .first()
+            .map(|subtype| subtype.to_string());
+
+        // resolve SRV record
+        if let Some(records) = self.cache.get_srv(fullname) {
+            if let Some(answer) = records
+                .iter()
+                .find(|r| !r.record.get_record().is_expired(now))
+            {
+                if let Some(dns_srv) = answer.record.any().downcast_ref::<DnsSrv>() {
+                    resolved_service.host = dns_srv.host().to_string();
+                    resolved_service.port = dns_srv.port();
+                }
             }
-            if let Some(current) = &mut result {
-                if current.host.eq_ignore_ascii_case(&service.host)
-                    && current.port == service.port
-                    && current.txt_properties == service.txt_properties
-                {
-                    for address in service.addresses {
-                        merge_scoped_address(&mut current.addresses, address);
+        }
+
+        // resolve TXT record
+        if let Some(records) = self.cache.get_txt(fullname) {
+            if let Some(record) = records
+                .iter()
+                .find(|r| !r.record.get_record().is_expired(now))
+            {
+                if let Some(dns_txt) = record.record.any().downcast_ref::<DnsTxt>() {
+                    resolved_service.txt_properties = dns_txt.text().into();
+                }
+            }
+        }
+
+        // resolve A and AAAA records
+        if let Some(records) = self.cache.get_addr(&resolved_service.host) {
+            for answer in records.iter() {
+                if let Some(dns_a) = answer.record.any().downcast_ref::<DnsAddress>() {
+                    if dns_a.get_record().is_expired(now) {
+                        trace!(
+                            "Addr expired or expires soon: {}",
+                            dns_a.address().to_ip_addr()
+                        );
+                    } else {
+                        let scoped = dns_a.address();
+                        if let ScopedIp::V4(v4) = &scoped {
+                            // Merge interface_ids if this V4 addr already exists.
+                            // Linear scan by IP since Eq/Hash include interface_ids.
+                            let existing = resolved_service
+                                .addresses
+                                .iter()
+                                .find(|a| a.to_ip_addr() == IpAddr::V4(*v4.addr()))
+                                .cloned();
+                            if let Some(mut existing) = existing {
+                                resolved_service.addresses.remove(&existing);
+                                if let ScopedIp::V4(existing_v4) = &mut existing {
+                                    for id in v4.interface_ids() {
+                                        existing_v4.add_interface_id(id.clone());
+                                    }
+                                }
+                                resolved_service.addresses.insert(existing);
+                            } else {
+                                resolved_service.addresses.insert(scoped);
+                            }
+                        } else {
+                            resolved_service.addresses.insert(scoped);
+                        }
                     }
                 }
-            } else {
-                result = Some(service);
             }
         }
-        if let Some(service) = result {
-            return service;
-        }
-        self.resolve_service_on_intf(ty_domain, fullname, u32::MAX)
+
+        resolved_service
     }
 
     fn handle_poller_events(&mut self, events: &mio::Events) {
@@ -3904,117 +3849,76 @@ impl Zeroconf {
 
     fn conflict_handler(&mut self, msg: &DnsIncoming, if_index: u32) {
         self.reconcile_registries();
-        let Some(intf) = self.my_intfs.get(&if_index) else {
-            return;
-        };
         let Some(registry) = self.dns_registry_map.get_mut(&if_index) else {
             return;
         };
-        let received_at = Instant::now();
-        let mut conflicts = HashMap::new();
+        let now = Instant::now();
+        let mut changed = false;
         for incoming in msg
             .answers()
             .iter()
             .chain(msg.authorities())
             .chain(msg.additionals())
         {
-            if registry.was_recently_multicast(incoming, received_at) {
-                continue;
-            }
             let key = registry_key(incoming.get_name());
-            if registry
-                .probing
-                .get(&key)
-                .is_some_and(|probe| probe.probes_sent == 0)
+            let probe = registry.probing.get(&key);
+            if registry.was_recently_multicast(incoming, now)
+                || probe.is_some_and(|probe| probe.probes_sent == 0)
             {
                 continue;
             }
-            let proposal = registry
-                .probing
-                .get(&key)
-                .map(|p| p.records.as_slice())
+            let records = probe
+                .map(|probe| probe.records.as_slice())
                 .unwrap_or_else(|| registry.records_for_name(&key));
-            let probing = registry.probing.contains_key(&key);
-            let claimed_class = proposal
-                .iter()
-                .any(|record| record.get_class() == incoming.get_class());
-            let same_type = |record: &DnsRecordBox| {
-                record.get_type() == incoming.get_type()
-                    && record.get_class() == incoming.get_class()
-            };
-            let has_type = proposal.iter().any(same_type);
-            let same_data = proposal
-                .iter()
-                .any(|record| same_type(record) && record.rrdata_match(incoming.as_ref()));
-            if ((probing && claimed_class) || has_type) && !same_data {
-                let hostname = self
-                    .my_services
-                    .values()
-                    .chain(self.pending_registrations.values())
-                    .any(|service| {
-                        CanonicalName::new(registry.resolve_name(service.get_hostname())).as_str()
-                            == key
-                    });
-                conflicts.insert(key, hostname);
+            let claimed = records.iter().any(|record| {
+                record.get_class() == incoming.get_class()
+                    && (probe.is_some() || record.get_type() == incoming.get_type())
+            });
+            if !claimed
+                || records.iter().any(|record| {
+                    record.get_type() == incoming.get_type()
+                        && record.get_class() == incoming.get_class()
+                        && record.rrdata_match(incoming.as_ref())
+                })
+            {
+                continue;
             }
-        }
-        if conflicts.is_empty() {
-            return;
-        }
-        let now = Instant::now();
-        self.conflicts
-            .retain(|time| now.saturating_duration_since(*time) < Duration::from_secs(10));
-        for (name, hostname) in conflicts {
-            if self.conflicts.len() == 15 {
-                self.conflicts.pop_front();
-            }
-            self.conflicts.push_back(now);
-            let established = registry.active.remove(&name).is_some();
-            if !established {
-                let presentation = self
-                    .my_services
-                    .values()
-                    .chain(self.pending_registrations.values())
-                    .map(|service| {
-                        if hostname {
-                            service.get_hostname()
-                        } else {
-                            service.get_fullname()
-                        }
-                    })
-                    .map(|original| registry.resolve_name(original))
-                    .find(|current| CanonicalName::new(current).as_str() == name.as_str())
-                    .unwrap_or(name.as_str());
-                let renamed = if hostname {
-                    hostname_change(presentation)
-                } else {
-                    name_change(presentation)
-                };
+            if registry.active.remove(&key).is_none() {
                 let originals: Vec<_> = self
                     .my_services
                     .values()
                     .chain(self.pending_registrations.values())
-                    .flat_map(|service| [service.get_fullname(), service.get_hostname()])
-                    .filter(|original| {
-                        CanonicalName::new(registry.resolve_name(original)).as_str() == name
+                    .flat_map(|service| {
+                        [
+                            (service.get_fullname(), false),
+                            (service.get_hostname(), true),
+                        ]
                     })
-                    .map(registry_key)
+                    .filter(|(original, _)| names_equal(registry.resolve_name(original), &key))
                     .collect();
-                for original in originals {
-                    registry.name_changes.insert(original, renamed.clone());
+                if let Some((original, hostname)) = originals.first() {
+                    let current = registry.resolve_name(original);
+                    let renamed = if *hostname {
+                        hostname_change(current)
+                    } else {
+                        name_change(current)
+                    };
+                    for (original, _) in originals {
+                        registry
+                            .name_changes
+                            .insert(registry_key(original), renamed.clone());
+                    }
                 }
             }
-            registry.probing.remove(&name);
+            registry.probing.remove(&key);
+            changed = true;
         }
-        let services: Vec<_> = self.my_services.values().collect();
-        let pending_hosts: Vec<_> = self.pending_registrations.values().collect();
-        let start = if self.conflicts.len() == 15 {
-            now + Duration::from_secs(5)
-        } else {
-            now
-        };
-        registry.reconcile_publication(&services, &pending_hosts, intf, start);
-        self.reconcile_registries();
+        if changed {
+            let services: Vec<_> = self.my_services.values().collect();
+            let pending: Vec<_> = self.pending_registrations.values().collect();
+            registry.reconcile_publication(&services, &pending, &self.my_intfs[&if_index], now);
+            self.reconcile_registries();
+        }
     }
 
     /// Resolve the updated (including new) instances.

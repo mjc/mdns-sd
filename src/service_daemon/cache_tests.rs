@@ -855,7 +855,7 @@ fn deduplicating_found_does_not_downgrade_a_resolved_link() {
         daemon.service_queriers[TY].delivered[&key],
         BrowseDelivery::Resolved(_)
     ));
-    assert!(!daemon.resolve_service_on_intf(TY, &key, second).is_valid());
+    assert!(daemon.cache.get_srv_on_intf(&key, second).is_none());
     assert!(daemon.cache.get_ptr_on_intf(TY, second).is_some());
     assert_eq!(
         receiver
