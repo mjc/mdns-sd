@@ -1461,10 +1461,46 @@ fn rate_limit_key(record: &DnsRecordBox) -> String {
 
 /// Returns a tuple of (service_type_domain, optional_sub_domain)
 pub(crate) fn split_sub_domain(domain: &str) -> (&str, Option<&str>) {
-    if let Some((_, ty_domain)) = domain.rsplit_once("._sub.") {
-        (ty_domain, Some(domain))
-    } else {
-        (domain, None)
+    let bytes = domain.as_bytes();
+    for index in (0..bytes.len().saturating_sub(5)).rev() {
+        if !bytes[index..index + 6].eq_ignore_ascii_case(b"._sub.") {
+            continue;
+        }
+        let escapes = bytes[..index]
+            .iter()
+            .rev()
+            .take_while(|byte| **byte == b'\\')
+            .count();
+        if escapes % 2 == 0 {
+            return (&domain[index + 6..], Some(domain));
+        }
+    }
+    (domain, None)
+}
+
+#[cfg(test)]
+mod subtype_name_tests {
+    use super::split_sub_domain;
+
+    #[test]
+    fn subtype_marker_requires_an_unescaped_label_boundary() {
+        let ordinary = "_print._sub._http._tcp.local.";
+        assert_eq!(
+            split_sub_domain(ordinary),
+            ("_http._tcp.local.", Some(ordinary))
+        );
+        let mixed_case = "_print._SuB._http._tcp.local.";
+        assert_eq!(
+            split_sub_domain(mixed_case),
+            ("_http._tcp.local.", Some(mixed_case))
+        );
+        let literal_dot = r"_print\._sub._http._tcp.local.";
+        assert_eq!(split_sub_domain(literal_dot), (literal_dot, None));
+        let literal_backslash = r"_print\\._sub._http._tcp.local.";
+        assert_eq!(
+            split_sub_domain(literal_backslash),
+            ("_http._tcp.local.", Some(literal_backslash))
+        );
     }
 }
 

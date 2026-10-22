@@ -785,6 +785,8 @@ fn test_disable_interface_cache() {
     // Disable the interface for the client.
     println!("Disabling interface with IP: {:?}", ipv4_list);
     client.disable_interface(ipv4_list).unwrap();
+    // A records can also arrive over IPv6 on the same link.
+    client.disable_interface(IfKind::IPv6).unwrap();
 
     // Browse for the service.
     let handle = client.browse(ty_domain).unwrap();
@@ -1183,7 +1185,7 @@ fn my_ip_interfaces() -> Vec<Interface> {
         .unwrap_or_default()
         .into_iter()
         .filter_map(|i| {
-            if i.is_loopback() || i.is_p2p() || is_apple_p2p_by_name(&i.name) {
+            if !i.is_oper_up() || i.is_loopback() || i.is_p2p() || is_apple_p2p_by_name(&i.name) {
                 None
             } else {
                 match &i.addr {
@@ -2220,6 +2222,7 @@ fn test_multicast_loop_v4() {
 
     // Register the first service.
     let server = ServiceDaemon::new().expect("failed to start server");
+    server.disable_interface(IfKind::IPv6).unwrap();
     server.set_multicast_loop_v4(false).unwrap();
 
     // Get a single IPv4 address
@@ -2242,6 +2245,7 @@ fn test_multicast_loop_v4() {
     // start a client i.e. querier.
     let mut resolved = false;
     let client = ServiceDaemon::new().expect("failed to create mdns client");
+    client.disable_interface(IfKind::IPv6).unwrap();
 
     // For Windows, IP_MULTICAST_LOOP option works only on the receive path.
     client.set_multicast_loop_v4(false).unwrap();
@@ -2297,6 +2301,7 @@ fn test_multicast_loop_v6() {
 
     // Register the first service.
     let server = ServiceDaemon::new().expect("failed to start server");
+    server.disable_interface(IfKind::IPv4).unwrap();
     server.set_multicast_loop_v6(false).unwrap();
 
     // Get a single IPv6 address
@@ -2319,6 +2324,7 @@ fn test_multicast_loop_v6() {
     // start a client i.e. querier.
     let mut resolved = false;
     let client = ServiceDaemon::new().expect("failed to create mdns client");
+    client.disable_interface(IfKind::IPv4).unwrap();
 
     // For Windows, IP_MULTICAST_LOOP option works only on the receive path.
     client.set_multicast_loop_v6(false).unwrap();
@@ -2512,13 +2518,7 @@ fn test_rfc6763_utf8_network_integration() {
                 let resolved_fullname = info.get_fullname();
                 println!("Resolved service: {}", resolved_fullname);
 
-                // Compare by checking if the resolved fullname contains our instance base
-                // and UTF-8 characters (network returns decoded names without escaping)
-                if resolved_fullname.contains(&instance_base)
-                    && resolved_fullname.contains("Café")
-                    && resolved_fullname.contains('🌐')
-                    && resolved_fullname.contains(ty_domain)
-                {
+                if resolved_fullname.contains(&instance_base) {
                     resolved = true;
                     println!("Successfully found UTF-8 service over network!");
 
@@ -2526,9 +2526,7 @@ fn test_rfc6763_utf8_network_integration() {
                     assert_eq!(info.get_port(), port);
                     assert!(!info.get_addresses().is_empty());
 
-                    // Verify UTF-8 characters are preserved
-                    assert!(resolved_fullname.contains("Café.Service"));
-                    assert!(resolved_fullname.contains('🌐'));
+                    assert_eq!(resolved_fullname, fullname);
                     break;
                 }
             }

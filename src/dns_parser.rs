@@ -339,7 +339,7 @@ pub(crate) const MAX_LABEL_BYTES: usize = 63;
 /// Max size of a whole domain name, in bytes.
 ///
 /// Reference: [RFC1035 section 2.3.4](https://datatracker.ietf.org/doc/html/rfc1035#section-2.3.4)
-const MAX_NAME_BYTES: usize = 255;
+pub(crate) const MAX_NAME_BYTES: usize = 255;
 
 /// Why a question or a record could not be written into a packet.
 ///

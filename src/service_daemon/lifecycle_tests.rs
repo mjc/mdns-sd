@@ -571,3 +571,67 @@ fn any_probe_defers_to_another_record_type_at_the_hostname() {
     unregister(&mut daemon, &fullname);
     assert_eq!(active_count(&daemon), 0);
 }
+
+#[test]
+fn unavailable_sockets_do_not_complete_a_probe() {
+    let (mut daemon, index) = daemon();
+    daemon.ipv4_sock = None;
+    daemon.ipv6_sock = None;
+    daemon.register_service(service("unsent", "unsent.local.", "127.0.0.1", "A"));
+    for _ in 0..8 {
+        for probe in daemon
+            .dns_registry_map
+            .get_mut(&index)
+            .unwrap()
+            .probing
+            .values_mut()
+        {
+            probe.next_send = Instant::now();
+        }
+        daemon.probing_handler();
+    }
+    let registry = &daemon.dns_registry_map[&index];
+    assert!(registry.active.is_empty());
+    assert!(registry
+        .probing
+        .values()
+        .all(|probe| probe.probes_sent == 0));
+    assert_eq!(
+        daemon
+            .my_services
+            .values()
+            .next()
+            .unwrap()
+            .get_status(index),
+        ServiceStatus::Probing
+    );
+}
+
+#[test]
+fn failed_udp_sends_do_not_acknowledge_an_announcement() {
+    let (mut daemon, index) = daemon();
+    daemon.port = 0;
+    let mut published = service("failed-send", "failed.local.", "127.0.0.1", "A");
+    published.set_requires_probe(false);
+    let fullname = registry_key(published.get_fullname());
+    daemon.register_service(published);
+    assert_ne!(
+        daemon.my_services[&fullname].get_status(index),
+        ServiceStatus::Announced
+    );
+    assert_eq!(
+        daemon
+            .retransmissions
+            .iter()
+            .filter(|rerun| matches!(&rerun.command, Command::RegisterResend(..)))
+            .count(),
+        1
+    );
+    daemon
+        .exec_command_register_resend(fullname.clone(), index)
+        .unwrap();
+    assert_ne!(
+        daemon.my_services[&fullname].get_status(index),
+        ServiceStatus::Announced
+    );
+}

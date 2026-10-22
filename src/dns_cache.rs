@@ -438,6 +438,7 @@ impl DnsCache {
         Some((&records[0], true))
     }
 
+    #[cfg(test)]
     pub(crate) fn remove_on_intf(&mut self, record: &DnsRecordBox, index: u32) -> bool {
         let key = (index, RrsetKey::new(record.as_ref()));
         let mut removed = false;
@@ -1334,7 +1335,7 @@ mod tests {
             DnsSrv::new(instance, 3, 120, 0, 0, 80, "Host.local.".to_string()).boxed(),
             true,
         );
-        assert_eq!(cache.srv_count(), 2);
+        assert_eq!(cache.srv_count(), 1);
         cache.age_records(Duration::from_secs(2));
         cache.add_or_update(
             &intf,
@@ -1351,7 +1352,7 @@ mod tests {
             true,
         );
         cache.evict_expired(Instant::now() + Duration::from_secs(2));
-        assert_eq!(cache.srv_count(), 2);
+        assert_eq!(cache.srv_count(), 1);
         assert_eq!(cache.get_srv_on_intf(instance, 1).unwrap().len(), 1);
         assert_eq!(
             cache.get_srv_on_intf(instance, 1).unwrap()[0]

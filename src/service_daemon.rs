@@ -191,6 +191,10 @@ enum Counter {
     CachedTxt,
     CachedNSec,
     CachedSubtype,
+    CachedRecords,
+    CachedBytes,
+    Resolved,
+    PendingResolves,
     DnsRegistryProbe,
     DnsRegistryActive,
     DnsRegistryTimer,
@@ -218,6 +222,10 @@ impl fmt::Display for Counter {
             Self::CachedTxt => write!(f, "cached-txt"),
             Self::CachedNSec => write!(f, "cached-nsec"),
             Self::CachedSubtype => write!(f, "cached-subtype"),
+            Self::CachedRecords => write!(f, "cached-records"),
+            Self::CachedBytes => write!(f, "cached-bytes"),
+            Self::Resolved => write!(f, "resolved"),
+            Self::PendingResolves => write!(f, "pending-resolves"),
             Self::DnsRegistryProbe => write!(f, "dns-registry-probe"),
             Self::DnsRegistryActive => write!(f, "dns-registry-active"),
             Self::DnsRegistryTimer => write!(f, "dns-registry-timer"),
@@ -750,7 +758,9 @@ impl ServiceDaemon {
     /// for a given service type. This is useful / necessary when doing cache-only browsing. See
     /// [browse_cache](Self::browse_cache).
     ///
-    /// If `accept` is false (default), accept only responses matching queries that we have initiated.
+    /// If `accept` is false (default), retain records needed by active browse,
+    /// hostname resolution or verification operations, plus updates to cached RRsets.
+    /// Supported records use class IN and remain subject to [`set_cache_limits`](Self::set_cache_limits).
     ///
     /// For example:
     /// ```ignore
@@ -1663,6 +1673,7 @@ impl Zeroconf {
         let now = Instant::now();
         let mut stale = Vec::new();
         let mut changed = HashSet::new();
+        let mut newly_resolved = HashSet::new();
         for (ty, subscription) in &self.service_queriers {
             for ((index, instance), delivery) in &subscription.delivered {
                 let ptr_alive = self
@@ -1682,7 +1693,16 @@ impl Zeroconf {
                     });
                 let valid = ptr_alive
                     && match delivery {
-                        BrowseDelivery::Found(_) => true,
+                        BrowseDelivery::Found(_) => {
+                            if self
+                                .resolve_service_on_intf(ty, instance, *index)
+                                .is_ok_and(|service| service.is_valid())
+                            {
+                                changed.insert((ty.clone(), instance.clone()));
+                                newly_resolved.insert((ty.clone(), *index, instance.clone()));
+                            }
+                            true
+                        }
                         BrowseDelivery::Resolved(previous) => {
                             if let Ok(current) = self.resolve_service_on_intf(ty, instance, *index)
                             {
@@ -1714,10 +1734,15 @@ impl Zeroconf {
         for (ty, index, instance, fullname, was_resolved) in stale {
             if let Some(subscription) = self.service_queriers.get_mut(&ty) {
                 subscription.delivered.remove(&(index, instance.clone()));
-                let remains = subscription.delivered.iter().any(|((_, key), delivery)| {
-                    key == &instance
-                        && (!was_resolved || matches!(delivery, BrowseDelivery::Resolved(_)))
-                });
+                let remains = subscription
+                    .delivered
+                    .iter()
+                    .any(|((scope, key), delivery)| {
+                        key == &instance
+                            && (!was_resolved
+                                || matches!(delivery, BrowseDelivery::Resolved(_))
+                                || newly_resolved.contains(&(ty.clone(), *scope, key.clone())))
+                    });
                 if !remains {
                     removed.insert((ty, instance), fullname);
                 } else {
@@ -2575,21 +2600,33 @@ impl Zeroconf {
 
             let (out, expired_probes) = check_probing(dns_registry, now);
 
-            // send probing.
             if !out.questions().is_empty() {
-                trace!("sending out probing of questions: {:?}", out.questions());
-                if let Some(sock) = self.ipv4_sock.as_mut() {
-                    if let Err(InternalError::IntfAddrInvalid(intf_addr)) =
-                        send_dns_outgoing(&out, intf, &sock.pktinfo, self.port, None, None)
-                    {
-                        invalid_intf_addrs.insert(intf_addr);
+                let mut sent = false;
+                for socket in [self.ipv4_sock.as_ref(), self.ipv6_sock.as_ref()]
+                    .iter()
+                    .flatten()
+                {
+                    let is_ipv4 = socket.pktinfo.domain() == Domain::IPV4;
+                    let max_size = if is_ipv4 {
+                        intf.max_packet_size_v4
+                    } else {
+                        intf.max_packet_size_v6
+                    };
+                    let expected = out.to_data_on_wire(max_size, is_ipv4).len();
+                    match send_dns_outgoing(&out, intf, &socket.pktinfo, self.port, None, None) {
+                        Ok(packets) => sent |= expected > 0 && packets.len() == expected,
+                        Err(InternalError::IntfAddrInvalid(address)) => {
+                            invalid_intf_addrs.insert(address);
+                        }
                     }
                 }
-                if let Some(sock) = self.ipv6_sock.as_mut() {
-                    if let Err(InternalError::IntfAddrInvalid(intf_addr)) =
-                        send_dns_outgoing(&out, intf, &sock.pktinfo, self.port, None, None)
-                    {
-                        invalid_intf_addrs.insert(intf_addr);
+                for question in out.questions() {
+                    if let Some(probe) = dns_registry.probing.get_mut(question.entry_name()) {
+                        if sent {
+                            probe.update_next_send(now);
+                        } else {
+                            probe.next_send = now + Duration::from_secs(1);
+                        }
                     }
                 }
             }
@@ -3276,8 +3313,18 @@ impl Zeroconf {
                 if record.get_class() != CLASS_IN || record.get_record().is_expired(now) {
                     continue;
                 }
-                if !questions.contains(&(CanonicalName::new(record.get_name()), record.get_type()))
-                {
+                let owner = CanonicalName::new(record.get_name());
+                let subtype_for_browser = if record.get_type() == RRType::PTR {
+                    let (base, subtype) = crate::service_info::split_sub_domain(owner.as_str());
+                    subtype.is_some()
+                        && questions.contains(&(CanonicalName::new(base), RRType::PTR))
+                } else {
+                    false
+                };
+                if subtype_for_browser {
+                    dependencies.push((owner.clone(), RRType::PTR));
+                }
+                if !subtype_for_browser && !questions.contains(&(owner, record.get_type())) {
                     continue;
                 }
                 if let Some(ptr) = record.any().downcast_ref::<DnsPointer>() {
@@ -3974,6 +4021,19 @@ impl Zeroconf {
         self.set_counter(Counter::CachedTxt, self.cache.txt_count() as i64);
         self.set_counter(Counter::CachedNSec, self.cache.nsec_count() as i64);
         self.set_counter(Counter::CachedSubtype, self.cache.subtype_count() as i64);
+        let (cached_records, cached_bytes) = self.cache.usage();
+        self.set_counter(Counter::CachedRecords, cached_records as i64);
+        self.set_counter(Counter::CachedBytes, cached_bytes as i64);
+        let resolved = self
+            .service_queriers
+            .values()
+            .flat_map(|subscription| subscription.delivered.iter())
+            .filter(|(_, delivery)| matches!(delivery, BrowseDelivery::Resolved(_)))
+            .map(|((_, instance), _)| instance)
+            .collect::<HashSet<_>>()
+            .len();
+        self.set_counter(Counter::Resolved, resolved as i64);
+        self.set_counter(Counter::PendingResolves, self.pending_resolves.len() as i64);
         self.set_counter(Counter::Timer, self.scheduled_deadlines() as i64);
 
         let dns_registry_probe_count: usize = self
@@ -4945,42 +5005,40 @@ fn send_dns_outgoing_impl(
     }
 
     let packet_list = out.to_data_on_wire(config.max_packet_size, config.is_ipv4);
-    for packet in packet_list.iter() {
-        match unicast_dest {
+    Ok(packet_list
+        .into_iter()
+        .filter(|packet| match unicast_dest {
             Some(dest) => unicast_on_intf(packet, if_name, dest, sock),
             None => multicast_on_intf(packet, if_name, if_index, if_addr, sock, config.port),
-        }
-    }
-    Ok(packet_list)
+        })
+        .collect())
 }
 
-/// Sends a unicast packet directly to `dest` (used for RFC 6762 §6.7
-/// legacy unicast responses).
-fn unicast_on_intf(packet: &[u8], if_name: &str, dest: SocketAddr, socket: &PktInfoUdpSocket) {
+/// Returns whether the kernel accepted the entire unicast datagram.
+fn unicast_on_intf(
+    packet: &[u8],
+    if_name: &str,
+    dest: SocketAddr,
+    socket: &PktInfoUdpSocket,
+) -> bool {
     let max_size = max_pkt_absolute(dest.is_ipv4());
     if packet.len() > max_size {
         debug!("Drop over-sized packet ({} > {max_size})", packet.len());
-        return;
+        return false;
     }
-
-    let sock_addr = dest.into();
-    match socket.send_to(packet, &sock_addr) {
-        Ok(sz) => trace!(
-            "sent unicast {} bytes on interface {} to {}",
-            sz,
-            if_name,
-            dest
-        ),
-        Err(e) => trace!(
-            "Failed to send unicast to {} via {:?}: {}",
-            dest,
-            &if_name,
-            e
-        ),
+    match socket.send_to(packet, &dest.into()) {
+        Ok(size) => {
+            trace!("sent unicast {size} bytes on interface {if_name} to {dest}");
+            size == packet.len()
+        }
+        Err(error) => {
+            debug!("Failed to send unicast to {dest} via {if_name}: {error}");
+            false
+        }
     }
 }
 
-/// Sends a multicast packet, and returns the packet bytes.
+/// Returns whether the kernel accepted the entire multicast datagram.
 fn multicast_on_intf(
     packet: &[u8],
     if_name: &str,
@@ -4988,33 +5046,28 @@ fn multicast_on_intf(
     if_addr: &IfAddr,
     socket: &PktInfoUdpSocket,
     port: u16,
-) {
+) -> bool {
     let max_size = max_pkt_absolute(if_addr.ip().is_ipv4());
     if packet.len() > max_size {
         debug!("Drop over-sized packet ({} > {max_size})", packet.len());
-        return;
+        return false;
     }
-
     let addr: SocketAddr = match if_addr {
-        if_addrs::IfAddr::V4(_) => SocketAddrV4::new(GROUP_ADDR_V4, port).into(),
-        if_addrs::IfAddr::V6(_) => {
-            let mut sock = SocketAddrV6::new(GROUP_ADDR_V6, port, 0, 0);
-            sock.set_scope_id(if_index); // Choose iface for multicast
-            sock.into()
-        }
+        IfAddr::V4(_) => SocketAddrV4::new(GROUP_ADDR_V4, port).into(),
+        IfAddr::V6(_) => SocketAddrV6::new(GROUP_ADDR_V6, port, 0, if_index).into(),
     };
-
-    // Sends out `packet` to `addr` on the socket.
-    let sock_addr = addr.into();
-    match socket.send_to(packet, &sock_addr) {
-        Ok(sz) => trace!(
-            "sent out {} bytes on interface {} (idx {}) addr {}",
-            sz,
-            if_name,
-            if_index,
-            if_addr.ip()
-        ),
-        Err(e) => trace!("Failed to send to {} via {:?}: {}", addr, &if_name, e),
+    match socket.send_to(packet, &addr.into()) {
+        Ok(size) => {
+            trace!(
+                "sent out {size} bytes on interface {if_name} (idx {if_index}) addr {}",
+                if_addr.ip()
+            );
+            size == packet.len()
+        }
+        Err(error) => {
+            debug!("Failed to send to {addr} via {if_name}: {error}");
+            false
+        }
     }
 }
 
@@ -5042,15 +5095,11 @@ fn notify_monitors(monitors: &mut Vec<Sender<DaemonEvent>>, event: DaemonEvent) 
 fn prepare_announce(
     info: &ServiceInfo,
     intf: &MyIntf,
-    registry: &mut DnsRegistry,
-    is_ipv4: bool,
+    registry: &DnsRegistry,
 ) -> Option<DnsOutgoing> {
-    let usable = if is_ipv4 {
-        info.get_addrs_on_my_intf_v4(intf)
-    } else {
-        info.get_addrs_on_my_intf_v6(intf)
-    };
-    if usable.is_empty() {
+    if info.get_addrs_on_my_intf_v4(intf).is_empty()
+        && info.get_addrs_on_my_intf_v6(intf).is_empty()
+    {
         return None;
     }
     let fullname = registry.resolve_name(info.get_fullname());
@@ -5129,7 +5178,7 @@ fn announce_service_on_intf(
     {
         return Ok(Announcement::default());
     }
-    if let Some(mut out) = prepare_announce(info, intf, dns_registry, is_ipv4) {
+    if let Some(mut out) = prepare_announce(info, intf, dns_registry) {
         // RFC 6762 §6: a record MUST NOT be multicast on an interface more than
         // once per second. Announcements are unsolicited multicast responses.
         let complete = out.answers_count();
@@ -5141,7 +5190,14 @@ fn announce_service_on_intf(
                 needs_retry,
             });
         }
-        let sent = !send_dns_outgoing(&out, intf, sock, port, None, None)?.is_empty();
+        let max_size = if is_ipv4 {
+            intf.max_packet_size_v4
+        } else {
+            intf.max_packet_size_v6
+        };
+        let expected = out.to_data_on_wire(max_size, is_ipv4).len();
+        let sent_packets = send_dns_outgoing(&out, intf, sock, port, None, None)?;
+        let sent = expected > 0 && sent_packets.len() == expected;
         return Ok(Announcement {
             sent,
             needs_retry: sent && needs_retry,
@@ -5159,7 +5215,7 @@ fn announce_service_on_intf(
 /// - `foo (2).local.` becomes `foo (3).local.`
 /// - `foo (9)` becomes `foo (10)`
 fn name_change(original: &str) -> String {
-    rename_first_label(original, |first| {
+    rename_first_label(original, |first, limit| {
         let incremented = first
             .strip_suffix(')')
             .and_then(|name| name.rsplit_once(" ("))
@@ -5171,8 +5227,8 @@ fn name_change(original: &str) -> String {
                     .map(|next| (base, next))
             });
         match incremented {
-            Some((base, next)) => label_with_suffix(base, &format!(" ({next})")),
-            None => label_with_suffix(first, " (2)"),
+            Some((base, next)) => label_with_suffix(base, &format!(" ({next})"), limit),
+            None => label_with_suffix(first, " (2)", limit),
         }
     })
 }
@@ -5185,7 +5241,7 @@ fn name_change(original: &str) -> String {
 /// - `foo-2.local.` becomes `foo-3.local.`
 /// - `foo` becomes `foo-2`
 fn hostname_change(original: &str) -> String {
-    rename_first_label(original, |first| {
+    rename_first_label(original, |first, limit| {
         let incremented = first.rsplit_once('-').and_then(|(base, number)| {
             number
                 .parse::<u32>()
@@ -5194,24 +5250,34 @@ fn hostname_change(original: &str) -> String {
                 .map(|next| (base, next))
         });
         match incremented {
-            Some((base, next)) => label_with_suffix(base, &format!("-{next}")),
-            None => label_with_suffix(first, "-2"),
+            Some((base, next)) => label_with_suffix(base, &format!("-{next}"), limit),
+            None => label_with_suffix(first, "-2", limit),
         }
     })
 }
 
 /// Leaves room for the suffix without splitting a UTF-8 character.
-fn label_with_suffix(stem: &str, suffix: &str) -> String {
-    let mut end = stem
-        .len()
-        .min(crate::dns_parser::MAX_LABEL_BYTES - suffix.len());
+fn label_with_suffix(stem: &str, suffix: &str, limit: usize) -> String {
+    if suffix.len() > limit {
+        let next = stem
+            .parse::<u32>()
+            .ok()
+            .and_then(|number| number.checked_add(1))
+            .unwrap_or(2)
+            .to_string();
+        if next.len() <= limit {
+            return next;
+        }
+        return if stem == "0" { "1" } else { "0" }.to_string();
+    }
+    let mut end = stem.len().min(limit - suffix.len());
     while !stem.is_char_boundary(end) {
         end -= 1;
     }
     format!("{}{suffix}", &stem[..end])
 }
 
-fn rename_first_label(original: &str, rename: impl FnOnce(&str) -> String) -> String {
+fn rename_first_label(original: &str, rename: impl FnOnce(&str, usize) -> String) -> String {
     let absolute = original.strip_suffix('.').map_or(false, |prefix| {
         prefix
             .as_bytes()
@@ -5226,7 +5292,14 @@ fn rename_first_label(original: &str, rename: impl FnOnce(&str) -> String) -> St
     if labels.is_empty() {
         labels.push(String::new());
     }
-    labels[0] = rename(&labels[0]);
+    let other_bytes = labels
+        .iter()
+        .skip(1)
+        .map(|label| label.len() + 1)
+        .sum::<usize>();
+    let first_limit = crate::dns_parser::MAX_LABEL_BYTES
+        .min(crate::dns_parser::MAX_NAME_BYTES.saturating_sub(other_bytes + 2));
+    labels[0] = rename(&labels[0], first_limit);
     let mut result = String::new();
     for label in labels {
         if !result.is_empty() {
@@ -5264,8 +5337,6 @@ fn check_probing(dns_registry: &mut DnsRegistry, now: Instant) -> (DnsOutgoing, 
                 for record in probe.records.iter() {
                     out.add_authority(record.clone());
                 }
-
-                probe.update_next_send(now);
             }
         }
     }
@@ -6846,6 +6917,68 @@ mod tests {
             hostname_change(&"\u{754c}".repeat(21)),
             format!("{}-2", "\u{754c}".repeat(20))
         );
+    }
+
+    #[test]
+    fn test_conflict_renaming_maximum_names_roundtrip() {
+        let suffix = format!(
+            "{}.{}.{}.local.",
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(63)
+        );
+        for first in [
+            "a".repeat(55),
+            format!("{}x", "\u{754c}".repeat(18)),
+            format!(r"{}\.\\", "a".repeat(53)),
+        ] {
+            let original = format!("{first}.{suffix}");
+            let original_labels = crate::dns_name::labels(&original);
+            let wire_len =
+                |labels: &[String]| labels.iter().map(|label| label.len() + 1).sum::<usize>() + 1;
+            assert_eq!(
+                wire_len(&original_labels),
+                crate::dns_parser::MAX_NAME_BYTES
+            );
+            for renamed in [name_change(&original), hostname_change(&original)] {
+                let labels = crate::dns_name::labels(&renamed);
+                assert!(wire_len(&labels) <= crate::dns_parser::MAX_NAME_BYTES);
+                assert_eq!(&labels[1..], &original_labels[1..]);
+                assert_ne!(labels[0], original_labels[0]);
+                let mut query = DnsOutgoing::new(FLAGS_QR_QUERY);
+                query.add_question(&renamed, RRType::ANY);
+                let packets = query.to_data_on_wire(MAX_PKT_DEFAULT, true);
+                assert_eq!(packets.len(), 1);
+                let parsed =
+                    DnsIncoming::new(packets[0].clone(), crate::InterfaceId::default()).unwrap();
+                assert_eq!(parsed.questions()[0].entry_name(), renamed);
+            }
+        }
+
+        let original = format!("a.{}.{}", "e".repeat(53), suffix);
+        let original_labels = crate::dns_name::labels(&original);
+        assert_eq!(
+            original_labels
+                .iter()
+                .map(|label| label.len() + 1)
+                .sum::<usize>()
+                + 1,
+            crate::dns_parser::MAX_NAME_BYTES
+        );
+        for rename in [name_change as fn(&str) -> String, hostname_change] {
+            let renamed = rename(&original);
+            let labels = crate::dns_name::labels(&renamed);
+            assert_eq!(labels[0], "2");
+            assert_eq!(&labels[1..], &original_labels[1..]);
+            assert_eq!(crate::dns_name::labels(&rename(&renamed))[0], "3");
+            let mut query = DnsOutgoing::new(FLAGS_QR_QUERY);
+            query.add_question(&renamed, RRType::ANY);
+            let packets = query.to_data_on_wire(MAX_PKT_DEFAULT, true);
+            assert_eq!(packets.len(), 1);
+            let parsed =
+                DnsIncoming::new(packets[0].clone(), crate::InterfaceId::default()).unwrap();
+            assert_eq!(parsed.questions()[0].entry_name(), renamed);
+        }
     }
 
     #[test]

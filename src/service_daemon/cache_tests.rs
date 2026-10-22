@@ -679,3 +679,88 @@ fn removing_a_link_notifies_hostname_subscribers_once() {
     assert!(daemon.cache.get_addr_on_intf(host, index).is_some());
     assert!(daemon.cache.get_addr_on_intf(host, other).is_none());
 }
+
+#[test]
+fn expiry_can_resolve_a_previously_found_instance() {
+    let (mut daemon, index) = daemon();
+    let receiver = subscribe(&mut daemon);
+    let instance = format!("fallback.{TY}");
+    let mut records = discovery_records(&daemon, index, &instance, "reachable.local.", 120, true);
+    records.push(
+        DnsSrv::new(
+            &instance,
+            CLASS_IN,
+            1,
+            0,
+            0,
+            9090,
+            "missing.local.".to_string(),
+        )
+        .boxed(),
+    );
+    receive(&mut daemon, index, records);
+    let events: Vec<_> = receiver.try_iter().collect();
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, ServiceEvent::ServiceFound(..))));
+    assert!(!events
+        .iter()
+        .any(|event| matches!(event, ServiceEvent::ServiceResolved(..))));
+    daemon.cache.age_records(Duration::from_secs(2));
+    daemon.expire_cache(Instant::now());
+    let resolved: Vec<_> = receiver
+        .try_iter()
+        .filter_map(|event| match event {
+            ServiceEvent::ServiceResolved(service) => Some(service),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(resolved.len(), 1);
+    assert_eq!(resolved[0].host, "reachable.local.");
+    assert_eq!(resolved[0].port, 8080);
+}
+
+#[test]
+fn parent_browse_retains_subtype_metadata_from_parsed_announcements() {
+    let (mut daemon, index) = daemon();
+    let receiver = subscribe(&mut daemon);
+    let instance = format!("subtype.{TY}");
+    let subtype = format!("_print._sub.{TY}");
+    let mut records = discovery_records(&daemon, index, &instance, "subtype.local.", 120, true);
+    records.push(DnsPointer::new(&subtype, RRType::PTR, CLASS_IN, 120, instance.clone()).boxed());
+    receive(&mut daemon, index, records);
+    let resolved = receiver
+        .try_iter()
+        .find_map(|event| match event {
+            ServiceEvent::ServiceResolved(service) => Some(service),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(resolved.sub_ty_domain.as_deref(), Some(subtype.as_str()));
+    assert_eq!(
+        daemon.cache.get_ptr_on_intf(&subtype, index).unwrap().len(),
+        1
+    );
+
+    let (mut publisher, index) = super::lifecycle_tests::daemon();
+    let mut records = discovery_records(&publisher, index, &instance, "subtype.local.", 120, true);
+    records.push(DnsPointer::new(&subtype, RRType::PTR, CLASS_IN, 120, instance).boxed());
+    receive(&mut publisher, index, records);
+    assert_eq!(publisher.cache.usage(), (0, 0));
+}
+
+#[test]
+fn escaped_subtype_marker_does_not_expand_parent_browse_interest() {
+    let (mut daemon, index) = daemon();
+    let receiver = subscribe(&mut daemon);
+    let instance = format!("escaped.{TY}");
+    let escaped = format!(r"_print\._sub.{TY}");
+    let mut records = discovery_records(&daemon, index, &instance, "escaped.local.", 120, false);
+    records.insert(
+        0,
+        DnsPointer::new(&escaped, RRType::PTR, CLASS_IN, 120, instance).boxed(),
+    );
+    receive(&mut daemon, index, records);
+    assert_eq!(daemon.cache.usage(), (0, 0));
+    assert!(receiver.is_empty());
+}
