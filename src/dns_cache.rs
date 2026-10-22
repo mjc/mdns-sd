@@ -141,31 +141,37 @@ impl DnsCache {
         } else {
             std::slice::from_ref(&ty)
         };
-        let mut result = Vec::new();
-        if let Some(index) = index {
-            for ty in types {
-                let key = RrsetKey {
-                    name: name.clone(),
-                    rr_type: *ty,
-                    class: CLASS_IN,
-                };
-                if let Some(records) = self.records.get(&(index, key)) {
-                    result.extend(records);
-                }
-            }
-        } else {
-            for ((_, key), records) in &self.records {
-                if key.name == name && key.class == CLASS_IN && types.contains(&key.rr_type) {
-                    result.extend(records);
-                }
-            }
-            result.sort_by_key(|record| record.src_intf.index);
+        let mut records: Vec<_> = match index {
+            Some(interface) => types
+                .iter()
+                .filter_map(|rr_type| {
+                    let rrset = RrsetKey {
+                        name: name.clone(),
+                        rr_type: *rr_type,
+                        class: CLASS_IN,
+                    };
+                    self.records.get(&(interface, rrset))
+                })
+                .flatten()
+                .collect(),
+            None => self
+                .records
+                .iter()
+                .filter(|((_, rrset), _)| {
+                    rrset.name == name && rrset.class == CLASS_IN && types.contains(&rrset.rr_type)
+                })
+                .flat_map(|(_, records)| records)
+                .collect(),
+        };
+
+        if index.is_none() {
+            records.sort_by_key(|record| record.src_intf.index);
         }
-        result.retain(|record| !record.record.get_record().is_expired(now));
-        if result.is_empty() {
+        records.retain(|record| !record.record.get_record().is_expired(now));
+        if records.is_empty() {
             None
         } else {
-            Some(result)
+            Some(records)
         }
     }
 
@@ -185,17 +191,21 @@ impl DnsCache {
         self.records.contains_key(&(index, RrsetKey::new(record)))
     }
 
+    /// Groups PTR records by service type across interfaces; callers check expiry.
     pub(crate) fn all_ptr(&self) -> HashMap<String, Vec<&DnsRecordIntf>> {
-        let mut result: HashMap<String, Vec<&DnsRecordIntf>> = HashMap::new();
-        for ((_, key), records) in &self.records {
-            if key.rr_type == RRType::PTR && key.class == CLASS_IN {
-                result
-                    .entry(key.name.as_str().to_string())
-                    .or_default()
-                    .extend(records);
-            }
+        let ptr_rrsets = self
+            .records
+            .iter()
+            .filter(|((_, rrset), _)| rrset.rr_type == RRType::PTR && rrset.class == CLASS_IN);
+        let mut by_service_type: HashMap<String, Vec<&DnsRecordIntf>> = HashMap::new();
+        for ((_, rrset), records) in ptr_rrsets {
+            let service_type = rrset.name.as_str().to_owned();
+            by_service_type
+                .entry(service_type)
+                .or_default()
+                .extend(records);
         }
-        result
+        by_service_type
     }
 
     fn count(&self, ty: RRType) -> usize {
