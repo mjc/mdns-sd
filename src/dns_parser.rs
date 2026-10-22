@@ -210,7 +210,7 @@ impl fmt::Display for ScopedIp {
 /// DNS resource record types, stored as `u16`. Can do `as u16` when needed.
 ///
 /// See [RFC 1035 section 3.2.2](https://datatracker.ietf.org/doc/html/rfc1035#section-3.2.2)
-#[derive(Debug, PartialEq, Eq, Clone, Copy, PartialOrd, Ord, Hash)]
+#[derive(Debug, Hash, PartialEq, Eq, Clone, Copy, PartialOrd, Ord)]
 #[non_exhaustive]
 #[repr(u16)]
 pub enum RRType {
@@ -334,12 +334,12 @@ const MSG_HEADER_LEN: usize = 12;
 /// Max size of a single DNS label, in bytes.
 ///
 /// Reference: [RFC1035 section 2.3.4](https://datatracker.ietf.org/doc/html/rfc1035#section-2.3.4)
-const MAX_LABEL_BYTES: usize = 63;
+pub(crate) const MAX_LABEL_BYTES: usize = 63;
 
 /// Max size of a whole domain name, in bytes.
 ///
 /// Reference: [RFC1035 section 2.3.4](https://datatracker.ietf.org/doc/html/rfc1035#section-2.3.4)
-const MAX_NAME_BYTES: usize = 255;
+pub(crate) const MAX_NAME_BYTES: usize = 255;
 
 /// Why a question or a record could not be written into a packet.
 ///
@@ -502,6 +502,17 @@ impl DnsRecord {
         self.ttl
     }
 
+    pub(crate) fn set_ttl(&mut self, ttl: u32) {
+        self.ttl = ttl;
+        self.created = Instant::now();
+        self.expires = get_expiration_time(self.created, ttl, 100);
+        self.refresh = if ttl > 1 {
+            get_expiration_time(self.created, ttl, 80)
+        } else {
+            self.expires
+        };
+    }
+
     pub const fn get_expire_time(&self) -> Instant {
         self.expires
     }
@@ -533,6 +544,10 @@ impl DnsRecord {
 
     pub fn is_unique(&self) -> bool {
         self.entry.cache_flush
+    }
+
+    pub(crate) fn set_cache_flush(&mut self, cache_flush: bool) {
+        self.entry.cache_flush = cache_flush;
     }
 
     /// Updates the refresh time to be the same as the expire time so that
@@ -1006,10 +1021,6 @@ impl DnsSrv {
 
     pub fn port(&self) -> u16 {
         self.port
-    }
-
-    pub fn set_host(&mut self, host: String) {
-        self.host = host;
     }
 }
 
@@ -1826,8 +1837,7 @@ impl DnsOutgoing {
         &self.questions
     }
 
-    /// For testing purposes only.
-    pub(crate) fn _answers(&self) -> &[DnsRecordBox] {
+    pub(crate) fn answers(&self) -> &[DnsRecordBox] {
         &self.answers
     }
 
@@ -1905,8 +1915,12 @@ impl DnsOutgoing {
 
     //    o  All address records (type "A" and "AAAA") named in the SRV rdata.
     pub fn add_additional_answer(&mut self, answer: impl DnsRecordExt + 'static) {
-        trace!("add_additional_answer: {:?}", &answer);
-        self.additionals.push(answer.boxed());
+        trace!("add_additional_answer: {:?}", answer);
+        self.add_additional_box(answer.boxed());
+    }
+
+    pub(crate) fn add_additional_box(&mut self, record: DnsRecordBox) {
+        self.additionals.push(record);
     }
 
     /// A workaround as Rust doesn't allow us to pass DnsRecordBox in as `impl DnsRecordExt`
@@ -1941,30 +1955,37 @@ impl DnsOutgoing {
         msg: &DnsIncoming,
         answer: impl DnsRecordExt + Send + 'static,
     ) -> bool {
-        trace!("Check for add_answer");
-        if answer.suppressed_by(msg) {
+        self.add_answer_box_checked(msg, answer.boxed())
+    }
+
+    pub(crate) fn add_answer_box_checked(
+        &mut self,
+        msg: &DnsIncoming,
+        record: DnsRecordBox,
+    ) -> bool {
+        if record.suppressed_by(msg) {
             trace!("my answer is suppressed by incoming msg");
             self.known_answer_count += 1;
             return false;
         }
 
-        self.add_answer_record(answer);
+        self.add_answer_box(record);
         true
     }
 
     /// Adds `answer` to the outgoing msg unconditionally. Its full TTL is
     /// written on the wire.
     pub fn add_answer_record(&mut self, answer: impl DnsRecordExt + Send + 'static) {
-        trace!("add_answer push: {:?}", &answer);
+        trace!("add_answer push: {:?}", answer);
         self.answers.push(answer.boxed());
     }
 
     /// Adds a PTR answer for `service` along with recommended additional records
     /// (SRV, TXT, and address records) per [RFC 6763 Section 12.1].
     ///
-    /// Resolves any name conflicts via `dns_registry` and selects addresses
-    /// matching the given interface. Does nothing if no addresses are available
-    /// on `intf` or if the PTR answer is suppressed by known-answer entries in `msg`.
+    /// Uses the interface registry's current SRV/TXT records and complete host
+    /// address sets. The selected transport and both name claims must be ready.
+    /// Known-answer entries in `msg` may suppress the PTR and its additionals.
     ///
     /// [RFC 6763 Section 12.1]: https://tools.ietf.org/html/rfc6763#section-12.1
     pub(crate) fn add_answer_with_additionals(
@@ -2087,6 +2108,40 @@ impl DnsOutgoing {
     pub fn to_data_on_wire(&self, max_size: usize, is_ipv4: bool) -> Vec<Vec<u8>> {
         let packet_list = self.to_packets(max_size, is_ipv4);
         packet_list.into_iter().map(|p| p.data).collect()
+    }
+
+    /// Rejects a message if encoding omitted any question or resource record.
+    pub(crate) fn to_complete_data_on_wire(
+        &self,
+        max_size: usize,
+        is_ipv4: bool,
+    ) -> Option<Vec<Vec<u8>>> {
+        let packets = self.to_packets(max_size, is_ipv4);
+        let counts = packets.iter().fold([0usize; 4], |mut counts, packet| {
+            for (count, value) in counts.iter_mut().zip(
+                [
+                    packet.question_count,
+                    packet.answer_count,
+                    packet.auth_count,
+                    packet.addi_count,
+                ]
+                .iter(),
+            ) {
+                *count += usize::from(*value);
+            }
+            counts
+        });
+        if counts
+            != [
+                self.questions.len(),
+                self.answers.len(),
+                self.authorities.len(),
+                self.additionals.len(),
+            ]
+        {
+            return None;
+        }
+        Some(packets.into_iter().map(|packet| packet.data).collect())
     }
 
     /// Encode self into one or more packets, each no bigger than `max_size`.
@@ -2839,6 +2894,40 @@ impl DnsIncoming {
     }
 }
 
+/// Encodes record identity with canonical DNS names and byte-exact opaque data.
+/// Callers use records whose names have passed parsing or publication validation.
+pub(crate) fn canonical_rdata(record: &dyn DnsRecordExt) -> Vec<u8> {
+    let normalized: Option<DnsRecordBox> =
+        if let Some(pointer) = record.any().downcast_ref::<DnsPointer>() {
+            let mut pointer = pointer.clone();
+            pointer.alias = crate::dns_name::CanonicalName::new(&pointer.alias)
+                .as_str()
+                .to_string();
+            Some(pointer.boxed())
+        } else if let Some(srv) = record.any().downcast_ref::<DnsSrv>() {
+            let mut srv = srv.clone();
+            srv.host = crate::dns_name::CanonicalName::new(&srv.host)
+                .as_str()
+                .to_string();
+            Some(srv.boxed())
+        } else if let Some(nsec) = record.any().downcast_ref::<DnsNSec>() {
+            let mut nsec = nsec.clone();
+            nsec.next_domain = crate::dns_name::CanonicalName::new(&nsec.next_domain)
+                .as_str()
+                .to_string();
+            Some(nsec.boxed())
+        } else {
+            None
+        };
+    let mut packet = DnsOutPacket::new(usize::MAX);
+    normalized
+        .as_deref()
+        .unwrap_or(record)
+        .write(&mut packet)
+        .expect("validated record names encode without a packet limit");
+    packet.as_bytes()[MSG_HEADER_LEN..].to_vec()
+}
+
 const fn u16_from_be_slice(bytes: &[u8]) -> u16 {
     let u8_array: [u8; 2] = [bytes[0], bytes[1]];
     u16::from_be_bytes(u8_array)
@@ -2862,8 +2951,8 @@ mod tests {
     use super::{
         u16_from_be_slice, DnsAddress, DnsHostInfo, DnsIncoming, DnsNSec, DnsOutPacket,
         DnsOutgoing, DnsPointer, DnsRecordExt, DnsSrv, DnsTxt, RRType, CLASS_CACHE_FLUSH, CLASS_IN,
-        FLAGS_QR_QUERY, FLAGS_QR_RESPONSE, FLAGS_TC, MAX_PKT_ABSOLUTE_IPV6, MAX_PKT_DEFAULT,
-        MSG_HEADER_LEN,
+        FLAGS_AA, FLAGS_QR_QUERY, FLAGS_QR_RESPONSE, FLAGS_TC, MAX_PKT_ABSOLUTE_IPV6,
+        MAX_PKT_DEFAULT, MSG_HEADER_LEN,
     };
     use crate::InterfaceId;
     use std::collections::HashMap;
@@ -2963,6 +3052,51 @@ mod tests {
         assert!(first.rrdata_match(&second));
     }
 
+    #[test]
+    fn test_goodbye_ttl_preserves_record_data_and_effective_name() {
+        let mut record = DnsTxt::new(
+            "original.local.",
+            CLASS_IN | CLASS_CACHE_FLUSH,
+            120,
+            vec![3, b'k', b'=', b'v'],
+        );
+        record
+            .get_record_mut()
+            .set_new_name("renamed.local.".to_string());
+        let original = record.clone();
+        record.get_record_mut().set_ttl(0);
+        assert!(record.matches(&original));
+        assert_eq!(record.get_name(), "renamed.local.");
+        assert!(record.get_cache_flush());
+        assert_eq!(record.get_record().get_ttl(), 0);
+        assert_eq!(
+            record.get_record().get_expire_time(),
+            record.get_record().get_refresh_time()
+        );
+        let mut outgoing = DnsOutgoing::new(FLAGS_QR_RESPONSE);
+        outgoing.add_answer_record(record);
+        let packets = outgoing.to_packets(MAX_PKT_DEFAULT, IPV6);
+        let incoming =
+            DnsIncoming::new(packets[0].as_bytes().to_vec(), test_interface_id()).unwrap();
+        assert_eq!(incoming.answers()[0].get_record().get_ttl(), 1);
+        assert!(original.matches(incoming.answers()[0].as_ref()));
+    }
+
+    #[test]
+    fn test_cache_charge_counts_owned_name_and_serialized_data() {
+        let name = "printer.local.";
+        let txt = DnsTxt::new(name, CLASS_IN, 120, vec![3, b'k', b'=', b'v']);
+        assert_eq!(txt.cache_charge(), name.len() + 10 + 4);
+        let ptr = DnsPointer::new(
+            "_http._tcp.local.",
+            RRType::PTR,
+            CLASS_IN,
+            120,
+            r"A\.B.local.".to_string(),
+        );
+        assert_eq!(ptr.cache_charge(), "_http._tcp.local.".len() + 10 + 11);
+    }
+
     /// Found by fuzzing the packet parser.
     ///
     /// An HINFO record with RDLENGTH 0 placed at the very end of a message left
@@ -3003,7 +3137,7 @@ mod tests {
         let out = DnsOutgoing::new(0);
         let packets = out.to_packets(MAX_PKT_DEFAULT, IPV6);
         assert_eq!(packets.len(), 1);
-        assert_eq!(packets[0].as_bytes(), &[0; MSG_HEADER_LEN]);
+        assert_eq!(packets[0].as_bytes(), &[0; 12]);
         let expected_names = HashMap::new();
         assert_eq!(&packets[0].names, &expected_names);
     }
@@ -3760,5 +3894,20 @@ mod tests {
             types,
             [RRType::SVCB, RRType::HTTPS, RRType::AAAA, RRType::A]
         );
+    }
+    #[test]
+    fn complete_encoding_rejects_silently_omitted_items() {
+        let mut out = DnsOutgoing::new(FLAGS_QR_QUERY);
+        out.add_question(&format!("{}.local.", "x".repeat(64)), RRType::ANY);
+        out.add_authority(DnsTxt::new("valid.local.", CLASS_IN, 120, vec![0]).boxed());
+        assert!(!out.to_data_on_wire(MAX_PKT_DEFAULT, true).is_empty());
+        assert!(out
+            .to_complete_data_on_wire(MAX_PKT_DEFAULT, true)
+            .is_none());
+        let mut out = DnsOutgoing::new(FLAGS_QR_RESPONSE | FLAGS_AA);
+        out.add_answer_box(DnsTxt::new("valid.local.", CLASS_IN, 120, vec![0; 10_000]).boxed());
+        assert!(out
+            .to_complete_data_on_wire(MAX_PKT_DEFAULT, false)
+            .is_none());
     }
 }

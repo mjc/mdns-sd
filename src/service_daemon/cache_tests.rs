@@ -1,50 +1,7 @@
+use super::lifecycle_tests::{daemon, finish, receive, service};
 use super::*;
 
 const TY: &str = "_cache._tcp.local.";
-
-fn daemon() -> (Zeroconf, u32) {
-    let mut daemon = super::tests::new_test_zeroconf();
-    let loopback = my_ip_interfaces(true)
-        .into_iter()
-        .find(|intf| intf.ip() == IpAddr::V4(Ipv4Addr::LOCALHOST))
-        .unwrap();
-    let index = loopback.index.unwrap();
-    daemon.my_intfs.retain(|key, _| *key == index);
-    daemon.dns_registry_map.retain(|key, _| *key == index);
-    daemon
-        .my_intfs
-        .get_mut(&index)
-        .unwrap()
-        .addrs
-        .retain(|address| address.ip().is_ipv4());
-    daemon.ipv6_sock = None;
-    daemon.if_selections = vec![
-        IfSelection {
-            if_kind: IfKind::All,
-            selected: false,
-        },
-        IfSelection {
-            if_kind: IfKind::Name(loopback.name),
-            selected: true,
-        },
-    ];
-    // Keep this fixture focused on learned records while the legacy operation
-    // timer heap remains until the publication commit.
-    daemon.timers.clear();
-    daemon.next_ip_check = None;
-    (daemon, index)
-}
-
-fn receive(daemon: &mut Zeroconf, index: u32, records: Vec<DnsRecordBox>) {
-    let mut outgoing = DnsOutgoing::new(FLAGS_QR_RESPONSE | FLAGS_AA);
-    for record in records {
-        outgoing.add_answer_box(record);
-    }
-    let intf = InterfaceId::from(&daemon.my_intfs[&index]);
-    for packet in outgoing.to_data_on_wire(MAX_PKT_DEFAULT, true) {
-        daemon.handle_response(DnsIncoming::new(packet, intf.clone()).unwrap(), index);
-    }
-}
 
 fn discovery_records(
     daemon: &Zeroconf,
@@ -111,6 +68,35 @@ fn second_interface(daemon: &mut Zeroconf, index: u32) -> u32 {
         },
     );
     other
+}
+
+#[test]
+fn publisher_does_not_learn_unrelated_no_ptr_responses() {
+    let (mut daemon, index) = daemon();
+    daemon.register_service(service("publisher", "owned.local.", "127.0.0.1", "A"));
+    finish(&mut daemon, index);
+    assert!(daemon.service_queriers.is_empty());
+    assert!(daemon.hostname_resolvers.is_empty());
+    assert!(!daemon.accept_unsolicited);
+    let deadlines = daemon.scheduled_deadlines();
+    for version in 0..100 {
+        let instance = format!("foreign-{version}.{TY}");
+        let host = format!("foreign-{version}.local.");
+        let mut records = discovery_records(&daemon, index, &instance, &host, 86400, false);
+        records.push(DnsNSec::new(&instance, CLASS_IN, 86400, instance.clone(), vec![0]).boxed());
+        receive(&mut daemon, index, records);
+        assert_eq!(daemon.cache.usage(), (0, 0));
+        assert_eq!(daemon.scheduled_deadlines(), deadlines);
+    }
+    assert_eq!(daemon.my_services.len(), 1);
+    assert_eq!(
+        daemon.dns_registry_map[&index]
+            .active
+            .values()
+            .map(Vec::len)
+            .sum::<usize>(),
+        3
+    );
 }
 
 #[test]
@@ -715,7 +701,7 @@ fn parent_browse_retains_subtype_metadata_from_parsed_announcements() {
         1
     );
 
-    let (mut publisher, index) = self::daemon();
+    let (mut publisher, index) = super::lifecycle_tests::daemon();
     let mut records = discovery_records(&publisher, index, &instance, "subtype.local.", 120, true);
     records.push(DnsPointer::new(&subtype, RRType::PTR, CLASS_IN, 120, instance).boxed());
     receive(&mut publisher, index, records);
