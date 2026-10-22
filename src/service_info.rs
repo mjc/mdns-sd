@@ -5,7 +5,7 @@ use crate::log::{debug, trace};
 use crate::{
     dns_name::{names_equal, CanonicalName, RrsetKey},
     dns_parser::{
-        canonical_rdata, ip_address_rr_type, DnsAddress, DnsIncoming, DnsOutgoing, DnsPointer,
+        canonical_rdata, ip_address_rr_type, DnsAddress, DnsIncoming, DnsOutgoing,
         DnsRecordBox, DnsRecordExt, DnsSrv, DnsTxt, ScopedIp, CLASS_IN,
     },
     Error, IfKind, InterfaceId, Result,
@@ -279,21 +279,6 @@ impl ServiceInfo {
             }
             record
         })
-    }
-
-    pub(crate) fn ptr_records(&self, fullname: &str) -> impl Iterator<Item = DnsPointer> + '_ {
-        let fullname = fullname.to_string();
-        std::iter::once(self.get_type())
-            .chain(self.get_subtype().as_deref())
-            .map(move |name| {
-                DnsPointer::new(
-                    name,
-                    crate::RRType::PTR,
-                    CLASS_IN,
-                    self.other_ttl,
-                    fullname.clone(),
-                )
-            })
     }
 
     /// Indicates that the library should automatically
@@ -1448,6 +1433,7 @@ impl DnsRegistry {
     }
 
     /// Establishes the current proposal. Completion never appends historical data.
+    #[cfg(test)]
     pub(crate) fn complete_probe(&mut self, name: &str) -> Option<Probe> {
         let name = registry_key(name);
         let probe = self.probing.remove(&name)?;
@@ -1661,7 +1647,7 @@ mod tests {
         ServiceInfo, ServiceStatus, TxtProperty,
     };
     use crate::dns_parser::{
-        DnsAddress, DnsOutgoing, DnsPointer, DnsRecordExt, DnsSrv, DnsTxt, RRType,
+        DnsAddress, DnsOutgoing, DnsRecordExt, DnsSrv, DnsTxt, RRType,
         CLASS_CACHE_FLUSH, CLASS_IN, FLAGS_QR_RESPONSE,
     };
     use crate::{IfKind, IfPredicate};

@@ -552,10 +552,6 @@ impl DnsRecord {
         self.entry.cache_flush
     }
 
-    pub(crate) fn set_cache_flush(&mut self, cache_flush: bool) {
-        self.entry.cache_flush = cache_flush;
-    }
-
     /// Updates the refresh time to be the same as the expire time so that
     /// this record will not refresh again and will just expire.
     pub fn refresh_no_more(&mut self) {

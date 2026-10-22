@@ -34,6 +34,14 @@ impl BitOr for IpType {
     }
 }
 
+/// The result of removing records on a specific interface.
+pub(crate) struct IntfRemovalResult {
+    /// Map of ty_domain -> set of fully removed instance names (PTR gone).
+    pub(crate) removed_instances: HashMap<String, HashSet<String>>,
+    /// Set of instance names that lost records but still have PTR entries.
+    pub(crate) modified_instances: HashSet<String>,
+}
+
 /// Changes reported by the cache expiry sweep.
 pub(crate) struct CacheEviction {
     /// Whether any record expired, including records without an address.
@@ -54,8 +62,10 @@ pub(crate) struct DnsRecordIntf {
 pub(crate) struct DnsCache {
     /// DnsPointer records indexed by ty_domain
     ptr: HashMap<String, Vec<DnsRecordIntf>>,
+
     /// DnsSrv records indexed by the fullname of an instance
     srv: HashMap<String, Vec<DnsRecordIntf>>,
+
     /// DnsTxt records indexed by the fullname of an instance
     txt: HashMap<String, Vec<DnsRecordIntf>>,
     /// Address records indexed by canonical hostname.
@@ -913,9 +923,7 @@ impl DnsCache {
         });
     }
 
-    /// Removes a link's records and returns instances that may need re-resolution.
-    /// Subscription reconciliation determines which services have disappeared.
-    pub(crate) fn remove_records_on_intf(&mut self, intf: InterfaceId) -> HashSet<String> {
+    pub(crate) fn remove_records_on_intf(&mut self, intf: InterfaceId) -> IntfRemovalResult {
         let mut ptrs = Vec::new();
         let mut modified_instances = HashSet::new();
         let mut hosts = HashSet::new();
@@ -944,12 +952,18 @@ impl DnsCache {
             modified_instances.extend(self.get_instances_on_host(host.as_str()));
         }
         let now = Instant::now();
+        let mut removed_instances: HashMap<String, HashSet<String>> = HashMap::new();
         for (ty, instance) in ptrs {
             if self.has_ptr(&ty, &instance, None, now) {
                 modified_instances.insert(instance);
+            } else {
+                removed_instances.entry(ty).or_default().insert(instance);
             }
         }
-        modified_instances
+        IntfRemovalResult {
+            removed_instances,
+            modified_instances,
+        }
     }
 }
 
@@ -1047,9 +1061,9 @@ mod tests {
 
         // addr_a was removed, so the instance is in modified_instances.
         assert!(
-            result.contains(instance),
+            result.modified_instances.contains(instance),
             "expected {instance} in modified_instances, got {:?}",
-            result
+            result.modified_instances
         );
 
         // Only addr_b remains in the cache.
