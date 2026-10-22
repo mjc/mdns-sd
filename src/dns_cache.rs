@@ -68,15 +68,7 @@ impl DnsCache {
     pub(crate) fn set_limits(&mut self, max_records: usize, max_bytes: usize) {
         self.max_records = max_records;
         self.max_bytes = max_bytes;
-        loop {
-            let (records, bytes) = self.usage();
-            if records <= max_records && bytes <= max_bytes {
-                break;
-            }
-            if !self.evict_oldest() {
-                break;
-            }
-        }
+        self.trim_to_limits(max_records, max_bytes);
     }
 
     /// Returns the retained record count and charged bytes, excluding allocator overhead.
@@ -87,6 +79,14 @@ impl DnsCache {
             .fold((0, 0usize), |(count, bytes), record| {
                 (count + 1, bytes.saturating_add(record.charge))
             })
+    }
+
+    fn trim_to_limits(&mut self, max_records: usize, max_bytes: usize) -> bool {
+        std::iter::from_fn(|| {
+            let (records, bytes) = self.usage();
+            (records > max_records || bytes > max_bytes).then(|| self.evict_oldest())
+        })
+        .all(|evicted| evicted)
     }
 
     fn compact(&mut self) {
@@ -107,26 +107,24 @@ impl DnsCache {
             .records
             .iter()
             .flat_map(|(key, records)| {
-                records.iter().enumerate().map(move |(index, record)| {
-                    (
-                        key,
-                        index,
-                        !record.record.get_record().is_expired(now),
-                        record.record.get_created(),
-                    )
-                })
+                records
+                    .iter()
+                    .enumerate()
+                    .map(move |(index, record)| (key, index, record))
             })
-            .min_by_key(|(_, _, live, received)| (*live, *received))
-            .map(|(key, index, _, _)| (key.clone(), index));
-        if let Some((key, index)) = oldest {
-            if let Some(records) = self.records.get_mut(&key) {
-                records.remove(index);
-            }
-            self.compact();
-            true
-        } else {
-            false
-        }
+            .min_by_key(|(_, _, record)| {
+                (
+                    !record.record.get_record().is_expired(now),
+                    record.record.get_created(),
+                )
+            })
+            .map(|(key, index, _)| (key.clone(), index));
+        let Some((key, index)) = oldest else {
+            return false;
+        };
+        self.records.get_mut(&key).unwrap().remove(index);
+        self.compact();
+        true
     }
 
     /// Returns unexpired IN-class records, optionally restricted to one interface.
@@ -145,39 +143,35 @@ impl DnsCache {
         } else {
             std::slice::from_ref(&ty)
         };
-        let mut result = Vec::new();
-        if let Some(index) = index {
-            for ty in types {
-                let key = RrsetKey {
-                    name: name.clone(),
-                    rr_type: *ty,
-                    class: CLASS_IN,
-                };
-                if let Some(records) = self.records.get(&(index, key)) {
-                    result.extend(
-                        records
-                            .iter()
-                            .filter(|record| !record.record.get_record().is_expired(now)),
-                    );
-                }
-            }
-        } else {
-            for ((_, key), records) in &self.records {
-                if key.name == name && key.class == CLASS_IN && types.contains(&key.rr_type) {
-                    result.extend(
-                        records
-                            .iter()
-                            .filter(|record| !record.record.get_record().is_expired(now)),
-                    );
-                }
-            }
+        let mut result: Vec<_> = match index {
+            Some(index) => types
+                .iter()
+                .filter_map(|rr_type| {
+                    self.records.get(&(
+                        index,
+                        RrsetKey {
+                            name: name.clone(),
+                            rr_type: *rr_type,
+                            class: CLASS_IN,
+                        },
+                    ))
+                })
+                .flatten()
+                .collect(),
+            None => self
+                .records
+                .iter()
+                .filter(|((_, key), _)| {
+                    key.name == name && key.class == CLASS_IN && types.contains(&key.rr_type)
+                })
+                .flat_map(|(_, records)| records)
+                .collect(),
+        };
+        result.retain(|record| !record.record.get_record().is_expired(now));
+        if index.is_none() {
             result.sort_by_key(|record| record.src_intf.index);
         }
-        if result.is_empty() {
-            None
-        } else {
-            Some(result)
-        }
+        (!result.is_empty()).then_some(result)
     }
 
     pub(crate) fn records_on_intf(&self, index: u32) -> Vec<&DnsRecordIntf> {
@@ -242,6 +236,24 @@ impl DnsCache {
     pub(crate) fn get_ptr_on_intf(&self, name: &str, index: u32) -> Option<Vec<&DnsRecordIntf>> {
         self.records_for(name, RRType::PTR, Some(index))
     }
+
+    pub(crate) fn pointers(
+        &self,
+        name: &str,
+        index: Option<u32>,
+    ) -> impl Iterator<Item = (&DnsRecordIntf, &DnsPointer)> {
+        self.records_for(name, RRType::PTR, index)
+            .into_iter()
+            .flatten()
+            .filter_map(|record| {
+                record
+                    .record
+                    .any()
+                    .downcast_ref::<DnsPointer>()
+                    .map(|ptr| (record, ptr))
+            })
+    }
+
     pub(crate) fn get_srv_on_intf(&self, name: &str, index: u32) -> Option<Vec<&DnsRecordIntf>> {
         self.records_for(name, RRType::SRV, Some(index))
     }
@@ -429,14 +441,8 @@ impl DnsCache {
         if self.max_records == 0 || charge > self.max_bytes {
             return None;
         }
-        loop {
-            let (count, bytes) = self.usage();
-            if count < self.max_records && charge <= self.max_bytes.saturating_sub(bytes) {
-                break;
-            }
-            if !self.evict_oldest() {
-                return None;
-            }
+        if !self.trim_to_limits(self.max_records - 1, self.max_bytes - charge) {
+            return None;
         }
         let records = self.records.entry(key).or_default();
         if incoming.get_cache_flush() {

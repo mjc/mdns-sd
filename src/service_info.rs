@@ -5,8 +5,8 @@ use crate::log::{debug, trace};
 use crate::{
     dns_name::{names_equal, CanonicalName, RrsetKey},
     dns_parser::{
-        canonical_rdata, ip_address_rr_type, DnsAddress, DnsIncoming, DnsOutgoing, DnsRecordBox,
-        DnsRecordExt, DnsSrv, DnsTxt, ScopedIp, CLASS_IN,
+        canonical_rdata, ip_address_rr_type, DnsAddress, DnsIncoming, DnsOutgoing, DnsPointer,
+        DnsRecordBox, DnsRecordExt, DnsSrv, DnsTxt, ScopedIp, CLASS_IN,
     },
     Error, IfKind, InterfaceId, Result,
 };
@@ -253,39 +253,59 @@ impl ServiceInfo {
         Ok(this)
     }
 
-    pub(crate) fn validate_records(&self) -> Result<()> {
-        use crate::dns_parser::{DnsPointer, FLAGS_AA, FLAGS_QR_RESPONSE, MAX_PKT_DEFAULT};
-        let mut out = DnsOutgoing::new(FLAGS_QR_RESPONSE | FLAGS_AA);
-        out.add_answer_record(DnsSrv::new(
-            &self.fullname,
-            CLASS_IN,
-            self.host_ttl,
-            self.priority,
-            self.weight,
-            self.port,
-            self.server.clone(),
-        ));
-        out.add_answer_record(DnsTxt::new(
-            &self.fullname,
-            CLASS_IN,
-            self.other_ttl,
-            self.generate_txt(),
-        ));
-        out.add_answer_record(DnsPointer::new(
-            &self.ty_domain,
-            crate::RRType::PTR,
-            CLASS_IN,
-            self.other_ttl,
-            self.fullname.clone(),
-        ));
-        if let Some(subtype) = &self.sub_domain {
-            out.add_answer_record(DnsPointer::new(
-                subtype,
-                crate::RRType::PTR,
+    pub(crate) fn instance_records(&self, fullname: &str, hostname: &str) -> [DnsRecordBox; 2] {
+        [
+            DnsSrv::new(
+                &self.fullname,
+                CLASS_IN,
+                self.host_ttl,
+                self.priority,
+                self.weight,
+                self.port,
+                hostname.to_string(),
+            )
+            .boxed(),
+            DnsTxt::new(
+                &self.fullname,
                 CLASS_IN,
                 self.other_ttl,
-                self.fullname.clone(),
-            ));
+                self.generate_txt(),
+            )
+            .boxed(),
+        ]
+        .map(|mut record| {
+            if fullname != self.fullname {
+                record.get_record_mut().set_new_name(fullname.to_string());
+            }
+            record
+        })
+    }
+
+    pub(crate) fn ptr_records(&self, fullname: &str) -> impl Iterator<Item = DnsPointer> + '_ {
+        let fullname = fullname.to_string();
+        std::iter::once(self.get_type())
+            .chain(self.get_subtype().as_deref())
+            .map(move |name| {
+                DnsPointer::new(
+                    name,
+                    crate::RRType::PTR,
+                    CLASS_IN,
+                    self.other_ttl,
+                    fullname.clone(),
+                )
+            })
+    }
+
+    pub(crate) fn validate_records(&self) -> Result<()> {
+        use crate::dns_parser::{FLAGS_AA, FLAGS_QR_RESPONSE, MAX_PKT_DEFAULT};
+        let mut out = DnsOutgoing::new(FLAGS_QR_RESPONSE | FLAGS_AA);
+        for record in IntoIterator::into_iter(self.instance_records(&self.fullname, &self.server))
+            .chain(
+                self.ptr_records(&self.fullname)
+                    .map(|record| record.boxed()),
+            )
+        {
+            out.add_answer_box(record);
         }
         out.to_complete_data_on_wire(MAX_PKT_DEFAULT, false)
             .ok_or_else(|| Error::Msg("Service records contain a DNS label over 63 bytes, a name over 255 wire bytes, or a record over the mDNS packet limit".to_string()))?;
@@ -876,7 +896,7 @@ impl fmt::Debug for TxtProperty {
         write!(
             f,
             "TxtProperty {{key: \"{}\", val: {}}}",
-            self.key, val_string,
+            &self.key, &val_string,
         )
     }
 }
@@ -1425,28 +1445,10 @@ impl DnsRegistry {
                 continue;
             }
             if publish_instance {
-                let mut srv = DnsSrv::new(
-                    service.get_fullname(),
-                    CLASS_IN,
-                    service.get_host_ttl(),
-                    service.get_priority(),
-                    service.get_weight(),
-                    service.get_port(),
-                    hostname.to_string(),
-                );
-                let mut txt = DnsTxt::new(
-                    service.get_fullname(),
-                    CLASS_IN,
-                    service.get_other_ttl(),
-                    service.generate_txt(),
-                );
-                if fullname != service.get_fullname() {
-                    srv.get_record_mut().set_new_name(fullname.to_string());
-                    txt.get_record_mut().set_new_name(fullname.to_string());
-                }
                 let instance = proposals.entry(registry_key(fullname)).or_default();
-                instance.add(srv.boxed(), service);
-                instance.add(txt.boxed(), service);
+                for record in service.instance_records(fullname, hostname) {
+                    instance.add(record, service);
+                }
             }
 
             let host = proposals.entry(registry_key(hostname)).or_default();
@@ -2353,7 +2355,7 @@ mod tests {
             key: "key1".to_string(),
             val: Some("val1".to_string().into()),
         };
-        let prop_1_debug = format!("{:?}", prop_1);
+        let prop_1_debug = format!("{:?}", &prop_1);
         assert_eq!(
             prop_1_debug,
             "TxtProperty {key: \"key1\", val: Some(\"val1\")}"
@@ -2364,7 +2366,7 @@ mod tests {
             key: "key2".to_string(),
             val: Some(vec![150u8, 151u8, 152u8]),
         };
-        let prop_2_debug = format!("{:?}", prop_2);
+        let prop_2_debug = format!("{:?}", &prop_2);
         assert_eq!(
             prop_2_debug,
             "TxtProperty {key: \"key2\", val: Some(0x969798)}"

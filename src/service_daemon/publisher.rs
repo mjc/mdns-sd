@@ -8,8 +8,8 @@ use super::{
 use crate::{
     dns_name::{names_equal, RrsetKey},
     dns_parser::{
-        DnsIncoming, DnsOutgoing, DnsPointer, DnsRecordBox, DnsRecordExt, RRType, CLASS_IN,
-        FLAGS_AA, FLAGS_QR_RESPONSE,
+        DnsIncoming, DnsOutgoing, DnsPointer, DnsRecordBox, DnsRecordExt, RRType, FLAGS_AA,
+        FLAGS_QR_RESPONSE,
     },
     service_info::{registry_key, DnsRegistry, ServiceInfo, ServiceStatus},
 };
@@ -181,29 +181,8 @@ impl Zeroconf {
                 for record in registry.records_for_name(fullname) {
                     push_record(&mut records, record.clone());
                 }
-                push_record(
-                    &mut records,
-                    DnsPointer::new(
-                        service.get_type(),
-                        RRType::PTR,
-                        CLASS_IN,
-                        service.get_other_ttl(),
-                        fullname.to_string(),
-                    )
-                    .boxed(),
-                );
-                if let Some(subtype) = service.get_subtype() {
-                    push_record(
-                        &mut records,
-                        DnsPointer::new(
-                            subtype,
-                            RRType::PTR,
-                            CLASS_IN,
-                            service.get_other_ttl(),
-                            fullname.to_string(),
-                        )
-                        .boxed(),
-                    );
+                for record in service.ptr_records(fullname) {
+                    push_record(&mut records, record.boxed());
                 }
             }
             snapshot.insert(*index, records);
@@ -509,7 +488,7 @@ fn publication_delta(
 mod tests {
     use super::*;
     use crate::{
-        dns_parser::{DnsAddress, InterfaceId, MAX_PKT_DEFAULT},
+        dns_parser::{DnsAddress, InterfaceId, CLASS_IN, MAX_PKT_DEFAULT},
         service_info::MyIntf,
     };
     use std::net::{IpAddr, Ipv4Addr};

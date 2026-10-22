@@ -70,6 +70,13 @@ fn second_interface(daemon: &mut Zeroconf, index: u32) -> u32 {
     other
 }
 
+fn found_count(events: &[ServiceEvent]) -> usize {
+    events
+        .iter()
+        .filter(|event| matches!(event, ServiceEvent::ServiceFound(..)))
+        .count()
+}
+
 #[test]
 fn publisher_does_not_learn_unrelated_no_ptr_responses() {
     let (mut daemon, index) = daemon();
@@ -372,17 +379,11 @@ fn cache_only_subscription_receives_future_announcements_without_querying() {
     );
     receive(&mut daemon, index, records);
     let events: Vec<_> = receiver.try_iter().collect();
+    assert_eq!(found_count(&events), 1);
     assert_eq!(
         events
             .iter()
-            .filter(|event| matches!(event, ServiceEvent::ServiceFound(_, _)))
-            .count(),
-        1
-    );
-    assert_eq!(
-        events
-            .iter()
-            .filter(|event| matches!(event, ServiceEvent::ServiceResolved(_)))
+            .filter(|event| matches!(event, ServiceEvent::ServiceResolved(..)))
             .count(),
         1
     );
@@ -568,7 +569,6 @@ fn stopping_browses_releases_interest_without_deleting_live_records_or_verificat
     assert_eq!(daemon.service_queriers.len(), 1);
     assert!(daemon
         .resolve_service_from_cache(subtype, &instance)
-        .unwrap()
         .is_valid());
     daemon.exec_command_stop_browse(subtype.to_string());
     assert!(daemon.service_queriers.is_empty());
@@ -751,13 +751,7 @@ fn cached_type_enumeration_replays_found_without_instance_resolution() {
     let (sender, receiver) = flume::unbounded();
     daemon.exec_command_browse(false, SERVICE_TYPE_ENUMERATION.to_string(), 1, true, sender);
     let events: Vec<_> = receiver.try_iter().collect();
-    assert_eq!(
-        events
-            .iter()
-            .filter(|event| matches!(event, ServiceEvent::ServiceFound(..)))
-            .count(),
-        1
-    );
+    assert_eq!(found_count(&events), 1);
     assert!(!events
         .iter()
         .any(|event| matches!(event, ServiceEvent::ServiceResolved(..))));
@@ -784,13 +778,7 @@ fn an_instance_has_one_found_and_removed_lifetime_across_links() {
             receive(&mut daemon, index, records);
         }
         let mut events: Vec<_> = receiver.try_iter().collect();
-        assert_eq!(
-            events
-                .iter()
-                .filter(|event| matches!(event, ServiceEvent::ServiceFound(..)))
-                .count(),
-            1
-        );
+        assert_eq!(found_count(&events), 1);
         assert_eq!(daemon.service_queriers[TY].delivered.len(), 2);
         let first_id = (&daemon.my_intfs[&first]).into();
         let removed = daemon.cache.remove_records_on_intf(first_id);
@@ -828,13 +816,7 @@ fn an_instance_has_one_found_and_removed_lifetime_across_links() {
         daemon.reconcile_browse_state();
         daemon.resolve_updated_instances(&removed);
         events.extend(receiver.try_iter());
-        assert_eq!(
-            events
-                .iter()
-                .filter(|event| matches!(event, ServiceEvent::ServiceFound(..)))
-                .count(),
-            1
-        );
+        assert_eq!(found_count(&events), 1);
         assert_eq!(
             events
                 .iter()

@@ -28,7 +28,10 @@ fn main() {
     service_type.push_str(".local.");
 
     // Showcase `verify` functionality for IPv4 addresses
-    let should_verify = matches!(std::env::args().nth(2), Some(arg) if arg == "--verify");
+    let should_verify = match std::env::args().nth(2) {
+        Some(arg) if arg == "--verify" => true,
+        _ => false,
+    };
 
     // Create a daemon
     let mdns = ServiceDaemon::new().expect("Failed to create daemon");
@@ -78,7 +81,7 @@ fn main() {
                 );
             }
             other_event => {
-                println!("At {:?}: {:?}", now.elapsed(), other_event);
+                println!("At {:?}: {:?}", now.elapsed(), &other_event);
             }
         }
     }

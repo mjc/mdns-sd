@@ -112,6 +112,13 @@ fn expire_multicast_window(daemon: &mut Zeroconf, index: u32) {
     }
 }
 
+fn record<T: 'static>(records: &[DnsRecordBox]) -> &T {
+    records
+        .iter()
+        .find_map(|record| record.any().downcast_ref::<T>())
+        .expect("published record has the expected type")
+}
+
 fn active_count(daemon: &Zeroconf) -> usize {
     daemon
         .dns_registry_map
@@ -171,14 +178,8 @@ fn txt_and_port_updates_keep_established_claims_and_current_records() {
         assert!(registry.probing.is_empty());
         assert_eq!(registry.unique_records().count(), 3);
         let records = registry.records_for_name(&fullname);
-        let srv = records
-            .iter()
-            .find_map(|record| record.any().downcast_ref::<DnsSrv>())
-            .unwrap();
-        let txt = records
-            .iter()
-            .find_map(|record| record.any().downcast_ref::<DnsTxt>())
-            .unwrap();
+        let srv = record::<DnsSrv>(records);
+        let txt = record::<DnsTxt>(records);
         assert_eq!(srv.port(), 8080 + version);
         assert_eq!(txt.text(), service.generate_txt());
         assert_eq!(
@@ -301,11 +302,7 @@ fn pending_updates_a_b_a_complete_only_latest_proposal() {
     );
     finish(&mut daemon, index);
     assert_eq!(active_count(&daemon), 3);
-    let txt = daemon.dns_registry_map[&index]
-        .records_for_name(&fullname)
-        .iter()
-        .find_map(|record| record.any().downcast_ref::<DnsTxt>())
-        .unwrap();
+    let txt = record::<DnsTxt>(daemon.dns_registry_map[&index].records_for_name(&fullname));
     assert_eq!(txt.text(), first.generate_txt());
     daemon.register_service(first);
     assert!(daemon.dns_registry_map[&index].probing.is_empty());
@@ -323,11 +320,7 @@ fn established_updates_a_b_a_never_create_obsolete_probes() {
     daemon.register_service(first.clone());
     daemon.probing_handler();
     assert!(daemon.dns_registry_map[&index].probing.is_empty());
-    let txt = daemon.dns_registry_map[&index]
-        .records_for_name(&fullname)
-        .iter()
-        .find_map(|record| record.any().downcast_ref::<DnsTxt>())
-        .unwrap();
+    let txt = record::<DnsTxt>(daemon.dns_registry_map[&index].records_for_name(&fullname));
     assert_eq!(txt.text(), first.generate_txt());
     assert_eq!(active_count(&daemon), 3);
 }
@@ -638,11 +631,7 @@ fn partially_rate_limited_resend_keeps_latest_data_pending() {
     expire_multicast_window(&mut daemon, index);
     run_registration_resend(&mut daemon, &fullname, index);
     assert_eq!(registration_resends(&daemon, &fullname, index), 0);
-    let txt = daemon.dns_registry_map[&index]
-        .records_for_name(&fullname)
-        .iter()
-        .find_map(|record| record.any().downcast_ref::<DnsTxt>())
-        .unwrap();
+    let txt = record::<DnsTxt>(daemon.dns_registry_map[&index].records_for_name(&fullname));
     assert_eq!(txt.text(), updated.generate_txt());
 }
 
@@ -718,22 +707,14 @@ fn a_looped_back_old_srv_does_not_conflict_with_the_updated_registration() {
     assert!(registry.name_changes.is_empty());
     assert_eq!(active_count(&daemon), 3);
     assert!(registry.records_for_name("old.local.").is_empty());
-    let current_srv = registry
-        .records_for_name(&fullname)
-        .iter()
-        .find_map(|record| record.any().downcast_ref::<DnsSrv>())
-        .unwrap();
+    let current_srv = record::<DnsSrv>(registry.records_for_name(&fullname));
     assert_eq!(current_srv.host(), "new.local.");
     unregister(&mut daemon, &fullname);
     assert_eq!(active_count(&daemon), 0);
 }
 
 fn published_srv_host(daemon: &Zeroconf, index: u32, fullname: &str) -> String {
-    daemon.dns_registry_map[&index]
-        .records_for_name(fullname)
-        .iter()
-        .find_map(|record| record.any().downcast_ref::<DnsSrv>())
-        .unwrap()
+    record::<DnsSrv>(daemon.dns_registry_map[&index].records_for_name(fullname))
         .host()
         .to_string()
 }
@@ -1037,19 +1018,11 @@ fn hostname_update_keeps_the_current_publication_while_probing() {
         daemon.my_services[&fullname].get_status(index),
         ServiceStatus::Announced
     );
-    let srv = daemon.dns_registry_map[&index]
-        .records_for_name(&fullname)
-        .iter()
-        .find_map(|record| record.any().downcast_ref::<DnsSrv>())
-        .unwrap();
+    let srv = record::<DnsSrv>(daemon.dns_registry_map[&index].records_for_name(&fullname));
     assert_eq!(srv.host(), "old.local.");
     finish(&mut daemon, index);
     assert_eq!(daemon.my_services[&fullname].get_hostname(), "new.local.");
-    let srv = daemon.dns_registry_map[&index]
-        .records_for_name(&fullname)
-        .iter()
-        .find_map(|record| record.any().downcast_ref::<DnsSrv>())
-        .unwrap();
+    let srv = record::<DnsSrv>(daemon.dns_registry_map[&index].records_for_name(&fullname));
     assert_eq!(srv.host(), "new.local.");
     assert_eq!(active_count(&daemon), 3);
     unregister(&mut daemon, &fullname);
