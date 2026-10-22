@@ -949,7 +949,10 @@ mod tests {
                 assert!(
                     result.is_none(),
                     "a not-for-us record should be dropped, got {:?}",
-                    result.map(|(r, _)| r.record.get_name().to_string())
+                    result.map(|update| match update {
+                        CacheUpdate::Inserted(record) => record.record.get_name().to_string(),
+                        CacheUpdate::Refreshed => "refreshed".to_string(),
+                    })
                 );
             }};
         }
