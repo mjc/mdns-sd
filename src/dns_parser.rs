@@ -507,6 +507,7 @@ impl DnsRecord {
         self.ttl
     }
 
+    #[cfg(test)]
     pub(crate) fn set_ttl(&mut self, ttl: u32) {
         self.ttl = ttl;
         self.created = Instant::now();

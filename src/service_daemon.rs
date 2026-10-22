@@ -28,6 +28,8 @@
 // In mDNS and DNS, the basic data structure is "Resource Record" (RR), where
 // in Service Discovery, the basic data structure is "Service Info". One Service Info
 // corresponds to a set of DNS Resource Records.
+#[cfg(test)]
+use crate::dns_parser::DnsRecordBox;
 #[cfg(feature = "logging")]
 use crate::log::{debug, trace};
 use crate::{
@@ -35,9 +37,9 @@ use crate::{
     dns_name::{names_equal, CanonicalName, SERVICE_TYPE_ENUMERATION},
     dns_parser::{
         ip_address_rr_type, max_pkt_absolute, DnsAddress, DnsEntryExt, DnsIncoming, DnsNSec,
-        DnsOutgoing, DnsPointer, DnsQuestion, DnsRecordBox, DnsRecordExt, DnsSrv, DnsTxt,
-        InterfaceId, RRType, ScopedIp, CLASS_CACHE_FLUSH, CLASS_IN, FLAGS_AA, FLAGS_QR_QUERY,
-        FLAGS_QR_RESPONSE, MAX_PKT_ABSOLUTE_IPV6, MAX_PKT_DEFAULT,
+        DnsOutgoing, DnsPointer, DnsQuestion, DnsRecordExt, DnsSrv, DnsTxt, InterfaceId, RRType,
+        ScopedIp, CLASS_CACHE_FLUSH, CLASS_IN, FLAGS_AA, FLAGS_QR_QUERY, FLAGS_QR_RESPONSE,
+        MAX_PKT_ABSOLUTE_IPV6, MAX_PKT_DEFAULT,
     },
     error::{e_fmt, Error, Result},
     service_info::{
@@ -2085,8 +2087,8 @@ impl Zeroconf {
         let now = Instant::now();
         let types: Vec<_> = self
             .service_queriers
-            .iter()
-            .map(|(name, _)| name.as_str())
+            .keys()
+            .map(|name| name.as_str())
             .collect();
         let hosts: Vec<_> = self.hostname_resolvers.keys().map(String::as_str).collect();
         self.cache
@@ -3317,21 +3319,36 @@ impl Zeroconf {
         // check possible conflicts and handle them.
         self.conflict_handler(&msg, if_index);
 
-        let mut is_for_us = true;
-        if !self.accept_unsolicited {
-            for record in msg.answers() {
-                if let Some(ptr) = record.any().downcast_ref::<DnsPointer>() {
-                    is_for_us = self
-                        .service_queriers
-                        .contains_key(&registry_key(record.get_name()))
-                        || self
-                            .hostname_resolvers
-                            .contains_key(&registry_key(ptr.alias()));
-                    if is_for_us {
-                        break;
-                    }
+        // check if the message is for us.
+        let mut is_for_us = true; // assume it is for us.
+
+        // If there are any PTR records in the answers, there should be
+        // at least one PTR for us. Otherwise, the message is not for us.
+        // If there are no PTR records at all, assume this message is for us.
+        for answer in msg.answers() {
+            if answer.get_type() == RRType::PTR {
+                if self
+                    .service_queriers
+                    .contains_key(&registry_key(answer.get_name()))
+                {
+                    is_for_us = true;
+                    break; // OK to break: at least one PTR for us.
+                } else {
+                    is_for_us = false;
+                }
+            } else if answer.get_type() == RRType::A || answer.get_type() == RRType::AAAA {
+                // If there is a hostname querier for this address, then it is for us.
+                let answer_lowercase = registry_key(answer.get_name());
+                if self.hostname_resolvers.contains_key(&answer_lowercase) {
+                    is_for_us = true;
+                    break; // OK to break: at least one hostname for us.
                 }
             }
+        }
+
+        // if we explicitily want to accept unsolicited responses, we should consider all messages as for us.
+        if self.accept_unsolicited {
+            is_for_us = true;
         }
 
         /// Represents a DNS record change that involves one service instance.
@@ -3437,34 +3454,21 @@ impl Zeroconf {
     }
 
     fn conflict_handler(&mut self, msg: &DnsIncoming, if_index: u32) {
-        self.reconcile_registries();
         let Some(registry) = self.dns_registry_map.get_mut(&if_index) else {
             return;
         };
-        let now = Instant::now();
         let mut changed = false;
-        for incoming in msg
-            .answers()
-            .iter()
-            .chain(msg.authorities())
-            .chain(msg.additionals())
-        {
+        for incoming in msg.answers() {
             let key = registry_key(incoming.get_name());
-            let probe = registry.probing.get(&key);
-            if registry.was_recently_multicast(incoming, now)
-                || probe.is_some_and(|probe| probe.probes_sent == 0)
-            {
+            let Some(probe) = registry.probing.get(&key) else {
                 continue;
-            }
-            let records = probe
-                .map(|probe| probe.records.as_slice())
-                .unwrap_or_else(|| registry.records_for_name(&key));
-            let claimed = records.iter().any(|record| {
+            };
+            let claimed = probe.records.iter().any(|record| {
                 record.get_class() == incoming.get_class()
-                    && (probe.is_some() || record.get_type() == incoming.get_type())
+                    && record.get_type() == incoming.get_type()
             });
             if !claimed
-                || records.iter().any(|record| {
+                || probe.records.iter().any(|record| {
                     record.get_type() == incoming.get_type()
                         && record.get_class() == incoming.get_class()
                         && record.rrdata_match(incoming.as_ref())
@@ -3472,38 +3476,34 @@ impl Zeroconf {
             {
                 continue;
             }
-            if registry.active.remove(&key).is_none() {
-                let originals: Vec<_> = self
-                    .my_services
-                    .values()
-                    .flat_map(|service| {
-                        [
-                            (service.get_fullname(), false),
-                            (service.get_hostname(), true),
-                        ]
-                    })
-                    .filter(|(original, _)| names_equal(registry.resolve_name(original), &key))
-                    .collect();
-                if let Some((original, hostname)) = originals.first() {
-                    let current = registry.resolve_name(original);
-                    let renamed = if *hostname {
-                        hostname_change(current)
-                    } else {
-                        name_change(current)
-                    };
-                    for (original, _) in originals {
-                        registry
-                            .name_changes
-                            .insert(registry_key(original), renamed.clone());
-                    }
+            let originals: Vec<_> = self
+                .my_services
+                .values()
+                .flat_map(|service| {
+                    [
+                        (service.get_fullname(), false),
+                        (service.get_hostname(), true),
+                    ]
+                })
+                .filter(|(original, _)| names_equal(registry.resolve_name(original), &key))
+                .collect();
+            if let Some((original, hostname)) = originals.first() {
+                let current = registry.resolve_name(original);
+                let renamed = if *hostname {
+                    hostname_change(current)
+                } else {
+                    name_change(current)
+                };
+                for (original, _) in originals {
+                    registry
+                        .name_changes
+                        .insert(registry_key(original), renamed.clone());
                 }
             }
             registry.probing.remove(&key);
             changed = true;
         }
         if changed {
-            let services: Vec<_> = self.my_services.values().collect();
-            registry.reconcile_services(&services, &self.my_intfs[&if_index], now);
             self.reconcile_registries();
         }
     }
@@ -4304,6 +4304,8 @@ impl Zeroconf {
         match self.remove_service_subscription(&ty_domain) {
             None => debug!("StopBrowse: cannot find querier for {}", &ty_domain),
             Some(sender) => {
+                self.cache.remove_service_type(&ty_domain);
+                self.reconcile_browse_state();
                 trace!("StopBrowse: removed queryer for {}", &ty_domain);
                 match sender.try_send(ServiceEvent::SearchStopped(ty_domain)) {
                     Ok(()) => trace!("Sent SearchStopped to the listener"),
@@ -7610,8 +7612,7 @@ mod tests {
         let mut zc = new_test_zeroconf();
         let ty = "_blocked._tcp.local.";
         let (sender, receiver) = flume::bounded(10);
-        zc.service_queriers
-            .insert(ty.to_string(), sender.clone().into());
+        zc.service_queriers.insert(ty.to_string(), sender.clone());
         zc.add_retransmission(
             Instant::now() + Duration::from_secs(60),
             super::Command::Browse(ty.to_string(), 1, false, sender.clone()),
@@ -7692,7 +7693,7 @@ mod tests {
         let ty = "_stale._tcp.local.";
         let (old_sender, old_receiver) = flume::bounded(10);
         zc.service_queriers
-            .insert(ty.to_string(), old_sender.clone().into());
+            .insert(ty.to_string(), old_sender.clone());
         for i in 0..10 {
             old_sender
                 .try_send(ServiceEvent::ServiceFound(ty.to_string(), format!("i{i}")))
@@ -7705,7 +7706,7 @@ mod tests {
         assert!(!zc.service_queriers.contains_key(ty));
         let (new_sender, new_receiver) = flume::bounded(10);
         zc.service_queriers
-            .insert(ty.to_string(), new_sender.clone().into());
+            .insert(ty.to_string(), new_sender.clone());
         let retrans_before = zc.retransmissions.len();
         zc.exec_command_browse(true, ty.to_string(), 1, false, old_sender.clone());
         assert!(zc
@@ -7772,8 +7773,7 @@ mod tests {
         let mut zc = new_test_zeroconf();
         let ty = "_retr._tcp.local.";
         let (sender, receiver) = flume::bounded(10);
-        zc.service_queriers
-            .insert(ty.to_string(), sender.clone().into());
+        zc.service_queriers.insert(ty.to_string(), sender.clone());
         for i in 0..10 {
             sender
                 .try_send(ServiceEvent::ServiceFound(ty.to_string(), format!("i{i}")))
@@ -7877,8 +7877,7 @@ mod tests {
         let mut zc = new_test_zeroconf();
         let ty = "_restall._tcp.local.";
         let (sender, receiver) = flume::bounded(10);
-        zc.service_queriers
-            .insert(ty.to_string(), sender.clone().into());
+        zc.service_queriers.insert(ty.to_string(), sender.clone());
         zc.add_retransmission(
             Instant::now() + Duration::from_secs(60),
             super::Command::Browse(ty.to_string(), 1, false, sender.clone()),
@@ -7899,7 +7898,7 @@ mod tests {
             Err(flume::TryRecvError::Disconnected)
         ));
         let (sender2, receiver2) = flume::bounded(10);
-        zc.service_queriers.insert(ty.to_string(), sender2.into());
+        zc.service_queriers.insert(ty.to_string(), sender2);
         zc.push_service(
             ty,
             ServiceEvent::ServiceFound(ty.to_string(), "new".to_string()),
@@ -7942,8 +7941,7 @@ mod tests {
         let mut zc = new_test_zeroconf();
         let ty = "_cleanup._tcp.local.";
         let (sender, _receiver) = flume::bounded(10);
-        zc.service_queriers
-            .insert(ty.to_string(), sender.clone().into());
+        zc.service_queriers.insert(ty.to_string(), sender.clone());
         for i in 0..10 {
             sender
                 .try_send(ServiceEvent::ServiceFound(ty.to_string(), format!("i{i}")))

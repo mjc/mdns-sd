@@ -48,9 +48,7 @@ fn discovery_records(
 
 fn subscribe(daemon: &mut Zeroconf) -> Receiver<ServiceEvent> {
     let (sender, receiver) = flume::unbounded();
-    daemon
-        .service_queriers
-        .insert(TY.to_string(), sender.into());
+    daemon.service_queriers.insert(TY.to_string(), sender);
     receiver
 }
 

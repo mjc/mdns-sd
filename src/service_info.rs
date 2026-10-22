@@ -1347,6 +1347,7 @@ impl DnsRegistry {
 
     /// Recognizes recent looped-back records after their published data changes.
     /// The timestamps expire with the multicast window; they do not own records.
+    #[cfg(test)]
     pub(crate) fn was_recently_multicast(&self, record: &DnsRecordBox, now: Instant) -> bool {
         let key = rate_limit_key(record);
         [&self.last_multicast_v4, &self.last_multicast_v6]
