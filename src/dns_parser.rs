@@ -2115,40 +2115,6 @@ impl DnsOutgoing {
         packet_list.into_iter().map(|p| p.data).collect()
     }
 
-    /// Rejects a message if encoding omitted any question or resource record.
-    pub(crate) fn to_complete_data_on_wire(
-        &self,
-        max_size: usize,
-        is_ipv4: bool,
-    ) -> Option<Vec<Vec<u8>>> {
-        let packets = self.to_packets(max_size, is_ipv4);
-        let counts = packets.iter().fold([0usize; 4], |mut counts, packet| {
-            for (count, value) in counts.iter_mut().zip(
-                [
-                    packet.question_count,
-                    packet.answer_count,
-                    packet.auth_count,
-                    packet.addi_count,
-                ]
-                .iter(),
-            ) {
-                *count += usize::from(*value);
-            }
-            counts
-        });
-        if counts
-            != [
-                self.questions.len(),
-                self.answers.len(),
-                self.authorities.len(),
-                self.additionals.len(),
-            ]
-        {
-            return None;
-        }
-        Some(packets.into_iter().map(|packet| packet.data).collect())
-    }
-
     /// Encode self into one or more packets, each no bigger than `max_size`.
     ///
     /// Questions and records are written in message order and spill into a new
@@ -2956,8 +2922,8 @@ mod tests {
     use super::{
         u16_from_be_slice, DnsAddress, DnsHostInfo, DnsIncoming, DnsNSec, DnsOutPacket,
         DnsOutgoing, DnsPointer, DnsRecordExt, DnsSrv, DnsTxt, RRType, CLASS_CACHE_FLUSH, CLASS_IN,
-        FLAGS_AA, FLAGS_QR_QUERY, FLAGS_QR_RESPONSE, FLAGS_TC, MAX_PKT_ABSOLUTE_IPV6,
-        MAX_PKT_DEFAULT, MSG_HEADER_LEN,
+        FLAGS_QR_QUERY, FLAGS_QR_RESPONSE, FLAGS_TC, MAX_PKT_ABSOLUTE_IPV6, MAX_PKT_DEFAULT,
+        MSG_HEADER_LEN,
     };
     use crate::InterfaceId;
     use std::collections::HashMap;
@@ -3903,20 +3869,5 @@ mod tests {
             types,
             [RRType::SVCB, RRType::HTTPS, RRType::AAAA, RRType::A]
         );
-    }
-    #[test]
-    fn complete_encoding_rejects_silently_omitted_items() {
-        let mut out = DnsOutgoing::new(FLAGS_QR_QUERY);
-        out.add_question(&format!("{}.local.", "x".repeat(64)), RRType::ANY);
-        out.add_authority(DnsTxt::new("valid.local.", CLASS_IN, 120, vec![0]).boxed());
-        assert!(!out.to_data_on_wire(MAX_PKT_DEFAULT, true).is_empty());
-        assert!(out
-            .to_complete_data_on_wire(MAX_PKT_DEFAULT, true)
-            .is_none());
-        let mut out = DnsOutgoing::new(FLAGS_QR_RESPONSE | FLAGS_AA);
-        out.add_answer_box(DnsTxt::new("valid.local.", CLASS_IN, 120, vec![0; 10_000]).boxed());
-        assert!(out
-            .to_complete_data_on_wire(MAX_PKT_DEFAULT, false)
-            .is_none());
     }
 }

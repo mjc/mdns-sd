@@ -296,22 +296,6 @@ impl ServiceInfo {
             })
     }
 
-    pub(crate) fn validate_records(&self) -> Result<()> {
-        use crate::dns_parser::{FLAGS_AA, FLAGS_QR_RESPONSE, MAX_PKT_DEFAULT};
-        let mut out = DnsOutgoing::new(FLAGS_QR_RESPONSE | FLAGS_AA);
-        for record in IntoIterator::into_iter(self.instance_records(&self.fullname, &self.server))
-            .chain(
-                self.ptr_records(&self.fullname)
-                    .map(|record| record.boxed()),
-            )
-        {
-            out.add_answer_box(record);
-        }
-        out.to_complete_data_on_wire(MAX_PKT_DEFAULT, false)
-            .ok_or_else(|| Error::Msg("Service records contain a DNS label over 63 bytes, a name over 255 wire bytes, or a record over the mDNS packet limit".to_string()))?;
-        Ok(())
-    }
-
     /// Indicates that the library should automatically
     /// update the addresses of this service, when IP
     /// address(es) are added or removed on the host.
@@ -1382,22 +1366,10 @@ impl DnsRegistry {
         }
     }
 
-    /// Projects current registrations onto this interface and reconciles name claims.
-    /// Established names keep their ownership when data changes (RFC 6762 section 8.4).
-    #[cfg(test)]
+    /// Retains only records and probes required by current registrations.
     pub(crate) fn reconcile_services(
         &mut self,
         services: &[&ServiceInfo],
-        intf: &MyIntf,
-        now: Instant,
-    ) {
-        self.reconcile_publication(services, &[], intf, now);
-    }
-
-    pub(crate) fn reconcile_publication(
-        &mut self,
-        services: &[&ServiceInfo],
-        pending_hosts: &[&ServiceInfo],
         intf: &MyIntf,
         now: Instant,
     ) {
@@ -1405,26 +1377,12 @@ impl DnsRegistry {
         let originals: HashSet<_> = services
             .iter()
             .flat_map(|service| [service.get_fullname(), service.get_hostname()])
-            .chain(pending_hosts.iter().map(|service| service.get_hostname()))
             .map(registry_key)
             .collect();
         self.name_changes.retain(|name, _| originals.contains(name));
 
-        let published_hosts: HashSet<_> = services
-            .iter()
-            .filter(|service| {
-                !service.get_addrs_on_my_intf_v4(intf).is_empty()
-                    || !service.get_addrs_on_my_intf_v6(intf).is_empty()
-            })
-            .map(|service| registry_key(self.resolve_name(service.get_hostname())))
-            .collect();
-
         let mut proposals: HashMap<String, NameProposal> = HashMap::new();
-        for (service, publish_instance) in services
-            .iter()
-            .map(|service| (*service, true))
-            .chain(pending_hosts.iter().map(|service| (*service, false)))
-        {
+        for service in services {
             let addresses: Vec<_> = service
                 .get_addrs_on_my_intf_v4(intf)
                 .into_iter()
@@ -1435,16 +1393,9 @@ impl DnsRegistry {
             }
             let fullname = self.resolve_name(service.get_fullname());
             let hostname = self.resolve_name(service.get_hostname());
-            // A staged update must not change an RRset that is already published
-            // by another registration. Its addresses join that set at commit.
-            if !publish_instance && published_hosts.contains(&registry_key(hostname)) {
-                continue;
-            }
-            if publish_instance {
-                let instance = proposals.entry(registry_key(fullname)).or_default();
-                for record in service.instance_records(fullname, hostname) {
-                    instance.add(record, service);
-                }
+            let instance = proposals.entry(registry_key(fullname)).or_default();
+            for record in service.instance_records(fullname, hostname) {
+                instance.add(record, service);
             }
 
             let host = proposals.entry(registry_key(hostname)).or_default();

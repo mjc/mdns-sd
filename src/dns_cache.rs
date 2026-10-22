@@ -38,6 +38,7 @@ impl BitOr for IpType {
 pub(crate) struct CacheEviction {
     /// Whether any record expired, including records without an address.
     pub(crate) changed: bool,
+    pub(crate) expired_services: HashMap<String, HashSet<String>>,
     /// Expired address records grouped by hostname.
     pub(crate) expired_addrs: HashMap<String, HashSet<ScopedIp>>,
 }
@@ -259,24 +260,11 @@ impl DnsCache {
         (!records.is_empty()).then_some(records)
     }
 
+    #[cfg(test)]
     pub(crate) fn records_on_intf(&self, index: u32) -> Vec<&DnsRecordIntf> {
         self.records()
             .filter(|record| record.src_intf.index == index)
             .collect()
-    }
-
-    pub(crate) fn has_rrset(
-        &self,
-        record: &dyn crate::dns_parser::DnsRecordExt,
-        index: u32,
-    ) -> bool {
-        self.table(record.get_type())
-            .and_then(|table| table.get(CanonicalName::new(record.get_name()).as_str()))
-            .is_some_and(|records| {
-                records.iter().any(|existing| {
-                    existing.src_intf.index == index && existing.record.same_rrset(record)
-                })
-            })
     }
 
     /// Groups PTR records by service type across interfaces, including expired records.
@@ -346,10 +334,6 @@ impl DnsCache {
     pub(crate) fn get_txt_on_intf(&self, name: &str, index: u32) -> Option<Vec<&DnsRecordIntf>> {
         self.records_for(name, RRType::TXT, Some(index))
     }
-    pub(crate) fn get_addr_on_intf(&self, name: &str, index: u32) -> Option<Vec<&DnsRecordIntf>> {
-        self.records_for(name, RRType::ANY, Some(index))
-    }
-
     pub(crate) fn subtypes(&self, fullname: &str, index: Option<u32>) -> Vec<&str> {
         let name = CanonicalName::new(fullname);
         let now = Instant::now();
@@ -578,6 +562,16 @@ impl DnsCache {
 
     /// All record types expire through this pass, independently of PTR relationships.
     pub(crate) fn evict_expired(&mut self, now: Instant) -> CacheEviction {
+        let pointers: Vec<_> = self
+            .ptr
+            .iter()
+            .flat_map(|(ty, records)| {
+                records.iter().filter_map(move |record| {
+                    let ptr = record.record.any().downcast_ref::<DnsPointer>()?;
+                    Some((ty.clone(), ptr.alias().to_string()))
+                })
+            })
+            .collect();
         let mut changed = false;
         let mut expired_addrs: HashMap<String, HashSet<ScopedIp>> = HashMap::new();
         self.retain_records(|record| {
@@ -593,8 +587,20 @@ impl DnsCache {
             }
             false
         });
+        let mut expired_services: HashMap<String, HashSet<String>> = HashMap::new();
+        if changed {
+            for (ty, instance) in pointers {
+                if !self.pointers(&ty, None).any(|(_, ptr)| {
+                    CanonicalName::new(ptr.alias()) == CanonicalName::new(&instance)
+                }) || self.get_srv(&instance).is_none()
+                {
+                    expired_services.entry(ty).or_default().insert(instance);
+                }
+            }
+        }
         CacheEviction {
             changed,
+            expired_services,
             expired_addrs,
         }
     }
