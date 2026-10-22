@@ -5,8 +5,8 @@ use crate::log::{debug, trace};
 use crate::{
     dns_name::{names_equal, CanonicalName, RrsetKey},
     dns_parser::{
-        canonical_rdata, ip_address_rr_type, DnsAddress, DnsIncoming, DnsOutgoing,
-        DnsRecordBox, DnsRecordExt, DnsSrv, DnsTxt, ScopedIp, CLASS_IN,
+        canonical_rdata, ip_address_rr_type, DnsAddress, DnsIncoming, DnsOutgoing, DnsRecordBox,
+        DnsRecordExt, DnsSrv, DnsTxt, ScopedIp, CLASS_IN,
     },
     Error, IfKind, InterfaceId, Result,
 };
@@ -1443,6 +1443,7 @@ impl DnsRegistry {
         Some(probe)
     }
 
+    #[cfg(test)]
     pub(crate) fn records_for_name(&self, name: &str) -> &[DnsRecordBox] {
         self.active
             .get(&registry_key(name))
@@ -1647,7 +1648,7 @@ mod tests {
         ServiceInfo, ServiceStatus, TxtProperty,
     };
     use crate::dns_parser::{
-        DnsAddress, DnsOutgoing, DnsRecordExt, DnsSrv, DnsTxt, RRType,
+        DnsAddress, DnsOutgoing, DnsPointer, DnsRecordExt, DnsSrv, DnsTxt, RRType,
         CLASS_CACHE_FLUSH, CLASS_IN, FLAGS_QR_RESPONSE,
     };
     use crate::{IfKind, IfPredicate};

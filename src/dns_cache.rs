@@ -348,6 +348,10 @@ impl DnsCache {
     pub(crate) fn get_txt_on_intf(&self, name: &str, index: u32) -> Option<Vec<&DnsRecordIntf>> {
         self.records_for(name, RRType::TXT, Some(index))
     }
+    pub(crate) fn get_subtype(&self, instance: &str) -> Option<&str> {
+        self.subtypes(instance, None).into_iter().next()
+    }
+
     pub(crate) fn subtypes(&self, fullname: &str, index: Option<u32>) -> Vec<&str> {
         let name = CanonicalName::new(fullname);
         let now = Instant::now();

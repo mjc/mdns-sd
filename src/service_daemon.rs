@@ -34,7 +34,6 @@ use crate::dns_parser::DnsRecordBox;
 use crate::log::{debug, error, trace};
 use crate::{
     dns_cache::{DnsCache, IpType},
-    dns_name::CanonicalName,
     dns_parser::{
         ip_address_rr_type, max_pkt_absolute, DnsAddress, DnsEntryExt, DnsIncoming, DnsNSec,
         DnsOutgoing, DnsPointer, DnsQuestion, DnsRecordExt, DnsSrv, DnsTxt, InterfaceId, RRType,
@@ -1356,28 +1355,6 @@ fn new_multicast_socket(addr: SocketAddr) -> Result<MyUdpSocket> {
     MyUdpSocket::new(sock).map_err(|e| e_fmt!("create MyUdpSocket for {}: {}", addr, e))
 }
 
-fn schedule_register_resend(
-    retransmissions: &mut Vec<ReRun>,
-    fullname: &str,
-    index: u32,
-    mut next_time: Instant,
-) {
-    let key = CanonicalName::new(fullname);
-    retransmissions.retain(|rerun| match &rerun.command {
-        Command::RegisterResend(name, current)
-            if *current == index && CanonicalName::new(name) == key =>
-        {
-            next_time = next_time.min(rerun.next_time);
-            false
-        }
-        _ => true,
-    });
-    retransmissions.push(ReRun {
-        next_time,
-        command: Command::RegisterResend(key.as_str().to_string(), index),
-    });
-}
-
 impl Zeroconf {
     fn scheduled_deadlines(&self) -> usize {
         self.retransmissions.len()
@@ -1616,7 +1593,7 @@ impl Zeroconf {
 
     fn hostname_live(&self, hostname: &str, sender: &Sender<HostnameResolutionEvent>) -> bool {
         self.hostname_resolvers
-            .get(CanonicalName::new(hostname).as_str())
+            .get(&registry_key(hostname))
             .is_some_and(|(s, _)| s.same_channel(sender))
     }
 
@@ -2606,11 +2583,9 @@ impl Zeroconf {
                 ANNOUNCE_SECOND_DELAY_MILLIS + fastrand::u64(0..ANNOUNCE_SECOND_JITTER_MILLIS),
             );
         for if_index in outgoing_intfs {
-            schedule_register_resend(
-                &mut self.retransmissions,
-                info.get_fullname(),
-                if_index,
+            self.add_retransmission(
                 next_time,
+                Command::RegisterResend(info.get_fullname().to_string(), if_index),
             );
         }
 
@@ -3191,11 +3166,18 @@ impl Zeroconf {
             txt_properties: TxtProperties::new(),
         };
 
-        resolved_service.sub_ty_domain = self
-            .cache
-            .subtypes(fullname, None)
-            .first()
-            .map(|subtype| subtype.to_string());
+        // Be sure setting `subtype` if available even when querying for the parent domain.
+        if let Some(subtype) = self.cache.get_subtype(fullname) {
+            trace!(
+                "ty_domain: {} found subtype {} for instance: {}",
+                ty_domain,
+                subtype,
+                fullname
+            );
+            if resolved_service.sub_ty_domain.is_none() {
+                resolved_service.sub_ty_domain = Some(subtype.to_string());
+            }
+        }
 
         // resolve SRV record
         if let Some(records) = self.cache.get_srv(fullname) {
