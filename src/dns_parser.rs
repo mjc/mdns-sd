@@ -7,6 +7,7 @@
 #[cfg(feature = "logging")]
 use crate::log::{debug, trace};
 
+use crate::dns_name::{labels, names_equal};
 use crate::error::{e_fmt, Error, Result};
 use crate::service_info::{decode_txt, is_unicast_link_local, DnsRegistry, MyIntf, ServiceInfo};
 
@@ -209,7 +210,7 @@ impl fmt::Display for ScopedIp {
 /// DNS resource record types, stored as `u16`. Can do `as u16` when needed.
 ///
 /// See [RFC 1035 section 3.2.2](https://datatracker.ietf.org/doc/html/rfc1035#section-3.2.2)
-#[derive(Debug, PartialEq, Eq, Clone, Copy, PartialOrd, Ord)]
+#[derive(Debug, Hash, PartialEq, Eq, Clone, Copy, PartialOrd, Ord)]
 #[non_exhaustive]
 #[repr(u16)]
 pub enum RRType {
@@ -333,12 +334,12 @@ const MSG_HEADER_LEN: usize = 12;
 /// Max size of a single DNS label, in bytes.
 ///
 /// Reference: [RFC1035 section 2.3.4](https://datatracker.ietf.org/doc/html/rfc1035#section-2.3.4)
-const MAX_LABEL_BYTES: usize = 63;
+pub(crate) const MAX_LABEL_BYTES: usize = 63;
 
 /// Max size of a whole domain name, in bytes.
 ///
 /// Reference: [RFC1035 section 2.3.4](https://datatracker.ietf.org/doc/html/rfc1035#section-2.3.4)
-const MAX_NAME_BYTES: usize = 255;
+pub(crate) const MAX_NAME_BYTES: usize = 255;
 
 /// Why a question or a record could not be written into a packet.
 ///
@@ -346,7 +347,8 @@ const MAX_NAME_BYTES: usize = 255;
 /// whatever was written and skips the item.
 #[derive(Debug, PartialEq, Eq)]
 pub enum WriteError {
-    /// A label in a name is longer than [`MAX_LABEL_BYTES`].
+    /// A label exceeds [`MAX_LABEL_BYTES`] or the complete encoded name exceeds
+    /// [`MAX_NAME_BYTES`].
     NameTooLong,
 
     /// The packet would exceed its max size with this record.
@@ -407,12 +409,18 @@ pub const fn ip_address_rr_type(address: &IpAddr) -> RRType {
     }
 }
 
-#[derive(Eq, PartialEq, Debug, Clone)]
+#[derive(Eq, Debug, Clone)]
 pub struct DnsEntry {
-    pub(crate) name: String, // always lower case.
+    pub(crate) name: String,
     pub(crate) ty: RRType,
     class: u16,
     cache_flush: bool,
+}
+
+impl PartialEq for DnsEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.ty == other.ty && self.class == other.class && names_equal(&self.name, &other.name)
+    }
 }
 
 impl DnsEntry {
@@ -476,9 +484,14 @@ impl DnsRecord {
         // From RFC 6762 section 5.2:
         // "... The querier should plan to issue a query at 80% of the record
         // lifetime, and then if no answer is received, at 85%, 90%, and 95%."
-        let refresh = get_expiration_time(created, ttl, 80);
-
         let expires = get_expiration_time(created, ttl, 100);
+        let refresh = if ttl > 1 {
+            get_expiration_time(created, ttl, 80)
+        } else {
+            // TTL 0 means immediate expiry; mDNS goodbye responses are
+            // received with TTL 1 and should expire after that second.
+            expires
+        };
 
         Self {
             entry: DnsEntry::new(name.to_string(), ty, class),
@@ -492,6 +505,17 @@ impl DnsRecord {
 
     pub const fn get_ttl(&self) -> u32 {
         self.ttl
+    }
+
+    pub(crate) fn set_ttl(&mut self, ttl: u32) {
+        self.ttl = ttl;
+        self.created = Instant::now();
+        self.expires = get_expiration_time(self.created, ttl, 100);
+        self.refresh = if ttl > 1 {
+            get_expiration_time(self.created, ttl, 80)
+        } else {
+            self.expires
+        };
     }
 
     pub const fn get_expire_time(&self) -> Instant {
@@ -525,6 +549,10 @@ impl DnsRecord {
 
     pub fn is_unique(&self) -> bool {
         self.entry.cache_flush
+    }
+
+    pub(crate) fn set_cache_flush(&mut self, cache_flush: bool) {
+        self.entry.cache_flush = cache_flush;
     }
 
     /// Updates the refresh time to be the same as the expire time so that
@@ -653,11 +681,32 @@ pub trait DnsRecordExt: fmt::Debug {
     fn write(&self, packet: &mut DnsOutPacket) -> WriteResult;
     fn any(&self) -> &dyn Any;
 
-    /// Returns whether `other` record is considered the same except TTL.
+    /// Compares record identity and data, ignoring TTL and the cache-flush flag.
     fn matches(&self, other: &dyn DnsRecordExt) -> bool;
+
+    /// Compares the effective owner, type and class, excluding packet flags and TTL.
+    fn same_rrset(&self, other: &dyn DnsRecordExt) -> bool {
+        self.get_type() == other.get_type()
+            && self.get_class() == other.get_class()
+            && names_equal(self.get_name(), other.get_name())
+    }
 
     /// Returns whether `other` record has the same rdata.
     fn rrdata_match(&self, other: &dyn DnsRecordExt) -> bool;
+
+    /// Returns the cache charge in bytes for the owner presentation, RR header
+    /// and uncompressed RDATA, excluding allocator overhead.
+    /// Returns `usize::MAX` if the RDATA cannot be encoded.
+    fn cache_charge(&self) -> usize {
+        let mut packet = DnsOutPacket::new(usize::MAX);
+        if self.write(&mut packet).is_err() {
+            return usize::MAX;
+        }
+        self.get_name()
+            .len()
+            .saturating_add(10)
+            .saturating_add(packet.size().saturating_sub(MSG_HEADER_LEN))
+    }
 
     /// Returns the result based on a byte-level comparison of `rdata`.
     /// If `other` is not valid, returns `Greater`.
@@ -837,7 +886,7 @@ impl DnsRecordExt for DnsAddress {
     fn matches(&self, other: &dyn DnsRecordExt) -> bool {
         if let Some(other_a) = other.any().downcast_ref::<Self>() {
             return self.address == other_a.address
-                && self.record.entry == other_a.record.entry
+                && self.same_rrset(other_a)
                 && self.interface_id == other_a.interface_id;
         }
         false
@@ -908,14 +957,14 @@ impl DnsRecordExt for DnsPointer {
 
     fn matches(&self, other: &dyn DnsRecordExt) -> bool {
         if let Some(other_ptr) = other.any().downcast_ref::<Self>() {
-            return self.alias == other_ptr.alias && self.record.entry == other_ptr.record.entry;
+            return names_equal(&self.alias, &other_ptr.alias) && self.same_rrset(other_ptr);
         }
         false
     }
 
     fn rrdata_match(&self, other: &dyn DnsRecordExt) -> bool {
         if let Some(other_ptr) = other.any().downcast_ref::<Self>() {
-            return self.alias == other_ptr.alias;
+            return names_equal(&self.alias, &other_ptr.alias);
         }
         false
     }
@@ -978,10 +1027,6 @@ impl DnsSrv {
     pub fn port(&self) -> u16 {
         self.port
     }
-
-    pub fn set_host(&mut self, host: String) {
-        self.host = host;
-    }
 }
 
 impl DnsRecordExt for DnsSrv {
@@ -1006,18 +1051,18 @@ impl DnsRecordExt for DnsSrv {
 
     fn matches(&self, other: &dyn DnsRecordExt) -> bool {
         if let Some(other_svc) = other.any().downcast_ref::<Self>() {
-            return self.host == other_svc.host
+            return names_equal(&self.host, &other_svc.host)
                 && self.port == other_svc.port
                 && self.weight == other_svc.weight
                 && self.priority == other_svc.priority
-                && self.record.entry == other_svc.record.entry;
+                && self.same_rrset(other_svc);
         }
         false
     }
 
     fn rrdata_match(&self, other: &dyn DnsRecordExt) -> bool {
         if let Some(other_srv) = other.any().downcast_ref::<Self>() {
-            return self.host == other_srv.host
+            return names_equal(&self.host, &other_srv.host)
                 && self.port == other_srv.port
                 && self.weight == other_srv.weight
                 && self.priority == other_srv.priority;
@@ -1124,7 +1169,7 @@ impl DnsRecordExt for DnsTxt {
 
     fn matches(&self, other: &dyn DnsRecordExt) -> bool {
         if let Some(other_txt) = other.any().downcast_ref::<Self>() {
-            return self.text == other_txt.text && self.record.entry == other_txt.record.entry;
+            return self.text == other_txt.text && self.same_rrset(other_txt);
         }
         false
     }
@@ -1207,7 +1252,7 @@ impl DnsRecordExt for DnsHostInfo {
         if let Some(other_hinfo) = other.any().downcast_ref::<Self>() {
             return self.cpu == other_hinfo.cpu
                 && self.os == other_hinfo.os
-                && self.record.entry == other_hinfo.record.entry;
+                && self.same_rrset(other_hinfo);
         }
         false
     }
@@ -1323,16 +1368,16 @@ impl DnsRecordExt for DnsNSec {
 
     fn matches(&self, other: &dyn DnsRecordExt) -> bool {
         if let Some(other_record) = other.any().downcast_ref::<Self>() {
-            return self.next_domain == other_record.next_domain
+            return names_equal(&self.next_domain, &other_record.next_domain)
                 && self.type_bitmap == other_record.type_bitmap
-                && self.record.entry == other_record.record.entry;
+                && self.same_rrset(other_record);
         }
         false
     }
 
     fn rrdata_match(&self, other: &dyn DnsRecordExt) -> bool {
         if let Some(other_record) = other.any().downcast_ref::<Self>() {
-            return self.next_domain == other_record.next_domain
+            return names_equal(&self.next_domain, &other_record.next_domain)
                 && self.type_bitmap == other_record.type_bitmap;
         }
         false
@@ -1506,50 +1551,7 @@ impl DnsOutPacket {
     /// - \\. becomes . (literal dot)
     /// - \\\\ becomes \\ (literal backslash)
     fn parse_escaped_name(name: &str) -> Vec<String> {
-        let mut labels = Vec::new();
-        let mut current_label = String::new();
-        let mut chars = name.chars().peekable();
-
-        while let Some(ch) = chars.next() {
-            match ch {
-                '\\' => {
-                    // Backslash escape sequence
-                    if let Some(&next_ch) = chars.peek() {
-                        match next_ch {
-                            '.' | '\\' => {
-                                // \\. or \\\\ - consume the backslash and add the escaped char
-                                chars.next();
-                                current_label.push(next_ch);
-                            }
-                            _ => {
-                                // Not a recognized escape - treat backslash literally
-                                current_label.push(ch);
-                            }
-                        }
-                    } else {
-                        // Trailing backslash - add it literally
-                        current_label.push(ch);
-                    }
-                }
-                '.' => {
-                    // Unescaped dot - label separator
-                    if !current_label.is_empty() {
-                        labels.push(current_label.clone());
-                        current_label.clear();
-                    }
-                }
-                _ => {
-                    current_label.push(ch);
-                }
-            }
-        }
-
-        // Add the last label if not empty
-        if !current_label.is_empty() {
-            labels.push(current_label);
-        }
-
-        labels
+        labels(name)
     }
 
     // Write name to packet
@@ -1840,8 +1842,7 @@ impl DnsOutgoing {
         &self.questions
     }
 
-    /// For testing purposes only.
-    pub(crate) fn _answers(&self) -> &[DnsRecordBox] {
+    pub(crate) fn answers(&self) -> &[DnsRecordBox] {
         &self.answers
     }
 
@@ -1920,7 +1921,11 @@ impl DnsOutgoing {
     //    o  All address records (type "A" and "AAAA") named in the SRV rdata.
     pub fn add_additional_answer(&mut self, answer: impl DnsRecordExt + 'static) {
         trace!("add_additional_answer: {:?}", &answer);
-        self.additionals.push(answer.boxed());
+        self.add_additional_box(answer.boxed());
+    }
+
+    pub(crate) fn add_additional_box(&mut self, record: DnsRecordBox) {
+        self.additionals.push(record);
     }
 
     /// A workaround as Rust doesn't allow us to pass DnsRecordBox in as `impl DnsRecordExt`
@@ -1955,14 +1960,21 @@ impl DnsOutgoing {
         msg: &DnsIncoming,
         answer: impl DnsRecordExt + Send + 'static,
     ) -> bool {
-        trace!("Check for add_answer");
-        if answer.suppressed_by(msg) {
+        self.add_answer_box_checked(msg, answer.boxed())
+    }
+
+    pub(crate) fn add_answer_box_checked(
+        &mut self,
+        msg: &DnsIncoming,
+        record: DnsRecordBox,
+    ) -> bool {
+        if record.suppressed_by(msg) {
             trace!("my answer is suppressed by incoming msg");
             self.known_answer_count += 1;
             return false;
         }
 
-        self.add_answer_record(answer);
+        self.add_answer_box(record);
         true
     }
 
@@ -1976,9 +1988,9 @@ impl DnsOutgoing {
     /// Adds a PTR answer for `service` along with recommended additional records
     /// (SRV, TXT, and address records) per [RFC 6763 Section 12.1].
     ///
-    /// Resolves any name conflicts via `dns_registry` and selects addresses
-    /// matching the given interface. Does nothing if no addresses are available
-    /// on `intf` or if the PTR answer is suppressed by known-answer entries in `msg`.
+    /// Uses the interface registry's current SRV/TXT records and complete host
+    /// address sets. The selected transport and both name claims must be ready.
+    /// Known-answer entries in `msg` may suppress the PTR and its additionals.
     ///
     /// [RFC 6763 Section 12.1]: https://tools.ietf.org/html/rfc6763#section-12.1
     pub(crate) fn add_answer_with_additionals(
@@ -2101,6 +2113,40 @@ impl DnsOutgoing {
     pub fn to_data_on_wire(&self, max_size: usize, is_ipv4: bool) -> Vec<Vec<u8>> {
         let packet_list = self.to_packets(max_size, is_ipv4);
         packet_list.into_iter().map(|p| p.data).collect()
+    }
+
+    /// Rejects a message if encoding omitted any question or resource record.
+    pub(crate) fn to_complete_data_on_wire(
+        &self,
+        max_size: usize,
+        is_ipv4: bool,
+    ) -> Option<Vec<Vec<u8>>> {
+        let packets = self.to_packets(max_size, is_ipv4);
+        let counts = packets.iter().fold([0usize; 4], |mut counts, packet| {
+            for (count, value) in counts.iter_mut().zip(
+                [
+                    packet.question_count,
+                    packet.answer_count,
+                    packet.auth_count,
+                    packet.addi_count,
+                ]
+                .iter(),
+            ) {
+                *count += usize::from(*value);
+            }
+            counts
+        });
+        if counts
+            != [
+                self.questions.len(),
+                self.answers.len(),
+                self.authorities.len(),
+                self.additionals.len(),
+            ]
+        {
+            return None;
+        }
+        Some(packets.into_iter().map(|packet| packet.data).collect())
     }
 
     /// Encode self into one or more packets, each no bigger than `max_size`.
@@ -2853,6 +2899,40 @@ impl DnsIncoming {
     }
 }
 
+/// Encodes record identity with canonical DNS names and byte-exact opaque data.
+/// Callers use records whose names have passed parsing or publication validation.
+pub(crate) fn canonical_rdata(record: &dyn DnsRecordExt) -> Vec<u8> {
+    let normalized: Option<DnsRecordBox> =
+        if let Some(pointer) = record.any().downcast_ref::<DnsPointer>() {
+            let mut pointer = pointer.clone();
+            pointer.alias = crate::dns_name::CanonicalName::new(&pointer.alias)
+                .as_str()
+                .to_string();
+            Some(pointer.boxed())
+        } else if let Some(srv) = record.any().downcast_ref::<DnsSrv>() {
+            let mut srv = srv.clone();
+            srv.host = crate::dns_name::CanonicalName::new(&srv.host)
+                .as_str()
+                .to_string();
+            Some(srv.boxed())
+        } else if let Some(nsec) = record.any().downcast_ref::<DnsNSec>() {
+            let mut nsec = nsec.clone();
+            nsec.next_domain = crate::dns_name::CanonicalName::new(&nsec.next_domain)
+                .as_str()
+                .to_string();
+            Some(nsec.boxed())
+        } else {
+            None
+        };
+    let mut packet = DnsOutPacket::new(usize::MAX);
+    normalized
+        .as_deref()
+        .unwrap_or(record)
+        .write(&mut packet)
+        .expect("validated record names encode without a packet limit");
+    packet.as_bytes()[MSG_HEADER_LEN..].to_vec()
+}
+
 const fn u16_from_be_slice(bytes: &[u8]) -> u16 {
     let u8_array: [u8; 2] = [bytes[0], bytes[1]];
     u16::from_be_bytes(u8_array)
@@ -2874,9 +2954,10 @@ fn get_expiration_time(created: Instant, ttl: u32, percent: u32) -> Instant {
 #[cfg(test)]
 mod tests {
     use super::{
-        u16_from_be_slice, DnsAddress, DnsHostInfo, DnsIncoming, DnsOutPacket, DnsOutgoing,
-        DnsPointer, DnsTxt, RRType, CLASS_CACHE_FLUSH, CLASS_IN, FLAGS_QR_QUERY, FLAGS_QR_RESPONSE,
-        FLAGS_TC, MAX_PKT_ABSOLUTE_IPV6, MAX_PKT_DEFAULT, MSG_HEADER_LEN,
+        u16_from_be_slice, DnsAddress, DnsHostInfo, DnsIncoming, DnsNSec, DnsOutPacket,
+        DnsOutgoing, DnsPointer, DnsRecordExt, DnsSrv, DnsTxt, RRType, CLASS_CACHE_FLUSH, CLASS_IN,
+        FLAGS_AA, FLAGS_QR_QUERY, FLAGS_QR_RESPONSE, FLAGS_TC, MAX_PKT_ABSOLUTE_IPV6,
+        MAX_PKT_DEFAULT, MSG_HEADER_LEN,
     };
     use crate::InterfaceId;
     use std::collections::HashMap;
@@ -2885,6 +2966,145 @@ mod tests {
     /// The `is_ipv4` argument of `to_packets`. IPv6 has the smaller of the two
     /// absolute ceilings, so it is the stricter one to encode for.
     const IPV6: bool = false;
+
+    #[test]
+    fn test_record_identity_ignores_flush_ttl_and_ascii_case() {
+        let first = DnsTxt::new(
+            "Printer._http._tcp.local.",
+            CLASS_IN,
+            120,
+            vec![3, b'A', b'=', b'B'],
+        );
+        let second = DnsTxt::new(
+            "printer._HTTP._tcp.LOCAL.",
+            CLASS_IN | CLASS_CACHE_FLUSH,
+            4500,
+            vec![3, b'A', b'=', b'B'],
+        );
+        assert!(first.matches(&second));
+        assert!(second.matches(&first));
+        let different_data = DnsTxt::new(
+            "printer._http._tcp.local.",
+            CLASS_IN,
+            120,
+            vec![3, b'A', b'=', b'b'],
+        );
+        assert!(!first.matches(&different_data));
+        let different_unicode =
+            DnsTxt::new("Pr\u{e4}nter._http._tcp.local.", CLASS_IN, 120, vec![0]);
+        let uppercase_unicode =
+            DnsTxt::new("Pr\u{c4}nter._http._tcp.local.", CLASS_IN, 120, vec![0]);
+        assert!(!different_unicode.matches(&uppercase_unicode));
+    }
+
+    #[test]
+    fn test_record_identity_compares_embedded_names_without_ascii_case() {
+        let first = DnsPointer::new(
+            "_http._tcp.local.",
+            RRType::PTR,
+            CLASS_IN,
+            120,
+            "Printer._http._tcp.local.".to_string(),
+        );
+        let second = DnsPointer::new(
+            "_HTTP._tcp.LOCAL.",
+            RRType::PTR,
+            CLASS_IN,
+            120,
+            "printer._HTTP._tcp.LOCAL.".to_string(),
+        );
+        assert!(first.matches(&second));
+        assert!(first.rrdata_match(&second));
+        assert_ne!(first.compare_rdata(&second), std::cmp::Ordering::Equal);
+
+        let first = DnsSrv::new(
+            "Printer._http._tcp.local.",
+            CLASS_IN,
+            120,
+            0,
+            0,
+            80,
+            "Host.local.".to_string(),
+        );
+        let second = DnsSrv::new(
+            "printer._http._tcp.local.",
+            CLASS_IN | CLASS_CACHE_FLUSH,
+            120,
+            0,
+            0,
+            80,
+            "host.LOCAL.".to_string(),
+        );
+        assert!(first.matches(&second));
+        assert!(first.rrdata_match(&second));
+        assert_ne!(first.compare_rdata(&second), std::cmp::Ordering::Equal);
+
+        let first = DnsNSec::new(
+            "Host.local.",
+            CLASS_IN,
+            120,
+            "Host.local.".to_string(),
+            vec![0, 1, 0x40],
+        );
+        let second = DnsNSec::new(
+            "host.LOCAL.",
+            CLASS_IN | CLASS_CACHE_FLUSH,
+            120,
+            "host.LOCAL.".to_string(),
+            vec![0, 1, 0x40],
+        );
+        assert!(first.matches(&second));
+        assert!(first.rrdata_match(&second));
+    }
+
+    #[test]
+    fn test_goodbye_ttl_preserves_record_data_and_effective_name() {
+        let mut record = DnsTxt::new(
+            "original.local.",
+            CLASS_IN | CLASS_CACHE_FLUSH,
+            120,
+            vec![3, b'k', b'=', b'v'],
+        );
+        record
+            .get_record_mut()
+            .set_new_name("renamed.local.".to_string());
+        let original = record.clone();
+        record.get_record_mut().set_ttl(0);
+        assert!(record.matches(&original));
+        assert_eq!(record.get_name(), "renamed.local.");
+        assert!(record.get_cache_flush());
+        assert_eq!(record.get_record().get_ttl(), 0);
+        assert_eq!(
+            record.get_record().get_expire_time(),
+            record.get_record().get_refresh_time()
+        );
+        let mut outgoing = DnsOutgoing::new(FLAGS_QR_RESPONSE);
+        outgoing.add_answer_record(record);
+        let packets = outgoing.to_packets(MAX_PKT_DEFAULT, IPV6);
+        let incoming =
+            DnsIncoming::new(packets[0].as_bytes().to_vec(), test_interface_id()).unwrap();
+        assert_eq!(incoming.answers()[0].get_record().get_ttl(), 1);
+        assert_eq!(
+            incoming.answers()[0].get_record().get_expire_time(),
+            incoming.answers()[0].get_record().get_refresh_time()
+        );
+        assert!(original.matches(incoming.answers()[0].as_ref()));
+    }
+
+    #[test]
+    fn test_cache_charge_counts_owned_name_and_serialized_data() {
+        let name = "printer.local.";
+        let txt = DnsTxt::new(name, CLASS_IN, 120, vec![3, b'k', b'=', b'v']);
+        assert_eq!(txt.cache_charge(), name.len() + 10 + 4);
+        let ptr = DnsPointer::new(
+            "_http._tcp.local.",
+            RRType::PTR,
+            CLASS_IN,
+            120,
+            r"A\.B.local.".to_string(),
+        );
+        assert_eq!(ptr.cache_charge(), "_http._tcp.local.".len() + 10 + 11);
+    }
 
     /// Found by fuzzing the packet parser.
     ///
@@ -3139,10 +3359,7 @@ mod tests {
         assert_eq!(incoming.answers().len(), 1);
     }
 
-    /// A name learned from the network can hold a label that ends with a
-    /// backslash, which escapes the following label separator. Unescaping such
-    /// a name on the way out merges two 63-byte labels into a 127-byte one.
-    /// This used to panic the daemon thread. See issue #483.
+    /// A trailing backslash in a wire label must not escape the next separator.
     #[test]
     fn test_incoming_name_with_merged_labels_does_not_panic() {
         // A query with one question: "aa..a\" + "bb..b", 63 bytes each.
@@ -3686,5 +3903,20 @@ mod tests {
             types,
             [RRType::SVCB, RRType::HTTPS, RRType::AAAA, RRType::A]
         );
+    }
+    #[test]
+    fn complete_encoding_rejects_silently_omitted_items() {
+        let mut out = DnsOutgoing::new(FLAGS_QR_QUERY);
+        out.add_question(&format!("{}.local.", "x".repeat(64)), RRType::ANY);
+        out.add_authority(DnsTxt::new("valid.local.", CLASS_IN, 120, vec![0]).boxed());
+        assert!(!out.to_data_on_wire(MAX_PKT_DEFAULT, true).is_empty());
+        assert!(out
+            .to_complete_data_on_wire(MAX_PKT_DEFAULT, true)
+            .is_none());
+        let mut out = DnsOutgoing::new(FLAGS_QR_RESPONSE | FLAGS_AA);
+        out.add_answer_box(DnsTxt::new("valid.local.", CLASS_IN, 120, vec![0; 10_000]).boxed());
+        assert!(out
+            .to_complete_data_on_wire(MAX_PKT_DEFAULT, false)
+            .is_none());
     }
 }

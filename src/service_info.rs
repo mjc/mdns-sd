@@ -3,7 +3,11 @@
 #[cfg(feature = "logging")]
 use crate::log::{debug, trace};
 use crate::{
-    dns_parser::{DnsIncoming, DnsOutgoing, DnsRecordBox, DnsRecordExt, DnsSrv, RRType, ScopedIp},
+    dns_name::{names_equal, CanonicalName, RrsetKey},
+    dns_parser::{
+        canonical_rdata, ip_address_rr_type, DnsAddress, DnsIncoming, DnsOutgoing, DnsPointer,
+        DnsRecordBox, DnsRecordExt, DnsSrv, DnsTxt, ScopedIp, CLASS_IN,
+    },
     Error, IfKind, InterfaceId, Result,
 };
 use if_addrs::{IfAddr, Interface};
@@ -247,6 +251,65 @@ impl ServiceInfo {
         };
 
         Ok(this)
+    }
+
+    pub(crate) fn instance_records(&self, fullname: &str, hostname: &str) -> [DnsRecordBox; 2] {
+        [
+            DnsSrv::new(
+                &self.fullname,
+                CLASS_IN,
+                self.host_ttl,
+                self.priority,
+                self.weight,
+                self.port,
+                hostname.to_string(),
+            )
+            .boxed(),
+            DnsTxt::new(
+                &self.fullname,
+                CLASS_IN,
+                self.other_ttl,
+                self.generate_txt(),
+            )
+            .boxed(),
+        ]
+        .map(|mut record| {
+            if fullname != self.fullname {
+                record.get_record_mut().set_new_name(fullname.to_string());
+            }
+            record
+        })
+    }
+
+    pub(crate) fn ptr_records(&self, fullname: &str) -> impl Iterator<Item = DnsPointer> + '_ {
+        let fullname = fullname.to_string();
+        std::iter::once(self.get_type())
+            .chain(self.get_subtype().as_deref())
+            .map(move |name| {
+                DnsPointer::new(
+                    name,
+                    crate::RRType::PTR,
+                    CLASS_IN,
+                    self.other_ttl,
+                    fullname.clone(),
+                )
+            })
+    }
+
+    pub(crate) fn validate_records(&self) -> Result<()> {
+        use crate::dns_parser::{FLAGS_AA, FLAGS_QR_RESPONSE, MAX_PKT_DEFAULT};
+        let mut out = DnsOutgoing::new(FLAGS_QR_RESPONSE | FLAGS_AA);
+        for record in IntoIterator::into_iter(self.instance_records(&self.fullname, &self.server))
+            .chain(
+                self.ptr_records(&self.fullname)
+                    .map(|record| record.boxed()),
+            )
+        {
+            out.add_answer_box(record);
+        }
+        out.to_complete_data_on_wire(MAX_PKT_DEFAULT, false)
+            .ok_or_else(|| Error::Msg("Service records contain a DNS label over 63 bytes, a name over 255 wire bytes, or a record over the mDNS packet limit".to_string()))?;
+        Ok(())
     }
 
     /// Indicates that the library should automatically
@@ -509,6 +572,14 @@ impl ServiceInfo {
             .get(&intf)
             .cloned()
             .unwrap_or(ServiceStatus::Unknown)
+    }
+
+    pub(crate) fn remove_status(&mut self, if_index: u32) {
+        self.status.remove(&if_index);
+    }
+
+    pub(crate) fn retain_statuses(&mut self, interfaces: &HashSet<u32>) {
+        self.status.retain(|index, _| interfaces.contains(index));
     }
 
     /// Consumes self and returns a resolved service, i.e. a lite version of `ServiceInfo`.
@@ -1026,6 +1097,9 @@ pub(crate) struct Probe {
 
     /// The time to send the next (including the first) query.
     pub(crate) next_send: Instant,
+
+    /// Probe queries issued for this proposal.
+    pub(crate) probes_sent: u8,
 }
 
 impl Probe {
@@ -1043,11 +1117,19 @@ impl Probe {
             waiting_services: HashSet::new(),
             start_time,
             next_send,
+            probes_sent: 0,
         }
     }
 
     /// Add a new record with the same probing name in a sorted order.
     pub(crate) fn insert_record(&mut self, record: DnsRecordBox) {
+        if self
+            .records
+            .iter()
+            .any(|existing| same_record(existing, &record))
+        {
+            return;
+        }
         /*
         RFC 6762: https://datatracker.ietf.org/doc/html/rfc6762#section-8.2.1
 
@@ -1059,12 +1141,7 @@ impl Probe {
          */
         let insert_position = self
             .records
-            .binary_search_by(
-                |existing| match existing.get_class().cmp(&record.get_class()) {
-                    std::cmp::Ordering::Equal => existing.get_type().cmp(&record.get_type()),
-                    other => other,
-                },
-            )
+            .binary_search_by(|existing| existing.compare(record.as_ref()))
             .unwrap_or_else(|pos| pos);
 
         self.records.insert(insert_position, record);
@@ -1081,11 +1158,12 @@ impl Probe {
             return;
         }
 
-        let incoming: Vec<_> = msg
+        let mut incoming: Vec<_> = msg
             .authorities()
             .iter()
-            .filter(|r| r.get_name() == probe_name)
+            .filter(|r| names_equal(r.get_name(), probe_name))
             .collect();
+        incoming.sort_unstable_by(|left, right| left.compare(right.as_ref()));
         /*
         RFC 6762 section 8.2: https://datatracker.ietf.org/doc/html/rfc6762#section-8.2
         ...
@@ -1119,6 +1197,7 @@ impl Probe {
                 debug!("tiebreaking '{probe_name}': LOST, will wait for one second",);
                 self.start_time = now + Duration::from_millis(1000); // wait and restart.
                 self.next_send = now + Duration::from_millis(1000);
+                self.probes_sent = 0;
             }
             ordering => {
                 debug!("tiebreaking '{probe_name}': {:?}", ordering);
@@ -1127,14 +1206,13 @@ impl Probe {
     }
 
     pub(crate) fn update_next_send(&mut self, now: Instant) {
+        self.probes_sent += 1;
         self.next_send = now + Duration::from_millis(250);
     }
 
     /// Returns whether this probe is finished.
     pub(crate) fn expired(&self, now: Instant) -> bool {
-        // The 2nd query is T + 250ms, the 3rd query is T + 500ms,
-        // The expire time is T + 750ms
-        now >= self.start_time + Duration::from_millis(750)
+        self.probes_sent >= 3 && now >= self.next_send
     }
 }
 
@@ -1152,12 +1230,9 @@ pub(crate) struct DnsRegistry {
      */
     pub(crate) probing: HashMap<String, Probe>,
 
-    /// Already done probing, or no need to probe.
-    /// Keyed by DNS record name.
+    /// Current records under established owner names, keyed case insensitively.
+    /// Changing their data preserves ownership; old versions are never retained.
     pub(crate) active: HashMap<String, Vec<DnsRecordBox>>,
-
-    /// timers of the newly added probes.
-    pub(crate) new_timers: Vec<Instant>,
 
     /// Mapping from original names to new names.
     pub(crate) name_changes: HashMap<String, String>,
@@ -1171,10 +1246,43 @@ pub(crate) struct DnsRegistry {
     /// carries both address families, but they are distinct multicast groups
     /// (`224.0.0.251` and `ff02::fb`) reaching potentially different listeners,
     /// so sending a record on one group must not throttle it on the other.
-    pub(crate) last_multicast_v4: HashMap<String, Instant>,
+    pub(crate) last_multicast_v4: HashMap<(RrsetKey, Vec<u8>), Instant>,
 
     /// Same as [`Self::last_multicast_v4`] but for this interface's IPv6 group.
-    pub(crate) last_multicast_v6: HashMap<String, Instant>,
+    pub(crate) last_multicast_v6: HashMap<(RrsetKey, Vec<u8>), Instant>,
+}
+
+#[derive(Default)]
+struct NameProposal {
+    records: Vec<DnsRecordBox>,
+    waiting_services: HashSet<String>,
+    skip_probe: bool,
+}
+
+impl NameProposal {
+    fn add(&mut self, record: DnsRecordBox, service: &ServiceInfo) {
+        if !self
+            .records
+            .iter()
+            .any(|existing| same_record(existing, &record))
+        {
+            self.records.push(record);
+        }
+        self.waiting_services
+            .insert(registry_key(service.get_fullname()));
+        self.skip_probe |= !service.requires_probe();
+    }
+}
+
+fn same_record(left: &DnsRecordBox, right: &DnsRecordBox) -> bool {
+    left.get_type() == right.get_type()
+        && left.get_class() == right.get_class()
+        && names_equal(left.get_name(), right.get_name())
+        && left.rrdata_match(right.as_ref())
+}
+
+pub(crate) fn registry_key(name: &str) -> String {
+    CanonicalName::new(name).as_str().to_string()
 }
 
 impl DnsRegistry {
@@ -1182,11 +1290,27 @@ impl DnsRegistry {
         Self {
             probing: HashMap::new(),
             active: HashMap::new(),
-            new_timers: Vec::new(),
             name_changes: HashMap::new(),
             last_multicast_v4: HashMap::new(),
             last_multicast_v6: HashMap::new(),
         }
+    }
+
+    pub(crate) fn prune_multicast_history(&mut self, now: Instant) {
+        let recent = |_: &(RrsetKey, Vec<u8>), sent: &mut Instant| {
+            now.saturating_duration_since(*sent)
+                < Duration::from_millis(MULTICAST_RATE_LIMIT_MILLIS)
+        };
+        self.last_multicast_v4.retain(recent);
+        self.last_multicast_v6.retain(recent);
+    }
+
+    pub(crate) fn next_multicast_expiry(&self) -> Option<Instant> {
+        self.last_multicast_v4
+            .values()
+            .chain(self.last_multicast_v6.values())
+            .min()
+            .map(|sent| *sent + Duration::from_millis(MULTICAST_RATE_LIMIT_MILLIS))
     }
 
     /// Enforces the RFC 6762 section 6 multicast rate limit on `out`.
@@ -1198,8 +1322,9 @@ impl DnsRegistry {
     /// `is_ipv4` selects the per-family bucket: the IPv4 and IPv6 groups on one
     /// interface are throttled independently (see [`Self::last_multicast_v4`]).
     ///
-    /// Drops from `out` any answer or additional record that was multicast within the
-    /// last second, and records `now` as the last-multicast time for the records kept.
+    /// Suppresses a unique RRset together if any member was multicast within
+    /// the last second, so a response never contains a partial unique RRset.
+    /// Shared records are throttled individually.
     ///
     /// This must NOT be applied to probe queries, legacy unicast responses, or
     /// goodbye packets, which are exempt from the rate limit.
@@ -1209,159 +1334,209 @@ impl DnsRegistry {
         now: Instant,
         is_ipv4: bool,
     ) {
+        self.prune_multicast_history(now);
         let last_multicast = if is_ipv4 {
             &mut self.last_multicast_v4
         } else {
             &mut self.last_multicast_v6
         };
 
-        // Prune stale entries so the map stays bounded across name changes;
-        // any record older than the one-second window is irrelevant now.
-        last_multicast.retain(|_, last| {
-            now.saturating_duration_since(*last)
-                < Duration::from_millis(MULTICAST_RATE_LIMIT_MILLIS)
-        });
-
-        out.retain_answers(|record| keep_after_rate_limit(last_multicast, record, now));
+        let was_multicast =
+            |record: &DnsRecordBox| last_multicast.contains_key(&rate_limit_key(record));
+        let blocked_rrsets: HashSet<_> = out
+            .answers()
+            .iter()
+            .chain(out.additionals())
+            .filter(|record| record.get_cache_flush() && was_multicast(record))
+            .map(|record| RrsetKey::new(record.as_ref()))
+            .collect();
+        let keep = |record: &DnsRecordBox| {
+            !(record.get_cache_flush() && blocked_rrsets.contains(&RrsetKey::new(record.as_ref())))
+                && !was_multicast(record)
+        };
+        out.retain_answers(keep);
 
         // Only touch additionals if an answer survived.
         if out.answers_count() > 0 {
-            out.retain_additionals(|record| keep_after_rate_limit(last_multicast, record, now));
+            out.retain_additionals(keep);
+            for record in out.answers().iter().chain(out.additionals()) {
+                last_multicast.insert(rate_limit_key(record), now);
+            }
         }
     }
 
-    /// Returns the renamed name if a name change exists, otherwise returns the original name.
+    /// Recognizes recent looped-back records after their published data changes.
+    /// The timestamps expire with the multicast window; they do not own records.
+    pub(crate) fn was_recently_multicast(&self, record: &DnsRecordBox, now: Instant) -> bool {
+        let key = rate_limit_key(record);
+        [&self.last_multicast_v4, &self.last_multicast_v6]
+            .iter()
+            .filter_map(|sent| sent.get(&key))
+            .any(|sent| {
+                now.saturating_duration_since(*sent)
+                    < Duration::from_millis(MULTICAST_RATE_LIMIT_MILLIS)
+            })
+    }
+
+    /// Returns the effective name on this interface.
     pub(crate) fn resolve_name<'a>(&'a self, name: &'a str) -> &'a str {
-        match self.name_changes.get(name) {
+        match self.name_changes.get(&registry_key(name)) {
             Some(new_name) => new_name,
             None => name,
         }
     }
 
-    pub(crate) fn is_probing_done<T>(
+    /// Projects current registrations onto this interface and reconciles name claims.
+    /// Established names keep their ownership when data changes (RFC 6762 section 8.4).
+    #[cfg(test)]
+    pub(crate) fn reconcile_services(
         &mut self,
-        answer: &T,
-        service_name: &str,
-        start_time: Instant,
-    ) -> bool
-    where
-        T: DnsRecordExt + Send + 'static,
-    {
-        if let Some(active_records) = self.active.get(answer.get_name()) {
-            for record in active_records.iter() {
-                if answer.matches(record.as_ref()) {
-                    debug!(
-                        "found active record {} {}",
-                        answer.get_type(),
-                        answer.get_name(),
-                    );
-                    return true;
-                }
-            }
-        }
-
-        let probe = self
-            .probing
-            .entry(answer.get_name().to_string())
-            .or_insert_with(|| {
-                debug!("new probe of {}", answer.get_name());
-                Probe::new(start_time)
-            });
-
-        self.new_timers.push(probe.next_send);
-
-        for record in probe.records.iter() {
-            if answer.matches(record.as_ref()) {
-                debug!(
-                    "found existing record {} in probe of '{}'",
-                    answer.get_type(),
-                    answer.get_name(),
-                );
-                probe.waiting_services.insert(service_name.to_string());
-                return false; // Found existing probe for the same record.
-            }
-        }
-
-        debug!(
-            "insert record {} into probe of {}",
-            answer.get_type(),
-            answer.get_name(),
-        );
-        probe.insert_record(answer.clone_box());
-        probe.waiting_services.insert(service_name.to_string());
-
-        false
+        services: &[&ServiceInfo],
+        intf: &MyIntf,
+        now: Instant,
+    ) {
+        self.reconcile_publication(services, &[], intf, now);
     }
 
-    /// check all records in "probing" and "active":
-    /// if the record is SRV, and hostname is set to original, remove it.
-    /// and create a new SRV with "host" set to "new_name" and put into "probing".
-    pub(crate) fn update_hostname(
+    pub(crate) fn reconcile_publication(
         &mut self,
-        original: &str,
-        new_name: &str,
-        probe_time: Instant,
-    ) -> bool {
-        let mut found_records = Vec::new();
-        let mut new_timer_added = false;
+        services: &[&ServiceInfo],
+        pending_hosts: &[&ServiceInfo],
+        intf: &MyIntf,
+        now: Instant,
+    ) {
+        self.prune_multicast_history(now);
+        let originals: HashSet<_> = services
+            .iter()
+            .flat_map(|service| [service.get_fullname(), service.get_hostname()])
+            .chain(pending_hosts.iter().map(|service| service.get_hostname()))
+            .map(registry_key)
+            .collect();
+        self.name_changes.retain(|name, _| originals.contains(name));
 
-        for (_name, probe) in self.probing.iter_mut() {
-            probe.records.retain(|record| {
-                if record.get_type() == RRType::SRV {
-                    if let Some(srv) = record.any().downcast_ref::<DnsSrv>() {
-                        if srv.host() == original {
-                            let mut new_record = srv.clone();
-                            new_record.set_host(new_name.to_string());
-                            found_records.push(new_record);
-                            return false;
-                        }
-                    }
+        let published_hosts: HashSet<_> = services
+            .iter()
+            .filter(|service| {
+                !service.get_addrs_on_my_intf_v4(intf).is_empty()
+                    || !service.get_addrs_on_my_intf_v6(intf).is_empty()
+            })
+            .map(|service| registry_key(self.resolve_name(service.get_hostname())))
+            .collect();
+
+        let mut proposals: HashMap<String, NameProposal> = HashMap::new();
+        for (service, publish_instance) in services
+            .iter()
+            .map(|service| (*service, true))
+            .chain(pending_hosts.iter().map(|service| (*service, false)))
+        {
+            let addresses: Vec<_> = service
+                .get_addrs_on_my_intf_v4(intf)
+                .into_iter()
+                .chain(service.get_addrs_on_my_intf_v6(intf))
+                .collect();
+            if addresses.is_empty() {
+                continue;
+            }
+            let fullname = self.resolve_name(service.get_fullname());
+            let hostname = self.resolve_name(service.get_hostname());
+            // A staged update must not change an RRset that is already published
+            // by another registration. Its addresses join that set at commit.
+            if !publish_instance && published_hosts.contains(&registry_key(hostname)) {
+                continue;
+            }
+            if publish_instance {
+                let instance = proposals.entry(registry_key(fullname)).or_default();
+                for record in service.instance_records(fullname, hostname) {
+                    instance.add(record, service);
                 }
-                true
-            });
+            }
+
+            let host = proposals.entry(registry_key(hostname)).or_default();
+            for address in addresses {
+                let mut record = DnsAddress::new(
+                    service.get_hostname(),
+                    ip_address_rr_type(&address),
+                    CLASS_IN,
+                    service.get_host_ttl(),
+                    address,
+                    intf.into(),
+                );
+                if hostname != service.get_hostname() {
+                    record.get_record_mut().set_new_name(hostname.to_string());
+                }
+                host.add(record.boxed(), service);
+            }
         }
 
-        for (_name, records) in self.active.iter_mut() {
-            records.retain(|record| {
-                if record.get_type() == RRType::SRV {
-                    if let Some(srv) = record.any().downcast_ref::<DnsSrv>() {
-                        if srv.host() == original {
-                            let mut new_record = srv.clone();
-                            new_record.set_host(new_name.to_string());
-                            found_records.push(new_record);
-                            return false;
-                        }
-                    }
-                }
-                true
-            });
+        self.active.retain(|name, _| proposals.contains_key(name));
+        self.probing.retain(|name, _| proposals.contains_key(name));
+        for (name, proposal) in proposals {
+            if self.active.contains_key(&name) || proposal.skip_probe {
+                self.active.insert(name.clone(), proposal.records);
+                self.probing.remove(&name);
+                continue;
+            }
+            let start = now + Duration::from_millis(fastrand::u64(0..250));
+            let probe = self
+                .probing
+                .entry(name)
+                .or_insert_with(|| Probe::new(start));
+            let changed = probe.records.len() != proposal.records.len()
+                || proposal
+                    .records
+                    .iter()
+                    .any(|record| !probe.records.iter().any(|old| same_record(old, record)));
+            if changed {
+                probe.start_time = start;
+                probe.next_send = start;
+                probe.probes_sent = 0;
+            }
+            probe.records.clear();
+            for record in proposal.records {
+                probe.insert_record(record);
+            }
+            probe.waiting_services = proposal.waiting_services;
         }
+    }
 
-        for record in found_records {
-            let probe = match self.probing.get_mut(record.get_name()) {
-                Some(p) => {
-                    p.start_time = probe_time; // restart this probe.
-                    p
-                }
-                None => {
-                    let new_probe = self
-                        .probing
-                        .entry(record.get_name().to_string())
-                        .or_insert_with(|| Probe::new(probe_time));
-                    new_timer_added = true;
-                    new_probe
-                }
-            };
-
-            debug!(
-                "insert record {} with new hostname {new_name} into probe for: {}",
-                record.get_type(),
-                record.get_name()
-            );
-            probe.insert_record(record.boxed());
+    /// Establishes the current proposal. Completion never appends historical data.
+    pub(crate) fn complete_probe(&mut self, name: &str) -> Option<Probe> {
+        let name = registry_key(name);
+        let probe = self.probing.remove(&name)?;
+        if !probe.records.is_empty() {
+            self.active.insert(name, probe.records.clone());
         }
+        Some(probe)
+    }
 
-        new_timer_added
+    pub(crate) fn records_for_name(&self, name: &str) -> &[DnsRecordBox] {
+        self.active
+            .get(&registry_key(name))
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    #[cfg(test)]
+    pub(crate) fn unique_records(&self) -> impl Iterator<Item = &DnsRecordBox> {
+        self.active.values().flatten()
+    }
+
+    /// Returns the address union contributed by registrations using this hostname.
+    #[cfg(test)]
+    pub(crate) fn host_addresses(&self, hostname: &str) -> Vec<IpAddr> {
+        let mut addresses: Vec<_> = self
+            .records_for_name(hostname)
+            .iter()
+            .filter_map(|record| record.any().downcast_ref::<DnsAddress>())
+            .map(|record| record.address().to_ip_addr())
+            .collect();
+        addresses.sort_unstable();
+        addresses.dedup();
+        addresses
+    }
+
+    pub(crate) fn is_claimed(&self, name: &str) -> bool {
+        self.active.contains_key(&registry_key(name))
     }
 }
 
@@ -1370,47 +1545,59 @@ impl DnsRegistry {
 /// elapsed since it was last multicast on that interface.
 pub(crate) const MULTICAST_RATE_LIMIT_MILLIS: u64 = 1000;
 
-/// Returns whether `record` may still be multicast under the RFC 6762 section 6
-/// rate limit, updating `last_multicast` to `now` when it is kept.
-fn keep_after_rate_limit(
-    last_multicast: &mut HashMap<String, Instant>,
-    record: &DnsRecordBox,
-    now: Instant,
-) -> bool {
-    let key = rate_limit_key(record);
-    match last_multicast.get(&key) {
-        Some(last)
-            if now.saturating_duration_since(*last)
-                < Duration::from_millis(MULTICAST_RATE_LIMIT_MILLIS) =>
-        {
-            false
-        }
-        _ => {
-            last_multicast.insert(key, now);
-            true
-        }
-    }
-}
-
 /// Builds the identity key for a record used by the RFC 6762 section 6
-/// multicast rate limit: name (case-insensitive) + type + rdata. TTL and the
+/// multicast rate limit: name (case-insensitive) + type + class + rdata. TTL and the
 /// cache-flush bit are intentionally excluded, so the same logical record maps
 /// to a single key regardless of the TTL it is sent with.
-fn rate_limit_key(record: &DnsRecordBox) -> String {
-    format!(
-        "{}-{}-{}",
-        record.get_name().to_lowercase(),
-        record.get_type(),
-        record.rdata_print(),
+fn rate_limit_key(record: &DnsRecordBox) -> (RrsetKey, Vec<u8>) {
+    (
+        RrsetKey::new(record.as_ref()),
+        canonical_rdata(record.as_ref()),
     )
 }
 
 /// Returns a tuple of (service_type_domain, optional_sub_domain)
 pub(crate) fn split_sub_domain(domain: &str) -> (&str, Option<&str>) {
-    if let Some((_, ty_domain)) = domain.rsplit_once("._sub.") {
-        (ty_domain, Some(domain))
-    } else {
-        (domain, None)
+    let bytes = domain.as_bytes();
+    for index in (0..bytes.len().saturating_sub(5)).rev() {
+        if !bytes[index..index + 6].eq_ignore_ascii_case(b"._sub.") {
+            continue;
+        }
+        let escapes = bytes[..index]
+            .iter()
+            .rev()
+            .take_while(|byte| **byte == b'\\')
+            .count();
+        if escapes % 2 == 0 {
+            return (&domain[index + 6..], Some(domain));
+        }
+    }
+    (domain, None)
+}
+
+#[cfg(test)]
+mod subtype_name_tests {
+    use super::split_sub_domain;
+
+    #[test]
+    fn subtype_marker_requires_an_unescaped_label_boundary() {
+        let ordinary = "_print._sub._http._tcp.local.";
+        assert_eq!(
+            split_sub_domain(ordinary),
+            ("_http._tcp.local.", Some(ordinary))
+        );
+        let mixed_case = "_print._SuB._http._tcp.local.";
+        assert_eq!(
+            split_sub_domain(mixed_case),
+            ("_http._tcp.local.", Some(mixed_case))
+        );
+        let literal_dot = r"_print\._sub._http._tcp.local.";
+        assert_eq!(split_sub_domain(literal_dot), (literal_dot, None));
+        let literal_backslash = r"_print\\._sub._http._tcp.local.";
+        assert_eq!(
+            split_sub_domain(literal_backslash),
+            ("_http._tcp.local.", Some(literal_backslash))
+        );
     }
 }
 
@@ -1522,13 +1709,291 @@ impl ResolvedService {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_txt, encode_txt, u8_slice_to_hex, DnsRegistry, Instant, ServiceInfo, TxtProperty,
+        decode_txt, encode_txt, rate_limit_key, u8_slice_to_hex, DnsRegistry, Instant, MyIntf,
+        ServiceInfo, ServiceStatus, TxtProperty,
     };
-    use crate::dns_parser::{DnsOutgoing, DnsPointer, RRType, CLASS_IN, FLAGS_QR_RESPONSE};
+    use crate::dns_parser::{
+        DnsAddress, DnsOutgoing, DnsPointer, DnsRecordExt, DnsSrv, DnsTxt, RRType,
+        CLASS_CACHE_FLUSH, CLASS_IN, FLAGS_QR_RESPONSE,
+    };
     use crate::{IfKind, IfPredicate};
     use if_addrs::{IfAddr, IfOperStatus, Ifv4Addr, Ifv6Addr, Interface};
     use std::net::{Ipv4Addr, Ipv6Addr};
     use std::time::Duration;
+
+    fn registry_interface() -> MyIntf {
+        MyIntf {
+            name: "loopback".to_string(),
+            index: 1,
+            addrs: std::collections::HashSet::from([IfAddr::V4(Ifv4Addr {
+                ip: Ipv4Addr::LOCALHOST,
+                netmask: Ipv4Addr::new(255, 0, 0, 0),
+                broadcast: None,
+                prefixlen: 8,
+            })]),
+            max_packet_size_v4: 1500,
+            max_packet_size_v6: 1500,
+        }
+    }
+
+    fn registry_service(name: &str, addresses: &str, version: u16) -> ServiceInfo {
+        ServiceInfo::new(
+            "_registry._tcp.local.",
+            name,
+            "shared.local.",
+            addresses,
+            8000 + version,
+            &[("version", version.to_string())][..],
+        )
+        .unwrap()
+    }
+
+    fn establish_registry(registry: &mut DnsRegistry) {
+        let names: Vec<_> = registry.probing.keys().cloned().collect();
+        for name in names {
+            registry.complete_probe(&name).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_registry_updates_established_data_without_probing() {
+        let intf = registry_interface();
+        let mut registry = DnsRegistry::new();
+        let initial = registry_service("current", "127.0.0.1", 0);
+        registry.reconcile_services(&[&initial], &intf, Instant::now());
+        establish_registry(&mut registry);
+        for version in 1..64 {
+            let address = format!("127.0.0.{}", version + 1);
+            let service = registry_service("current", &address, version);
+            registry.reconcile_services(&[&service], &intf, Instant::now());
+            assert!(registry.probing.is_empty());
+            assert_eq!(registry.unique_records().count(), 3);
+            let records = registry.records_for_name(service.get_fullname());
+            let srv = records
+                .iter()
+                .find_map(|r| r.any().downcast_ref::<DnsSrv>())
+                .unwrap();
+            let txt = records
+                .iter()
+                .find_map(|r| r.any().downcast_ref::<DnsTxt>())
+                .unwrap();
+            assert_eq!(srv.port(), 8000 + version);
+            assert_eq!(txt.text(), service.generate_txt());
+            assert_eq!(
+                registry.host_addresses("shared.local."),
+                vec![address.parse::<std::net::IpAddr>().unwrap()]
+            );
+        }
+    }
+
+    #[test]
+    fn test_registry_unusable_and_unprobed_registrations() {
+        let intf = registry_interface();
+        let mut registry = DnsRegistry::new();
+        let service = registry_service("unusable", "", 0);
+        registry.reconcile_services(&[&service], &intf, Instant::now());
+        assert!(registry.active.is_empty());
+        assert!(registry.probing.is_empty());
+        let mut service = registry_service("unprobed", "127.0.0.1", 0);
+        service.set_requires_probe(false);
+        registry.reconcile_services(&[&service], &intf, Instant::now());
+        assert!(registry.probing.is_empty());
+        assert_eq!(registry.unique_records().count(), 3);
+        assert!(registry.is_claimed(service.get_fullname()));
+    }
+
+    #[test]
+    fn test_registry_pending_proposal_follows_latest_registration() {
+        let intf = registry_interface();
+        let mut registry = DnsRegistry::new();
+        let first = registry_service("pending", "127.0.0.1", 0);
+        let second = registry_service("pending", "127.0.0.1", 1);
+        let now = Instant::now();
+        registry.reconcile_services(&[&first], &intf, now);
+        registry.reconcile_services(&[&second], &intf, now + Duration::from_secs(1));
+        let key = first.get_fullname().to_ascii_lowercase();
+        let changed = registry.probing[&key].start_time;
+        assert!(changed >= now + Duration::from_secs(1));
+        registry.reconcile_services(&[&second], &intf, now + Duration::from_secs(2));
+        assert_eq!(registry.probing[&key].start_time, changed);
+        registry.reconcile_services(&[&first], &intf, now + Duration::from_secs(3));
+        assert!(registry.probing[&key].start_time >= now + Duration::from_secs(3));
+        assert_eq!(registry.probing[&key].records.len(), 2);
+        establish_registry(&mut registry);
+        let records = registry.records_for_name(first.get_fullname());
+        assert_eq!(records.len(), 2);
+        let txt = records
+            .iter()
+            .find_map(|r| r.any().downcast_ref::<DnsTxt>())
+            .unwrap();
+        assert_eq!(txt.text(), first.generate_txt());
+    }
+
+    #[test]
+    fn test_probe_waits_for_three_queries_and_final_interval() {
+        let now = Instant::now();
+        let mut probe = super::Probe::new(now - Duration::from_secs(1));
+        assert!(!probe.expired(now));
+        for query in 0..3 {
+            let sent = now + Duration::from_millis(query * 250);
+            probe.update_next_send(sent);
+            assert!(!probe.expired(sent + Duration::from_millis(249)));
+        }
+        assert!(probe.expired(now + Duration::from_millis(750)));
+    }
+
+    #[test]
+    fn test_registry_address_ownership_is_a_union() {
+        let intf = registry_interface();
+        let mut registry = DnsRegistry::new();
+        let first = registry_service("first", "127.0.0.1,127.0.0.2", 0);
+        let second = registry_service("second", "127.0.0.2,127.0.0.3", 0);
+        registry.reconcile_services(&[&first, &second], &intf, Instant::now());
+        assert_eq!(registry.probing["shared.local."].records.len(), 3);
+        establish_registry(&mut registry);
+        assert_eq!(registry.unique_records().count(), 7);
+        registry.reconcile_services(&[&second], &intf, Instant::now());
+        assert_eq!(
+            registry.host_addresses("SHARED.local."),
+            vec![
+                "127.0.0.2".parse::<std::net::IpAddr>().unwrap(),
+                "127.0.0.3".parse::<std::net::IpAddr>().unwrap(),
+            ]
+        );
+        assert_eq!(registry.unique_records().count(), 4);
+        assert!(registry.probing.is_empty());
+        registry.reconcile_services(&[], &intf, Instant::now());
+        assert!(registry.active.is_empty());
+        assert!(registry.probing.is_empty());
+    }
+
+    #[test]
+    fn test_registry_case_changes_reuse_name_claims() {
+        let intf = registry_interface();
+        let mut registry = DnsRegistry::new();
+        for name in ["Case", "CASE", "case", "cASE"] {
+            let service = registry_service(name, "127.0.0.1", 0);
+            registry.reconcile_services(&[&service], &intf, Instant::now());
+            if registry.active.is_empty() {
+                establish_registry(&mut registry);
+            }
+            assert!(registry.probing.is_empty());
+            assert_eq!(registry.unique_records().count(), 3);
+            assert_eq!(registry.active.len(), 2);
+        }
+    }
+
+    #[test]
+    fn test_registry_rename_mappings_follow_current_registrations() {
+        let intf = registry_interface();
+        let service = registry_service("renamed", "127.0.0.1", 0);
+        let mut registry = DnsRegistry::new();
+        registry
+            .name_changes
+            .insert("shared.local.".to_string(), "shared-2.local.".to_string());
+        registry.name_changes.insert(
+            service.get_fullname().to_ascii_lowercase(),
+            "renamed (2)._registry._tcp.local.".to_string(),
+        );
+        registry.reconcile_services(&[&service], &intf, Instant::now());
+        assert_eq!(registry.probing.len(), 2);
+        assert!(registry.probing.contains_key("shared-2.local."));
+        establish_registry(&mut registry);
+        assert_eq!(registry.resolve_name("SHARED.local."), "shared-2.local.");
+        registry.reconcile_services(&[], &intf, Instant::now());
+        assert!(registry.active.is_empty());
+        assert!(registry.probing.is_empty());
+        assert!(registry.name_changes.is_empty());
+    }
+
+    #[test]
+    fn test_service_status_drops_removed_interface() {
+        let mut service = registry_service("status", "127.0.0.1", 0);
+        service.set_status(1, ServiceStatus::Announced);
+        service.remove_status(1);
+        assert_eq!(service.get_status(1), ServiceStatus::Unknown);
+    }
+
+    #[test]
+    fn multicast_identity_keeps_binary_txt_bytes_distinct() {
+        let first = DnsTxt::new("binary.local.", CLASS_IN, 120, vec![1, 0xfe]).boxed();
+        let second = DnsTxt::new("binary.local.", CLASS_IN, 120, vec![1, 0xff]).boxed();
+        assert_eq!(first.rdata_print(), second.rdata_print());
+        assert_ne!(rate_limit_key(&first), rate_limit_key(&second));
+        let mut registry = DnsRegistry::new();
+        let now = Instant::now();
+        let mut outgoing = DnsOutgoing::new(FLAGS_QR_RESPONSE);
+        outgoing.add_answer_box(first.clone());
+        registry.apply_multicast_rate_limit(&mut outgoing, now, true);
+        assert!(registry.was_recently_multicast(&first, now));
+        assert!(!registry.was_recently_multicast(&second, now));
+    }
+
+    #[test]
+    fn multicast_identity_canonicalizes_names_inside_srv_and_ptr_data() {
+        let first = DnsSrv::new(
+            "Instance.local.",
+            CLASS_IN,
+            120,
+            0,
+            0,
+            8080,
+            "Host.local.".to_string(),
+        )
+        .boxed();
+        let second = DnsSrv::new(
+            "instance.local.",
+            CLASS_IN | CLASS_CACHE_FLUSH,
+            30,
+            0,
+            0,
+            8080,
+            "host.local".to_string(),
+        )
+        .boxed();
+        assert_eq!(rate_limit_key(&first), rate_limit_key(&second));
+        let first = DnsPointer::new(
+            "_demo._tcp.local.",
+            RRType::PTR,
+            CLASS_IN,
+            120,
+            "Instance.local.".to_string(),
+        )
+        .boxed();
+        let second = DnsPointer::new(
+            "_DEMO._tcp.local.",
+            RRType::PTR,
+            CLASS_IN,
+            30,
+            "instance.local".to_string(),
+        )
+        .boxed();
+        assert_eq!(rate_limit_key(&first), rate_limit_key(&second));
+    }
+
+    #[test]
+    fn idle_multicast_history_has_a_deadline_and_expires_without_new_records() {
+        let mut registry = DnsRegistry::new();
+        let now = Instant::now();
+        for is_ipv4 in [true, false] {
+            let mut outgoing = DnsOutgoing::new(FLAGS_QR_RESPONSE);
+            outgoing.add_answer_record(DnsTxt::new(
+                "idle.local.",
+                CLASS_IN,
+                120,
+                b"\x03x=y".to_vec(),
+            ));
+            registry.apply_multicast_rate_limit(&mut outgoing, now, is_ipv4);
+        }
+        assert_eq!(
+            registry.next_multicast_expiry(),
+            Some(now + Duration::from_secs(1))
+        );
+        registry.reconcile_services(&[], &registry_interface(), now + Duration::from_secs(1));
+        assert!(registry.last_multicast_v4.is_empty());
+        assert!(registry.last_multicast_v6.is_empty());
+        assert_eq!(registry.next_multicast_expiry(), None);
+    }
 
     /// RFC 6762 section 6: the same record must not be multicast on an
     /// interface more than once per second, but is allowed again after a
@@ -1663,6 +2128,80 @@ mod tests {
         out.add_answer_record(extra());
         registry.apply_multicast_rate_limit(&mut out, now + Duration::from_millis(200), true);
         assert_eq!(out.answers_count(), 1);
+    }
+
+    #[test]
+    fn test_multicast_rate_limit_preserves_complete_unique_rrsets() {
+        let intf = registry_interface();
+        let address = |last| {
+            DnsAddress::new(
+                "shared.local.",
+                RRType::A,
+                CLASS_IN | CLASS_CACHE_FLUSH,
+                120,
+                Ipv4Addr::new(127, 0, 0, last).into(),
+                (&intf).into(),
+            )
+        };
+        let mut registry = DnsRegistry::new();
+        let now = Instant::now();
+        let mut initial = DnsOutgoing::new(FLAGS_QR_RESPONSE);
+        initial.add_answer_record(address(1));
+        registry.apply_multicast_rate_limit(&mut initial, now, true);
+        assert_eq!(initial.answers_count(), 1);
+
+        let complete = || {
+            let mut out = DnsOutgoing::new(FLAGS_QR_RESPONSE);
+            out.add_answer_record(address(1));
+            out.add_answer_record(address(2));
+            out
+        };
+        let mut update = complete();
+        registry.apply_multicast_rate_limit(&mut update, now + Duration::from_millis(500), true);
+        assert_eq!(update.answers_count(), 0);
+        let mut update = complete();
+        registry.apply_multicast_rate_limit(&mut update, now + Duration::from_secs(1), true);
+        assert_eq!(update.answers_count(), 2);
+    }
+
+    #[test]
+    fn test_multicast_rate_limit_groups_answer_and_additional_rrset_members() {
+        let intf = registry_interface();
+        let address = |last| {
+            DnsAddress::new(
+                "shared.local.",
+                RRType::A,
+                CLASS_IN | CLASS_CACHE_FLUSH,
+                120,
+                Ipv4Addr::new(127, 0, 0, last).into(),
+                (&intf).into(),
+            )
+        };
+        let mut registry = DnsRegistry::new();
+        let now = Instant::now();
+        let mut initial = DnsOutgoing::new(FLAGS_QR_RESPONSE);
+        initial.add_answer_record(address(1));
+        registry.apply_multicast_rate_limit(&mut initial, now, true);
+
+        let mut update = DnsOutgoing::new(FLAGS_QR_RESPONSE);
+        update.add_answer_record(address(2));
+        update.add_additional_answer(address(1));
+        registry.apply_multicast_rate_limit(&mut update, now + Duration::from_millis(500), true);
+        assert_eq!(update.answers_count(), 0);
+
+        let mut update = DnsOutgoing::new(FLAGS_QR_RESPONSE);
+        update.add_answer_record(DnsPointer::new(
+            "_registry._tcp.local.",
+            RRType::PTR,
+            CLASS_IN,
+            4500,
+            "other._registry._tcp.local.".to_string(),
+        ));
+        update.add_additional_answer(address(1));
+        update.add_additional_answer(address(2));
+        registry.apply_multicast_rate_limit(&mut update, now + Duration::from_millis(750), true);
+        assert_eq!(update.answers_count(), 1);
+        assert!(update.additionals().is_empty());
     }
 
     #[test]

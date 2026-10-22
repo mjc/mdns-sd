@@ -144,30 +144,37 @@ fn integration_success() {
     assert!(matches!(response, UnregisterStatus::OK));
 
     let mut remove_count = 0;
-    let mut resolved = false;
+    let mut resolved_after_removal = false;
     while let Ok(event) = browse_chan.recv_timeout(timeout) {
         match event {
-            ServiceEvent::ServiceRemoved(_ty_domain, fullname) => {
-                println!("Removed service: {}", &fullname);
-                if fullname.contains(&instance_name) {
-                    remove_count += 1;
-                }
-                break;
+            ServiceEvent::ServiceRemoved(_, instance) if instance == fullname => {
+                remove_count += 1;
             }
-            ServiceEvent::ServiceResolved(info) => {
-                if info.get_fullname() == fullname {
-                    println!("Received a resolved service event after unregister");
-                    resolved = true;
-                }
+            ServiceEvent::ServiceResolved(info) if info.get_fullname() == fullname => {
+                // Other links remain valid during the one-second goodbye grace period.
+                resolved_after_removal |= remove_count > 0;
             }
             _ => {}
         }
+        if remove_count > 0 {
+            while let Ok(event) = browse_chan.recv_timeout(Duration::from_secs(1)) {
+                match event {
+                    ServiceEvent::ServiceResolved(info) if info.get_fullname() == fullname => {
+                        resolved_after_removal = true;
+                    }
+                    ServiceEvent::ServiceRemoved(_, instance) if instance == fullname => {
+                        remove_count += 1;
+                    }
+                    _ => {}
+                }
+            }
+            break;
+        }
     }
-
     assert_eq!(remove_count, 1);
     assert!(
-        !resolved,
-        "Resolved event should not be received after unregister"
+        !resolved_after_removal,
+        "Service resolved again after its removal"
     );
 
     // Stop browsing the service.
@@ -206,10 +213,10 @@ fn integration_success() {
     assert!(*respond_count >= 2 || *known_answer_count > 0);
 
     // Test the special meta-query of "_services._dns-sd._udp.local."
-    let service2_type = "_my-service2._udp.local.";
+    let service2_type = format!("_s2{:x}._udp.local.", fastrand::u32(..));
     let service2_instance = "instance2";
     let service2 = ServiceInfo::new(
-        service2_type,
+        &service2_type,
         service2_instance,
         host_name,
         &my_ifaddrs[..],
@@ -223,7 +230,8 @@ fn integration_success() {
     // Browse using the special meta-query.
     let meta_query = "_services._dns-sd._udp.local.";
     let browse_chan = d.browse(meta_query).unwrap();
-    let timeout = Duration::from_secs(2);
+    // A query can precede probe completion, then back off for two seconds.
+    let timeout = Duration::from_secs(5);
 
     loop {
         match browse_chan.recv_timeout(timeout) {
@@ -241,7 +249,11 @@ fn integration_success() {
                 }
             },
             Err(e) => {
-                panic!("browse error: {}", e);
+                let metrics = d
+                    .get_metrics()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(1));
+                panic!("browse error: {}; metrics: {:?}", e, metrics);
             }
         }
     }
@@ -785,6 +797,8 @@ fn test_disable_interface_cache() {
     // Disable the interface for the client.
     println!("Disabling interface with IP: {:?}", ipv4_list);
     client.disable_interface(ipv4_list).unwrap();
+    // A records can also arrive over IPv6 on the same link.
+    client.disable_interface(IfKind::IPv6).unwrap();
 
     // Browse for the service.
     let handle = client.browse(ty_domain).unwrap();
@@ -1183,7 +1197,7 @@ fn my_ip_interfaces() -> Vec<Interface> {
         .unwrap_or_default()
         .into_iter()
         .filter_map(|i| {
-            if i.is_loopback() || i.is_p2p() || is_apple_p2p_by_name(&i.name) {
+            if !i.is_oper_up() || i.is_loopback() || i.is_p2p() || is_apple_p2p_by_name(&i.name) {
                 None
             } else {
                 match &i.addr {
@@ -1721,6 +1735,7 @@ fn test_cache_flush_srv() {
 
     // Browse for the updated SRV record
     let timeout = Duration::from_secs(2);
+    resolved = false;
     let mut removed = false;
     while let Ok(event) = browse_chan.recv_timeout(timeout) {
         println!("Received event {:?}", event);
@@ -2220,6 +2235,7 @@ fn test_multicast_loop_v4() {
 
     // Register the first service.
     let server = ServiceDaemon::new().expect("failed to start server");
+    server.disable_interface(IfKind::IPv6).unwrap();
     server.set_multicast_loop_v4(false).unwrap();
 
     // Get a single IPv4 address
@@ -2242,6 +2258,7 @@ fn test_multicast_loop_v4() {
     // start a client i.e. querier.
     let mut resolved = false;
     let client = ServiceDaemon::new().expect("failed to create mdns client");
+    client.disable_interface(IfKind::IPv6).unwrap();
 
     // For Windows, IP_MULTICAST_LOOP option works only on the receive path.
     client.set_multicast_loop_v4(false).unwrap();
@@ -2297,6 +2314,7 @@ fn test_multicast_loop_v6() {
 
     // Register the first service.
     let server = ServiceDaemon::new().expect("failed to start server");
+    server.disable_interface(IfKind::IPv4).unwrap();
     server.set_multicast_loop_v6(false).unwrap();
 
     // Get a single IPv6 address
@@ -2319,6 +2337,7 @@ fn test_multicast_loop_v6() {
     // start a client i.e. querier.
     let mut resolved = false;
     let client = ServiceDaemon::new().expect("failed to create mdns client");
+    client.disable_interface(IfKind::IPv4).unwrap();
 
     // For Windows, IP_MULTICAST_LOOP option works only on the receive path.
     client.set_multicast_loop_v6(false).unwrap();
