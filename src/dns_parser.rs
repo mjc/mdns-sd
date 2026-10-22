@@ -7,7 +7,7 @@
 #[cfg(feature = "logging")]
 use crate::log::{debug, trace};
 
-use crate::dns_name::{labels, names_equal};
+use crate::dns_name::{append_escaped_label, labels, names_equal};
 use crate::error::{e_fmt, Error, Result};
 use crate::service_info::{decode_txt, is_unicast_link_local, DnsRegistry, MyIntf, ServiceInfo};
 
@@ -347,7 +347,8 @@ pub(crate) const MAX_NAME_BYTES: usize = 255;
 /// whatever was written and skips the item.
 #[derive(Debug, PartialEq, Eq)]
 pub enum WriteError {
-    /// A label in a name is longer than [`MAX_LABEL_BYTES`].
+    /// A label exceeds [`MAX_LABEL_BYTES`] or the complete encoded name exceeds
+    /// [`MAX_NAME_BYTES`].
     NameTooLong,
 
     /// The packet would exceed its max size with this record.
@@ -956,7 +957,7 @@ impl DnsRecordExt for DnsPointer {
 
     fn compare_rdata(&self, other: &dyn DnsRecordExt) -> cmp::Ordering {
         if let Some(other_ptr) = other.any().downcast_ref::<Self>() {
-            self.alias.cmp(&other_ptr.alias)
+            compare_rdata_on_wire(self, other_ptr)
         } else {
             cmp::Ordering::Greater
         }
@@ -1059,32 +1060,7 @@ impl DnsRecordExt for DnsSrv {
         let Some(other_srv) = other.any().downcast_ref::<Self>() else {
             return cmp::Ordering::Greater;
         };
-
-        // 1. compare `priority`
-        match self
-            .priority
-            .to_be_bytes()
-            .cmp(&other_srv.priority.to_be_bytes())
-        {
-            cmp::Ordering::Equal => {
-                // 2. compare `weight`
-                match self
-                    .weight
-                    .to_be_bytes()
-                    .cmp(&other_srv.weight.to_be_bytes())
-                {
-                    cmp::Ordering::Equal => {
-                        // 3. compare `port`.
-                        match self.port.to_be_bytes().cmp(&other_srv.port.to_be_bytes()) {
-                            cmp::Ordering::Equal => self.host.cmp(&other_srv.host),
-                            not_equal => not_equal,
-                        }
-                    }
-                    not_equal => not_equal,
-                }
-            }
-            not_equal => not_equal,
-        }
+        compare_rdata_on_wire(self, other_srv)
     }
 
     fn rdata_print(&self) -> String {
@@ -1370,10 +1346,7 @@ impl DnsRecordExt for DnsNSec {
 
     fn compare_rdata(&self, other: &dyn DnsRecordExt) -> cmp::Ordering {
         if let Some(other_nsec) = other.any().downcast_ref::<Self>() {
-            match self.next_domain.cmp(&other_nsec.next_domain) {
-                cmp::Ordering::Equal => self.type_bitmap.cmp(&other_nsec.type_bitmap),
-                ordering => ordering,
-            }
+            compare_rdata_on_wire(self, other_nsec)
         } else {
             cmp::Ordering::Greater
         }
@@ -1565,11 +1538,7 @@ impl DnsOutPacket {
     // in instance names are escaped (e.g., "My\\.Service" represents a single label "My.Service").
     // The actual name sent over the wire is the unescaped version.
     fn write_name(&mut self, name: &str) -> WriteResult {
-        // Remove trailing dot if present
-        let name_to_parse = name.strip_suffix('.').unwrap_or(name);
-
-        // Parse the name considering escape sequences
-        let labels = Self::parse_escaped_name(name_to_parse);
+        let labels = Self::parse_escaped_name(name);
 
         if labels.is_empty() {
             self.write_byte(0);
@@ -1577,14 +1546,21 @@ impl DnsOutPacket {
         }
 
         // Validate before writing anything.
-        if labels.iter().any(|label| label.len() > MAX_LABEL_BYTES) {
+        if labels.iter().any(|label| label.len() > MAX_LABEL_BYTES)
+            || labels.iter().map(|label| label.len() + 1).sum::<usize>() + 1 > MAX_NAME_BYTES
+        {
             return Err(WriteError::NameTooLong);
         }
 
         // Write each label
         for (i, label) in labels.iter().enumerate() {
-            // Build the remaining name for compression (with dots as separators)
-            let remaining: String = labels[i..].join(".");
+            let mut remaining = String::new();
+            for part in &labels[i..] {
+                if !remaining.is_empty() {
+                    remaining.push('.');
+                }
+                append_escaped_label(&mut remaining, part);
+            }
 
             // Check if we can use compression for the remaining part
             const POINTER_MASK: u16 = 0xC000;
@@ -2727,7 +2703,8 @@ impl DnsIncoming {
     /// domain name encoding.
     fn read_name(&mut self) -> Result<String> {
         let mut name = String::new();
-        self.offset = self.read_labels(self.offset, &mut name)?;
+        let mut wire_len = 1;
+        self.offset = self.read_labels(self.offset, &mut name, &mut wire_len)?;
         Ok(name)
     }
 
@@ -2759,7 +2736,12 @@ impl DnsIncoming {
     /// ```
     ///
     /// Takes `&self` so that following a pointer cannot move the read cursor.
-    fn read_labels(&self, mut offset: usize, name: &mut String) -> Result<usize> {
+    fn read_labels(
+        &self,
+        mut offset: usize,
+        name: &mut String,
+        wire_len: &mut usize,
+    ) -> Result<usize> {
         let data = &self.data[..];
 
         // From RFC1035:
@@ -2815,19 +2797,20 @@ impl DnsIncoming {
                     //  bytes:  | 05 | "_http" | C0 | 0C |
                     //          +----+---------+----+----+
                     //            ^len           ^pointer targets offset 12.
-                    if name.len() + label.len() + 1 > MAX_NAME_BYTES {
+                    *wire_len += label.len() + 1;
+                    if *wire_len > MAX_NAME_BYTES {
                         return Err(Error::Msg(format!(
                             "read_labels: name exceeds {MAX_NAME_BYTES} bytes: {name}"
                         )));
                     }
 
-                    *name += label;
-                    *name += ".";
+                    append_escaped_label(name, label);
+                    name.push('.');
                     offset = ending;
                 }
                 0xC0 => {
                     // Message compression: a pointer marks the end of a domain name.
-                    self.follow_pointer(offset, name)?;
+                    self.follow_pointer(offset, name, wire_len)?;
                     return Ok(offset + U16_SIZE);
                 }
                 _ => {
@@ -2847,7 +2830,7 @@ impl DnsIncoming {
     ///
     /// See https://datatracker.ietf.org/doc/html/rfc1035#section-4.1.4 for
     /// message compression.
-    fn follow_pointer(&self, at: usize, name: &mut String) -> Result<()> {
+    fn follow_pointer(&self, at: usize, name: &mut String, wire_len: &mut usize) -> Result<()> {
         let data = &self.data[..];
         let mut pointer_at = at;
 
@@ -2879,8 +2862,24 @@ impl DnsIncoming {
             pointer_at = target;
         };
 
-        self.read_labels(target, name)?;
+        self.read_labels(target, name, wire_len)?;
         Ok(())
+    }
+}
+
+/// Probe ordering compares uncompressed RDATA bytes, including DNS label lengths.
+fn compare_rdata_on_wire(first: &dyn DnsRecordExt, second: &dyn DnsRecordExt) -> cmp::Ordering {
+    let mut first_packet = DnsOutPacket::new(usize::MAX);
+    let mut second_packet = DnsOutPacket::new(usize::MAX);
+    match (
+        first.write(&mut first_packet),
+        second.write(&mut second_packet),
+    ) {
+        (Ok(()), Ok(())) => first_packet.as_bytes()[MSG_HEADER_LEN..]
+            .cmp(&second_packet.as_bytes()[MSG_HEADER_LEN..]),
+        (Ok(()), Err(_)) => cmp::Ordering::Greater,
+        (Err(_), Ok(())) => cmp::Ordering::Less,
+        (Err(_), Err(_)) => cmp::Ordering::Equal,
     }
 }
 
@@ -2942,7 +2941,7 @@ mod tests {
         u16_from_be_slice, DnsAddress, DnsHostInfo, DnsIncoming, DnsNSec, DnsOutPacket,
         DnsOutgoing, DnsPointer, DnsRecordExt, DnsSrv, DnsTxt, RRType, CLASS_CACHE_FLUSH, CLASS_IN,
         FLAGS_AA, FLAGS_QR_QUERY, FLAGS_QR_RESPONSE, FLAGS_TC, MAX_PKT_ABSOLUTE_IPV6,
-        MAX_PKT_DEFAULT, MSG_HEADER_LEN,
+        MAX_PKT_DEFAULT,
     };
     use crate::InterfaceId;
     use std::collections::HashMap;
@@ -3329,10 +3328,7 @@ mod tests {
         assert_eq!(incoming.answers().len(), 1);
     }
 
-    /// A name learned from the network can hold a label that ends with a
-    /// backslash, which escapes the following label separator. Unescaping such
-    /// a name on the way out merges two 63-byte labels into a 127-byte one.
-    /// This used to panic the daemon thread. See issue #483.
+    /// A trailing backslash in a wire label must not escape the next separator.
     #[test]
     fn test_incoming_name_with_merged_labels_does_not_panic() {
         // A query with one question: "aa..a\" + "bb..b", 63 bytes each.
@@ -3346,7 +3342,7 @@ mod tests {
         data.extend([0, 12, 0, 1]); // PTR, IN
 
         let incoming = DnsIncoming::new(
-            data,
+            data.clone(),
             InterfaceId {
                 name: "test".to_string(),
                 index: 1,
@@ -3355,16 +3351,13 @@ mod tests {
         .unwrap();
         let name = incoming.questions()[0].entry.name.clone();
 
-        // The two labels merged: the trailing backslash escaped the separator.
-        assert!(name.starts_with("aaa"));
-        assert!(name.contains("\\.bbb"));
+        assert_eq!(name, format!("{}\\\\.{}.", "a".repeat(62), "b".repeat(63)));
 
-        // Re-emitting it must drop the question rather than panic.
         let mut out = DnsOutgoing::new(0);
         out.add_question(&name, RRType::PTR);
         let packets = out.to_packets(MAX_PKT_DEFAULT, IPV6);
         assert_eq!(packets.len(), 1);
-        assert_eq!(packets[0].as_bytes(), &[0; MSG_HEADER_LEN]);
+        assert_eq!(packets[0].as_bytes(), data);
     }
 
     /// A pointer that points into the name currently being read is a loop:
@@ -3891,5 +3884,115 @@ mod tests {
         assert!(out
             .to_complete_data_on_wire(MAX_PKT_DEFAULT, false)
             .is_none());
+    }
+
+    #[test]
+    fn test_probe_order_compares_uncompressed_name_lengths_and_case() {
+        let ptr = |alias: &str| {
+            DnsPointer::new(
+                "_http._tcp.local.",
+                RRType::PTR,
+                CLASS_IN,
+                120,
+                alias.to_string(),
+            )
+        };
+        assert_eq!(
+            ptr("z.local.").compare_rdata(&ptr("aa.local.")),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            ptr(r"\.a.local.").compare_rdata(&ptr("z.local.")),
+            std::cmp::Ordering::Greater
+        );
+        assert!(ptr("Z.local.").rrdata_match(&ptr("z.local.")));
+        assert_eq!(
+            ptr("Z.local.").compare_rdata(&ptr("z.local.")),
+            std::cmp::Ordering::Less
+        );
+
+        let srv = |host: &str| {
+            DnsSrv::new(
+                "instance._http._tcp.local.",
+                CLASS_IN,
+                120,
+                0,
+                0,
+                80,
+                host.to_string(),
+            )
+        };
+        assert_eq!(
+            srv("z.local.").compare_rdata(&srv("aa.local.")),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            srv(r"\.a.local.").compare_rdata(&srv("z.local.")),
+            std::cmp::Ordering::Greater
+        );
+
+        let nsec = |name: &str| {
+            DnsNSec::new(
+                "host.local.",
+                CLASS_IN,
+                120,
+                name.to_string(),
+                vec![0, 1, 0x40],
+            )
+        };
+        assert_eq!(
+            nsec("z.local.").compare_rdata(&nsec("aa.local.")),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            nsec(r"\.a.local.").compare_rdata(&nsec("z.local.")),
+            std::cmp::Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn test_escaped_names_roundtrip_without_merging_labels() {
+        let names = [
+            r"A\.B._http._tcp.local.",
+            "A.B._http._tcp.local.",
+            r"A\\._http._tcp.local.",
+        ];
+        let mut out = DnsOutgoing::new(FLAGS_QR_RESPONSE);
+        for name in names {
+            out.add_answer_record(DnsPointer::new(
+                "_http._tcp.local.",
+                RRType::PTR,
+                CLASS_IN,
+                120,
+                name.to_string(),
+            ));
+        }
+        let packets = out.to_packets(MAX_PKT_DEFAULT, IPV6);
+        let incoming =
+            DnsIncoming::new(packets[0].as_bytes().to_vec(), test_interface_id()).unwrap();
+        let aliases: Vec<_> = incoming
+            .answers()
+            .iter()
+            .map(|record| record.any().downcast_ref::<DnsPointer>().unwrap().alias())
+            .collect();
+        assert_eq!(aliases, names);
+        let mut repeated = DnsOutgoing::new(FLAGS_QR_RESPONSE);
+        for record in incoming.answers() {
+            repeated.add_answer_box(record.clone());
+        }
+        let repeated_packets = repeated.to_packets(MAX_PKT_DEFAULT, IPV6);
+        assert_eq!(repeated_packets[0].as_bytes(), packets[0].as_bytes());
+    }
+
+    #[test]
+    fn test_escaped_name_length_counts_wire_bytes() {
+        let label = r"\.".repeat(63);
+        let name = format!("{label}.{label}.{label}.{}.", r"\.".repeat(61));
+        let mut out = DnsOutgoing::new(FLAGS_QR_QUERY);
+        out.add_question(&name, RRType::PTR);
+        let packets = out.to_packets(MAX_PKT_DEFAULT, IPV6);
+        let incoming =
+            DnsIncoming::new(packets[0].as_bytes().to_vec(), test_interface_id()).unwrap();
+        assert_eq!(incoming.questions()[0].entry.name, name);
     }
 }

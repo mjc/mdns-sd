@@ -5696,32 +5696,22 @@ fn announce_service_on_intf(
 /// - `foo (2).local.` becomes `foo (3).local.`
 /// - `foo (9)` becomes `foo (10)`
 fn name_change(original: &str) -> String {
-    let mut parts: Vec<_> = original.split('.').collect();
-    let Some(first_part) = parts.get_mut(0) else {
-        return format!("{original} (2)");
-    };
-
-    let mut new_name = format!("{first_part} (2)");
-
-    // check if there is already has `(<num>)` suffix.
-    if let Some(paren_pos) = first_part.rfind(" (") {
-        // Check if there's a closing parenthesis
-        if let Some(end_paren) = first_part[paren_pos..].find(')') {
-            let absolute_end_pos = paren_pos + end_paren;
-            // Only process if the closing parenthesis is the last character
-            if absolute_end_pos == first_part.len() - 1 {
-                let num_start = paren_pos + 2; // Skip " ("
-                                               // Try to parse the number between parentheses
-                if let Ok(number) = first_part[num_start..absolute_end_pos].parse::<u32>() {
-                    let base_name = &first_part[..paren_pos];
-                    new_name = format!("{} ({})", base_name, number + 1)
-                }
-            }
+    rename_first_label(original, |first, limit| {
+        let incremented = first
+            .strip_suffix(')')
+            .and_then(|name| name.rsplit_once(" ("))
+            .and_then(|(base, number)| {
+                number
+                    .parse::<u32>()
+                    .ok()?
+                    .checked_add(1)
+                    .map(|next| (base, next))
+            });
+        match incremented {
+            Some((base, next)) => label_with_suffix(base, &format!(" ({next})"), limit),
+            None => label_with_suffix(first, " (2)", limit),
         }
-    }
-
-    *first_part = &new_name;
-    parts.join(".")
+    })
 }
 
 /// Returns a new name based on the `original` to avoid conflicts.
@@ -5732,24 +5722,76 @@ fn name_change(original: &str) -> String {
 /// - `foo-2.local.` becomes `foo-3.local.`
 /// - `foo` becomes `foo-2`
 fn hostname_change(original: &str) -> String {
-    let mut parts: Vec<_> = original.split('.').collect();
-    let Some(first_part) = parts.get_mut(0) else {
-        return format!("{original}-2");
-    };
-
-    let mut new_name = format!("{first_part}-2");
-
-    // check if there is already a `-<num>` suffix
-    if let Some(hyphen_pos) = first_part.rfind('-') {
-        // Try to parse everything after the hyphen as a number
-        if let Ok(number) = first_part[hyphen_pos + 1..].parse::<u32>() {
-            let base_name = &first_part[..hyphen_pos];
-            new_name = format!("{}-{}", base_name, number + 1);
+    rename_first_label(original, |first, limit| {
+        let incremented = first.rsplit_once('-').and_then(|(base, number)| {
+            number
+                .parse::<u32>()
+                .ok()?
+                .checked_add(1)
+                .map(|next| (base, next))
+        });
+        match incremented {
+            Some((base, next)) => label_with_suffix(base, &format!("-{next}"), limit),
+            None => label_with_suffix(first, "-2", limit),
         }
-    }
+    })
+}
 
-    *first_part = &new_name;
-    parts.join(".")
+/// Leaves room for the suffix without splitting a UTF-8 character.
+fn label_with_suffix(stem: &str, suffix: &str, limit: usize) -> String {
+    if suffix.len() > limit {
+        let next = stem
+            .parse::<u32>()
+            .ok()
+            .and_then(|number| number.checked_add(1))
+            .unwrap_or(2)
+            .to_string();
+        if next.len() <= limit {
+            return next;
+        }
+        return if stem == "0" { "1" } else { "0" }.to_string();
+    }
+    let mut end = stem.len().min(limit - suffix.len());
+    while !stem.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{suffix}", &stem[..end])
+}
+
+fn rename_first_label(original: &str, rename: impl FnOnce(&str, usize) -> String) -> String {
+    let absolute = original.strip_suffix('.').is_some_and(|prefix| {
+        prefix
+            .as_bytes()
+            .iter()
+            .rev()
+            .take_while(|byte| **byte == b'\\')
+            .count()
+            % 2
+            == 0
+    });
+    let mut labels = crate::dns_name::labels(original);
+    if labels.is_empty() {
+        labels.push(String::new());
+    }
+    let other_bytes = labels
+        .iter()
+        .skip(1)
+        .map(|label| label.len() + 1)
+        .sum::<usize>();
+    let first_limit = crate::dns_parser::MAX_LABEL_BYTES
+        .min(crate::dns_parser::MAX_NAME_BYTES.saturating_sub(other_bytes + 2));
+    labels[0] = rename(&labels[0], first_limit);
+    let mut result = String::new();
+    for label in labels {
+        if !result.is_empty() {
+            result.push('.');
+        }
+        crate::dns_name::append_escaped_label(&mut result, &label);
+    }
+    if absolute {
+        result.push('.');
+    }
+    result
 }
 
 /// Check probes in a registry and returns: a probing packet to send out, and a list of probe names
@@ -8540,5 +8582,172 @@ mod tests {
             receiver_b.try_recv(),
             Ok(HostnameResolutionEvent::SearchStarted(_))
         ));
+    }
+
+    #[test]
+    fn test_conflict_renaming_preserves_escaped_labels() {
+        assert_eq!(
+            name_change(r"A\.B._http._tcp.local."),
+            r"A\.B (2)._http._tcp.local."
+        );
+        assert_eq!(
+            name_change(r"A\\B._http._tcp.local."),
+            r"A\\B (2)._http._tcp.local."
+        );
+        assert_eq!(hostname_change(r"A\.B.local."), r"A\.B-2.local.");
+        assert_eq!(hostname_change(r"A\\B.local."), r"A\\B-2.local.");
+        assert_eq!(name_change(r"A\\."), r"A\\ (2).");
+        assert_eq!(name_change(r"A\."), r"A\. (2)");
+    }
+
+    #[test]
+    fn test_conflict_renaming_does_not_overflow_numeric_suffixes() {
+        assert_eq!(
+            name_change("foo (4294967295).local."),
+            "foo (4294967295) (2).local."
+        );
+        assert_eq!(
+            hostname_change("foo-4294967295.local."),
+            "foo-4294967295-2.local."
+        );
+    }
+
+    #[test]
+    fn test_conflict_renaming_maximum_labels_roundtrip() {
+        for label in ["a".repeat(63), "\u{754c}".repeat(21)] {
+            let original = format!("{label}._http._tcp.local.");
+            for renamed in [name_change(&original), hostname_change(&original)] {
+                let labels = crate::dns_name::labels(&renamed);
+                assert!(labels[0].len() <= crate::dns_parser::MAX_LABEL_BYTES);
+                assert_eq!(&labels[1..], &["_http", "_tcp", "local"]);
+                let mut query = DnsOutgoing::new(FLAGS_QR_QUERY);
+                query.add_question(&renamed, RRType::ANY);
+                let packets = query.to_data_on_wire(MAX_PKT_DEFAULT, true);
+                let parsed =
+                    DnsIncoming::new(packets[0].clone(), crate::InterfaceId::default()).unwrap();
+                assert_eq!(parsed.questions()[0].entry_name(), renamed);
+            }
+        }
+        assert_eq!(
+            name_change(&"a".repeat(63)),
+            format!("{} (2)", "a".repeat(59))
+        );
+        assert_eq!(
+            hostname_change(&"\u{754c}".repeat(21)),
+            format!("{}-2", "\u{754c}".repeat(20))
+        );
+    }
+
+    #[test]
+    fn test_conflict_renaming_maximum_names_roundtrip() {
+        let suffix = format!(
+            "{}.{}.{}.local.",
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(63)
+        );
+        for first in [
+            "a".repeat(55),
+            format!("{}x", "\u{754c}".repeat(18)),
+            format!(r"{}\.\\", "a".repeat(53)),
+        ] {
+            let original = format!("{first}.{suffix}");
+            let original_labels = crate::dns_name::labels(&original);
+            let wire_len =
+                |labels: &[String]| labels.iter().map(|label| label.len() + 1).sum::<usize>() + 1;
+            assert_eq!(
+                wire_len(&original_labels),
+                crate::dns_parser::MAX_NAME_BYTES
+            );
+            for renamed in [name_change(&original), hostname_change(&original)] {
+                let labels = crate::dns_name::labels(&renamed);
+                assert!(wire_len(&labels) <= crate::dns_parser::MAX_NAME_BYTES);
+                assert_eq!(&labels[1..], &original_labels[1..]);
+                assert_ne!(labels[0], original_labels[0]);
+                let mut query = DnsOutgoing::new(FLAGS_QR_QUERY);
+                query.add_question(&renamed, RRType::ANY);
+                let packets = query.to_data_on_wire(MAX_PKT_DEFAULT, true);
+                assert_eq!(packets.len(), 1);
+                let parsed =
+                    DnsIncoming::new(packets[0].clone(), crate::InterfaceId::default()).unwrap();
+                assert_eq!(parsed.questions()[0].entry_name(), renamed);
+            }
+        }
+
+        let original = format!("a.{}.{}", "e".repeat(53), suffix);
+        let original_labels = crate::dns_name::labels(&original);
+        assert_eq!(
+            original_labels
+                .iter()
+                .map(|label| label.len() + 1)
+                .sum::<usize>()
+                + 1,
+            crate::dns_parser::MAX_NAME_BYTES
+        );
+        for rename in [name_change as fn(&str) -> String, hostname_change] {
+            let renamed = rename(&original);
+            let labels = crate::dns_name::labels(&renamed);
+            assert_eq!(labels[0], "2");
+            assert_eq!(&labels[1..], &original_labels[1..]);
+            assert_eq!(crate::dns_name::labels(&rename(&renamed))[0], "3");
+            let mut query = DnsOutgoing::new(FLAGS_QR_QUERY);
+            query.add_question(&renamed, RRType::ANY);
+            let packets = query.to_data_on_wire(MAX_PKT_DEFAULT, true);
+            assert_eq!(packets.len(), 1);
+            let parsed =
+                DnsIncoming::new(packets[0].clone(), crate::InterfaceId::default()).unwrap();
+            assert_eq!(parsed.questions()[0].entry_name(), renamed);
+        }
+    }
+
+    #[test]
+    fn test_scoped_resolution_preserves_ptr_instance_presentation() {
+        let mut daemon = new_test_zeroconf();
+        daemon.accept_unsolicited = true;
+        let intf = daemon
+            .my_intfs
+            .values()
+            .find(|intf| {
+                intf.addrs
+                    .iter()
+                    .any(|address| address.ip() == IpAddr::V4(Ipv4Addr::LOCALHOST))
+            })
+            .unwrap();
+        let index = intf.index;
+        let interface = crate::InterfaceId::from(intf);
+        let ty = "_display._tcp.local.";
+        let fullname = r"MiXeD\.Name._display._tcp.local.";
+        let mut outgoing = DnsOutgoing::new(FLAGS_QR_RESPONSE);
+        outgoing.add_answer_record(DnsPointer::new(
+            ty,
+            RRType::PTR,
+            CLASS_IN,
+            120,
+            fullname.to_string(),
+        ));
+        outgoing.add_answer_record(DnsSrv::new(
+            fullname,
+            CLASS_IN,
+            120,
+            0,
+            0,
+            80,
+            "Host.local.".to_string(),
+        ));
+        outgoing.add_answer_record(DnsAddress::new(
+            "Host.local.",
+            RRType::A,
+            CLASS_IN,
+            120,
+            Ipv4Addr::LOCALHOST.into(),
+            interface.clone(),
+        ));
+        for packet in outgoing.to_data_on_wire(MAX_PKT_DEFAULT, true) {
+            daemon.handle_response(DnsIncoming::new(packet, interface.clone()).unwrap(), index);
+        }
+        let canonical = fullname.to_ascii_lowercase();
+        let service = daemon.resolve_service_on_intf(ty, &canonical, index);
+        assert!(service.is_valid());
+        assert_eq!(service.fullname, fullname);
     }
 }

@@ -951,3 +951,19 @@ fn cached_complete_service_replays_once_across_links_and_alias_case() {
         assert!(daemon.pending_resolves.is_empty());
     }
 }
+
+#[test]
+fn escaped_subtype_marker_does_not_expand_parent_browse_interest() {
+    let (mut daemon, index) = daemon();
+    let receiver = subscribe(&mut daemon);
+    let instance = format!("escaped.{TY}");
+    let escaped = format!(r"_print\._sub.{TY}");
+    let mut records = discovery_records(&daemon, index, &instance, "escaped.local.", 120, false);
+    records.insert(
+        0,
+        DnsPointer::new(&escaped, RRType::PTR, CLASS_IN, 120, instance).boxed(),
+    );
+    receive(&mut daemon, index, records);
+    assert_eq!(daemon.cache.record_count(), 0);
+    assert!(receiver.is_empty());
+}

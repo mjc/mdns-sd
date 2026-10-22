@@ -2532,13 +2532,7 @@ fn test_rfc6763_utf8_network_integration() {
                 let resolved_fullname = info.get_fullname();
                 println!("Resolved service: {}", resolved_fullname);
 
-                // Compare by checking if the resolved fullname contains our instance base
-                // and UTF-8 characters (network returns decoded names without escaping)
-                if resolved_fullname.contains(&instance_base)
-                    && resolved_fullname.contains("Café")
-                    && resolved_fullname.contains('🌐')
-                    && resolved_fullname.contains(ty_domain)
-                {
+                if resolved_fullname.contains(&instance_base) {
                     resolved = true;
                     println!("Successfully found UTF-8 service over network!");
 
@@ -2546,14 +2540,12 @@ fn test_rfc6763_utf8_network_integration() {
                     assert_eq!(info.get_port(), port);
                     assert!(!info.get_addresses().is_empty());
 
-                    // Verify UTF-8 characters are preserved
-                    assert!(resolved_fullname.contains("Café.Service"));
-                    assert!(resolved_fullname.contains('🌐'));
+                    assert_eq!(resolved_fullname, fullname);
                     break;
                 }
             }
             ServiceEvent::SearchStarted(_) => {
-                println!("Search started for {}", ty_domain);
+                println!("Search started for {}", &ty_domain);
             }
             ServiceEvent::ServiceFound(_, found_fullname) => {
                 println!("Service found: {}", found_fullname);
