@@ -1642,8 +1642,6 @@ impl Zeroconf {
                     let scopes: Vec<_> = self
                         .cache
                         .get_ptr(&ty_domain)
-                        .into_iter()
-                        .flatten()
                         .filter(|record| !record.record.get_record().is_expired(Instant::now()))
                         .filter_map(|record| {
                             record
@@ -1708,21 +1706,14 @@ impl Zeroconf {
         let mut newly_resolved = HashSet::new();
         for (ty, subscription) in &self.service_queriers {
             for ((index, instance), delivery) in &subscription.delivered {
-                let ptr_alive = self
-                    .cache
-                    .get_ptr_on_intf(ty, *index)
-                    .into_iter()
-                    .flatten()
-                    .any(|record| {
-                        !record.record.get_record().is_expired(now)
-                            && record
-                                .record
-                                .any()
-                                .downcast_ref::<DnsPointer>()
-                                .is_some_and(|ptr| {
-                                    CanonicalName::new(ptr.alias()).as_str() == instance
-                                })
-                    });
+                let ptr_alive = self.cache.get_ptr_on_intf(ty, *index).any(|record| {
+                    !record.record.get_record().is_expired(now)
+                        && record
+                            .record
+                            .any()
+                            .downcast_ref::<DnsPointer>()
+                            .is_some_and(|ptr| CanonicalName::new(ptr.alias()).as_str() == instance)
+                });
                 let valid = ptr_alive
                     && match delivery {
                         BrowseDelivery::Found(_) => {
@@ -2955,7 +2946,7 @@ impl Zeroconf {
             if !subscription.querying || ty == SERVICE_TYPE_ENUMERATION {
                 continue;
             }
-            for record in self.cache.get_ptr(ty).into_iter().flatten() {
+            for record in self.cache.get_ptr(ty) {
                 if record
                     .record
                     .any()
@@ -2969,18 +2960,23 @@ impl Zeroconf {
             }
         }
         for index in scopes {
-            if let Some(records) = self.cache.get_srv_on_intf(instance, index) {
-                for record in records {
-                    if let Some(srv) = record.record.any().downcast_ref::<DnsSrv>() {
-                        if self.cache.get_addr_on_intf(srv.host(), index).is_none() {
-                            questions.insert((index, srv.host().to_string(), RRType::A));
-                            questions.insert((index, srv.host().to_string(), RRType::AAAA));
-                        }
-                    }
-                }
-            } else {
+            let mut records = self.cache.get_srv_on_intf(instance, index).peekable();
+            if records.peek().is_none() {
                 questions.insert((index, instance.to_string(), RRType::SRV));
                 questions.insert((index, instance.to_string(), RRType::TXT));
+            }
+            for record in records {
+                if let Some(srv) = record.record.any().downcast_ref::<DnsSrv>() {
+                    if self
+                        .cache
+                        .get_addr_on_intf(srv.host(), index)
+                        .next()
+                        .is_none()
+                    {
+                        questions.insert((index, srv.host().to_string(), RRType::A));
+                        questions.insert((index, srv.host().to_string(), RRType::AAAA));
+                    }
+                }
             }
         }
         questions
@@ -3004,14 +3000,13 @@ impl Zeroconf {
     /// active.
     fn query_unresolved_instances(&mut self, ty_domain: &str) {
         let now = Instant::now();
-        let mut instances = Vec::new();
-        if let Some(records) = self.cache.get_ptr(ty_domain) {
-            for record in records.iter().filter(|r| !r.record.expires_soon(now)) {
-                if let Some(ptr) = record.record.any().downcast_ref::<DnsPointer>() {
-                    instances.push(ptr.alias().to_string());
-                }
-            }
-        }
+        let instances: Vec<_> = self
+            .cache
+            .get_ptr(ty_domain)
+            .filter(|record| !record.record.expires_soon(now))
+            .filter_map(|record| record.record.any().downcast_ref::<DnsPointer>())
+            .map(|ptr| ptr.alias().to_string())
+            .collect();
 
         for instance in instances {
             self.query_unresolved(&instance);
@@ -3029,19 +3024,10 @@ impl Zeroconf {
         let mut aliases: Vec<String> = self
             .cache
             .get_ptr(ty_domain)
-            .map(|records| {
-                records
-                    .iter()
-                    .filter(|r| !r.record.expires_soon(now))
-                    .filter_map(|r| {
-                        r.record
-                            .any()
-                            .downcast_ref::<DnsPointer>()
-                            .map(|p| p.alias().to_string())
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+            .filter(|record| !record.record.expires_soon(now))
+            .filter_map(|record| record.record.any().downcast_ref::<DnsPointer>())
+            .map(|ptr| ptr.alias().to_string())
+            .collect();
         let mut seen = HashSet::new();
         aliases.retain(|alias| seen.insert(CanonicalName::new(alias)));
 
@@ -3133,8 +3119,6 @@ impl Zeroconf {
         let mut scopes: Vec<_> = self
             .cache
             .get_ptr(ty_domain)
-            .into_iter()
-            .flatten()
             .filter_map(|record| {
                 record
                     .record
@@ -3182,8 +3166,6 @@ impl Zeroconf {
         let display_fullname = self
             .cache
             .get_ptr_on_intf(ty_domain, index)
-            .into_iter()
-            .flatten()
             .filter_map(|record| record.record.any().downcast_ref::<DnsPointer>())
             .find(|ptr| CanonicalName::new(ptr.alias()) == CanonicalName::new(fullname))
             .map(|ptr| ptr.alias().to_string())
@@ -3217,63 +3199,59 @@ impl Zeroconf {
         }
 
         // resolve SRV record
-        if let Some(records) = self.cache.get_srv_on_intf(fullname, index) {
-            if let Some(answer) = records
-                .iter()
-                .find(|r| !r.record.get_record().is_expired(now))
-            {
-                if let Some(dns_srv) = answer.record.any().downcast_ref::<DnsSrv>() {
-                    resolved_service.host = dns_srv.host().to_string();
-                    resolved_service.port = dns_srv.port();
-                }
+        if let Some(answer) = self
+            .cache
+            .get_srv_on_intf(fullname, index)
+            .find(|r| !r.record.get_record().is_expired(now))
+        {
+            if let Some(dns_srv) = answer.record.any().downcast_ref::<DnsSrv>() {
+                resolved_service.host = dns_srv.host().to_string();
+                resolved_service.port = dns_srv.port();
             }
         }
 
         // resolve TXT record
-        if let Some(records) = self.cache.get_txt_on_intf(fullname, index) {
-            if let Some(record) = records
-                .iter()
-                .find(|r| !r.record.get_record().is_expired(now))
-            {
-                if let Some(dns_txt) = record.record.any().downcast_ref::<DnsTxt>() {
-                    resolved_service.txt_properties = dns_txt.text().into();
-                }
+        if let Some(record) = self
+            .cache
+            .get_txt_on_intf(fullname, index)
+            .find(|r| !r.record.get_record().is_expired(now))
+        {
+            if let Some(dns_txt) = record.record.any().downcast_ref::<DnsTxt>() {
+                resolved_service.txt_properties = dns_txt.text().into();
             }
         }
 
         // resolve A and AAAA records
-        if let Some(records) = self.cache.get_addr_on_intf(&resolved_service.host, index) {
-            for answer in records.iter() {
-                if let Some(dns_a) = answer.record.any().downcast_ref::<DnsAddress>() {
-                    if dns_a.get_record().is_expired(now) {
-                        trace!(
-                            "Addr expired or expires soon: {}",
-                            dns_a.address().to_ip_addr()
-                        );
-                    } else {
-                        let scoped = dns_a.address();
-                        if let ScopedIp::V4(v4) = &scoped {
-                            // Merge interface_ids if this V4 addr already exists.
-                            // Linear scan by IP since Eq/Hash include interface_ids.
-                            let existing = resolved_service
-                                .addresses
-                                .iter()
-                                .find(|a| a.to_ip_addr() == IpAddr::V4(*v4.addr()))
-                                .cloned();
-                            if let Some(mut existing) = existing {
-                                resolved_service.addresses.remove(&existing);
-                                if let ScopedIp::V4(existing_v4) = &mut existing {
-                                    for id in v4.interface_ids() {
-                                        existing_v4.add_interface_id(id.clone());
-                                    }
+        for answer in self.cache.get_addr_on_intf(&resolved_service.host, index) {
+            if let Some(dns_a) = answer.record.any().downcast_ref::<DnsAddress>() {
+                if dns_a.get_record().is_expired(now) {
+                    trace!(
+                        "Addr expired or expires soon: {}",
+                        dns_a.address().to_ip_addr()
+                    );
+                } else {
+                    let scoped = dns_a.address();
+                    if let ScopedIp::V4(v4) = &scoped {
+                        // Merge interface_ids if this V4 addr already exists.
+                        // Linear scan by IP since Eq/Hash include interface_ids.
+                        let existing = resolved_service
+                            .addresses
+                            .iter()
+                            .find(|a| a.to_ip_addr() == IpAddr::V4(*v4.addr()))
+                            .cloned();
+                        if let Some(mut existing) = existing {
+                            resolved_service.addresses.remove(&existing);
+                            if let ScopedIp::V4(existing_v4) = &mut existing {
+                                for id in v4.interface_ids() {
+                                    existing_v4.add_interface_id(id.clone());
                                 }
-                                resolved_service.addresses.insert(existing);
-                            } else {
-                                resolved_service.addresses.insert(scoped);
                             }
+                            resolved_service.addresses.insert(existing);
                         } else {
                             resolved_service.addresses.insert(scoped);
                         }
+                    } else {
+                        resolved_service.addresses.insert(scoped);
                     }
                 }
             }
@@ -3478,20 +3456,15 @@ impl Zeroconf {
             }
         }
         for (ty, instance) in found {
-            let retained = self
-                .cache
-                .get_ptr_on_intf(&ty, if_index)
-                .into_iter()
-                .flatten()
-                .any(|record| {
-                    record
-                        .record
-                        .any()
-                        .downcast_ref::<DnsPointer>()
-                        .is_some_and(|ptr| {
-                            CanonicalName::new(ptr.alias()) == CanonicalName::new(&instance)
-                        })
-                });
+            let retained = self.cache.get_ptr_on_intf(&ty, if_index).any(|record| {
+                record
+                    .record
+                    .any()
+                    .downcast_ref::<DnsPointer>()
+                    .is_some_and(|ptr| {
+                        CanonicalName::new(ptr.alias()) == CanonicalName::new(&instance)
+                    })
+            });
             if retained {
                 self.push_service(&ty, ServiceEvent::ServiceFound(ty.clone(), instance));
             }
@@ -8040,7 +8013,7 @@ mod tests {
             let msg = DnsIncoming::new(packet, interface_id.clone()).unwrap();
             zc.handle_response(msg, index);
         }
-        assert_eq!(zc.cache.get_ptr(ty).map(|v| v.len()).unwrap_or(0), 12);
+        assert_eq!(zc.cache.get_ptr(ty).count(), 12);
         let (sender, receiver) = flume::bounded(10);
         zc.exec_command_browse(false, ty.to_string(), 1, false, sender);
         assert!(!zc.service_queriers.contains_key(ty));

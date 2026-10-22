@@ -157,16 +157,20 @@ fn verification_without_browsing_accepts_changed_target_and_new_address() {
     daemon.exec_command_verify(instance.clone(), Duration::from_secs(10), false);
     let deadline = daemon.verifications[&instance];
     assert!(
-        daemon.cache.get_srv_on_intf(&instance, index).unwrap()[0]
+        daemon
+            .cache
+            .get_srv_on_intf(&instance, index)
+            .next()
+            .unwrap()
             .record
             .get_expire()
             <= deadline
     );
     let records = discovery_records(&daemon, index, &instance, "new.local.", 120, false);
     receive(&mut daemon, index, records);
-    let records = daemon.cache.get_srv_on_intf(&instance, index).unwrap();
-    let updated = records
-        .iter()
+    let updated = daemon
+        .cache
+        .get_srv_on_intf(&instance, index)
         .find(|record| {
             record
                 .record
@@ -177,11 +181,7 @@ fn verification_without_browsing_accepts_changed_target_and_new_address() {
         .unwrap();
     assert!(updated.record.get_expire() > deadline);
     assert_eq!(
-        daemon
-            .cache
-            .get_addr_on_intf("new.local.", index)
-            .unwrap()
-            .len(),
+        daemon.cache.get_addr_on_intf("new.local.", index).count(),
         1
     );
 }
@@ -457,7 +457,7 @@ fn incomplete_cache_only_data_does_not_schedule_resolution_or_refresh() {
     assert!(daemon.pending_resolves.is_empty());
     assert!(daemon.retransmissions.is_empty());
     assert_eq!(daemon.scheduled_deadlines(), 1);
-    let ptr = daemon.cache.get_ptr_on_intf(TY, index).unwrap()[0];
+    let ptr = daemon.cache.get_ptr_on_intf(TY, index).next().unwrap();
     assert_eq!(daemon.peek_earliest_timer(), Some(ptr.record.get_expire()));
     assert!(ptr.record.get_record().get_refresh_time() < ptr.record.get_expire());
 }
@@ -522,8 +522,8 @@ fn unsolicited_unsupported_class_cannot_displace_in_records() {
         .boxed()],
     );
     assert_eq!(daemon.cache.usage().0, 1);
-    assert!(daemon.cache.get_ptr(TY).is_some());
-    assert!(daemon.cache.get_ptr("other.local.").is_none());
+    assert!(daemon.cache.get_ptr(TY).next().is_some());
+    assert!(daemon.cache.get_ptr("other.local.").next().is_none());
 }
 
 #[test]
@@ -554,7 +554,7 @@ fn unresolved_link_cannot_hide_loss_of_the_last_resolved_link() {
             .count(),
         1
     );
-    assert!(daemon.cache.get_ptr_on_intf(TY, other).is_some());
+    assert!(daemon.cache.get_ptr_on_intf(TY, other).next().is_some());
     daemon.reconcile_browse_state();
     assert!(receiver.is_empty());
 }
@@ -676,8 +676,8 @@ fn removing_a_link_notifies_hostname_subscribers_once() {
         .collect();
     assert_eq!(removed.len(), 1);
     assert!(!removed[0].is_empty());
-    assert!(daemon.cache.get_addr_on_intf(host, index).is_some());
-    assert!(daemon.cache.get_addr_on_intf(host, other).is_none());
+    assert!(daemon.cache.get_addr_on_intf(host, index).next().is_some());
+    assert!(daemon.cache.get_addr_on_intf(host, other).next().is_none());
 }
 
 #[test]
@@ -737,10 +737,7 @@ fn parent_browse_retains_subtype_metadata_from_parsed_announcements() {
         })
         .unwrap();
     assert_eq!(resolved.sub_ty_domain.as_deref(), Some(subtype.as_str()));
-    assert_eq!(
-        daemon.cache.get_ptr_on_intf(&subtype, index).unwrap().len(),
-        1
-    );
+    assert_eq!(daemon.cache.get_ptr_on_intf(&subtype, index).count(), 1);
 
     let (mut publisher, index) = super::lifecycle_tests::daemon();
     let mut records = discovery_records(&publisher, index, &instance, "subtype.local.", 120, true);
@@ -1038,7 +1035,7 @@ fn cached_complete_service_replays_once_across_links_and_alias_case() {
             let records = discovery_records(&daemon, index, &alias, "startup.local.", 120, true);
             receive(&mut daemon, index, records);
         }
-        assert_eq!(daemon.cache.get_ptr(TY).unwrap().len(), 2);
+        assert_eq!(daemon.cache.get_ptr(TY).count(), 2);
         let (sender, receiver) = flume::unbounded();
         daemon.exec_command_browse(false, TY.to_string(), 1, cache_only, sender);
         let events: Vec<_> = receiver.try_iter().collect();
