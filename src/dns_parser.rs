@@ -484,9 +484,14 @@ impl DnsRecord {
         // From RFC 6762 section 5.2:
         // "... The querier should plan to issue a query at 80% of the record
         // lifetime, and then if no answer is received, at 85%, 90%, and 95%."
-        let refresh = get_expiration_time(created, ttl, 80);
-
         let expires = get_expiration_time(created, ttl, 100);
+        let refresh = if ttl > 1 {
+            get_expiration_time(created, ttl, 80)
+        } else {
+            // TTL 0 means immediate expiry; mDNS goodbye responses are
+            // received with TTL 1 and should expire after that second.
+            expires
+        };
 
         Self {
             entry: DnsEntry::new(name.to_string(), ty, class),
@@ -3079,6 +3084,10 @@ mod tests {
         let incoming =
             DnsIncoming::new(packets[0].as_bytes().to_vec(), test_interface_id()).unwrap();
         assert_eq!(incoming.answers()[0].get_record().get_ttl(), 1);
+        assert_eq!(
+            incoming.answers()[0].get_record().get_expire_time(),
+            incoming.answers()[0].get_record().get_refresh_time()
+        );
         assert!(original.matches(incoming.answers()[0].as_ref()));
     }
 
