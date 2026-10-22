@@ -235,8 +235,15 @@ impl Zeroconf {
                             .set_cache_flush(record.get_type() != RRType::PTR);
                         out.add_answer_box(goodbye);
                     }
-                    let packets = self.send_publication_packet(index, is_ipv4, &out);
+                    self.send_publication_packet(index, is_ipv4, &out);
                     if repeat_goodbyes {
+                        let packets = self
+                            .my_intfs
+                            .get(&index)
+                            .and_then(|intf| {
+                                out.to_complete_data_on_wire(intf.max_packet_size(is_ipv4), is_ipv4)
+                            })
+                            .unwrap_or_default();
                         for packet in packets {
                             if self.retransmissions.iter().any(|rerun| {
                                 matches!(&rerun.command, Command::UnregisterResend(existing, current_index, current_family)

@@ -3491,10 +3491,24 @@ impl Zeroconf {
                 .collect();
             let established = registry.active.remove(&name).is_some();
             if !established {
+                let presentation = self
+                    .my_services
+                    .values()
+                    .chain(self.pending_registrations.values())
+                    .map(|service| {
+                        if hostname {
+                            service.get_hostname()
+                        } else {
+                            service.get_fullname()
+                        }
+                    })
+                    .map(|original| registry.resolve_name(original))
+                    .find(|current| CanonicalName::new(current).as_str() == name.as_str())
+                    .unwrap_or(name.as_str());
                 let renamed = if hostname {
-                    hostname_change(&name)
+                    hostname_change(presentation)
                 } else {
-                    name_change(&name)
+                    name_change(presentation)
                 };
                 let originals: Vec<_> = self
                     .my_services

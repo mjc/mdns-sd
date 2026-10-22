@@ -379,6 +379,33 @@ fn conflict_renames_are_current_and_disappear_on_unregister() {
 }
 
 #[test]
+fn conflict_renaming_preserves_instance_presentation() {
+    let (mut daemon, index) = daemon();
+    let published = service("My Printer", "host.local.", "127.0.0.1", "A");
+    let fullname = published.get_fullname().to_string();
+    daemon.register_service(published);
+    for probe in daemon
+        .dns_registry_map
+        .get_mut(&index)
+        .unwrap()
+        .probing
+        .values_mut()
+    {
+        probe.next_send = Instant::now();
+    }
+    daemon.probing_handler();
+    receive(
+        &mut daemon,
+        index,
+        vec![DnsTxt::new(&fullname, CLASS_IN, 120, b"\x09version=B".to_vec()).boxed()],
+    );
+    assert_eq!(
+        daemon.dns_registry_map[&index].resolve_name(&fullname),
+        "My Printer (2)._lifecycle._tcp.local."
+    );
+}
+
+#[test]
 fn unregister_does_not_send_goodbye_for_a_shared_hostname() {
     let (mut daemon, index) = daemon();
     let first = service("first", "shared.local.", "127.0.0.1", "A");

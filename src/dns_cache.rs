@@ -51,6 +51,8 @@ pub(crate) struct DnsRecordIntf {
 pub(crate) struct DnsCache {
     /// Records keyed by receiving interface index and RRset identity.
     records: HashMap<(u32, RrsetKey), Vec<DnsRecordIntf>>,
+    record_count: usize,
+    charged_bytes: usize,
     max_records: usize,
     max_bytes: usize,
 }
@@ -59,6 +61,8 @@ impl DnsCache {
     pub(crate) fn new() -> Self {
         Self {
             records: HashMap::new(),
+            record_count: 0,
+            charged_bytes: 0,
             max_records: 4096,
             max_bytes: 4 * 1024 * 1024,
         }
@@ -73,20 +77,24 @@ impl DnsCache {
 
     /// Returns the retained record count and charged bytes, excluding allocator overhead.
     pub(crate) fn usage(&self) -> (usize, usize) {
-        self.records
-            .values()
-            .flatten()
-            .fold((0, 0usize), |(count, bytes), record| {
-                (count + 1, bytes.saturating_add(record.charge))
-            })
+        (self.record_count, self.charged_bytes)
     }
 
     fn trim_to_limits(&mut self, max_records: usize, max_bytes: usize) -> bool {
-        std::iter::from_fn(|| {
-            let (records, bytes) = self.usage();
-            (records > max_records || bytes > max_bytes).then(|| self.evict_oldest())
-        })
-        .all(|evicted| evicted)
+        let mut changed = false;
+        while self.record_count > max_records || self.charged_bytes > max_bytes {
+            if !self.evict_oldest() {
+                if changed {
+                    self.compact();
+                }
+                return false;
+            }
+            changed = true;
+        }
+        if changed {
+            self.compact();
+        }
+        true
     }
 
     fn compact(&mut self) {
@@ -122,8 +130,9 @@ impl DnsCache {
         let Some((key, index)) = oldest else {
             return false;
         };
-        self.records.get_mut(&key).unwrap().remove(index);
-        self.compact();
+        let removed = self.records.get_mut(&key).unwrap().remove(index);
+        self.record_count -= 1;
+        self.charged_bytes -= removed.charge;
         true
     }
 
@@ -456,6 +465,8 @@ impl DnsCache {
                 charge,
             },
         );
+        self.record_count += 1;
+        self.charged_bytes += charge;
         Some((&records[0], true))
     }
 
@@ -463,11 +474,15 @@ impl DnsCache {
     pub(crate) fn remove_on_intf(&mut self, record: &DnsRecordBox, index: u32) -> bool {
         let key = (index, RrsetKey::new(record.as_ref()));
         let mut removed = false;
+        let mut removed_count = 0;
+        let mut removed_bytes = 0;
         self.records.retain(|candidate, records| {
             if *candidate == key {
                 records.retain(|existing| {
                     if existing.record.matches(record.as_ref()) {
                         removed = true;
+                        removed_count += 1;
+                        removed_bytes += existing.charge;
                         false
                     } else {
                         true
@@ -476,6 +491,8 @@ impl DnsCache {
             }
             !records.is_empty()
         });
+        self.record_count -= removed_count;
+        self.charged_bytes -= removed_bytes;
         self.compact();
         removed
     }
@@ -506,12 +523,16 @@ impl DnsCache {
     pub(crate) fn evict_expired(&mut self, now: Instant) -> CacheEviction {
         let mut changed = false;
         let mut expired_addrs: HashMap<String, HashSet<ScopedIp>> = HashMap::new();
+        let mut removed_count = 0;
+        let mut removed_bytes = 0;
         self.records.retain(|_, records| {
             records.retain(|record| {
                 if !record.record.get_record().is_expired(now) {
                     return true;
                 }
                 changed = true;
+                removed_count += 1;
+                removed_bytes += record.charge;
                 if let Some(addr) = record.record.any().downcast_ref::<DnsAddress>() {
                     expired_addrs
                         .entry(record.record.get_name().to_string())
@@ -522,6 +543,8 @@ impl DnsCache {
             });
             !records.is_empty()
         });
+        self.record_count -= removed_count;
+        self.charged_bytes -= removed_bytes;
         self.compact();
         CacheEviction {
             changed,
@@ -718,11 +741,20 @@ impl DnsCache {
     }
 
     pub(crate) fn remove_addrs_on_disabled_intf(&mut self, index: u32, ip_type: IpType) {
-        self.records.retain(|(scope, key), _| {
-            *scope != index
-                || !((key.rr_type == RRType::A && ip_type.contains(IpType::V4))
-                    || (key.rr_type == RRType::AAAA && ip_type.contains(IpType::V6)))
+        let mut removed_count = 0;
+        let mut removed_bytes = 0;
+        self.records.retain(|(scope, key), records| {
+            let remove = *scope == index
+                && ((key.rr_type == RRType::A && ip_type.contains(IpType::V4))
+                    || (key.rr_type == RRType::AAAA && ip_type.contains(IpType::V6)));
+            if remove {
+                removed_count += records.len();
+                removed_bytes += records.iter().map(|record| record.charge).sum::<usize>();
+            }
+            !remove
         });
+        self.record_count -= removed_count;
+        self.charged_bytes -= removed_bytes;
         self.compact();
     }
 
@@ -732,10 +764,14 @@ impl DnsCache {
         let mut ptrs = Vec::new();
         let mut modified_instances = HashSet::new();
         let mut hosts = HashSet::new();
+        let mut removed_count = 0;
+        let mut removed_bytes = 0;
         self.records.retain(|(scope, key), records| {
             if *scope != intf.index {
                 return true;
             }
+            removed_count += records.len();
+            removed_bytes += records.iter().map(|record| record.charge).sum::<usize>();
             match key.rr_type {
                 RRType::PTR => {
                     for ptr in records {
@@ -754,6 +790,8 @@ impl DnsCache {
             }
             false
         });
+        self.record_count -= removed_count;
+        self.charged_bytes -= removed_bytes;
         for host in hosts {
             modified_instances.extend(self.get_instances_on_host(host.as_str()));
         }
