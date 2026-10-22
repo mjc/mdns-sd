@@ -573,6 +573,66 @@ fn any_probe_defers_to_another_record_type_at_the_hostname() {
 }
 
 #[test]
+fn a_looped_back_old_srv_does_not_conflict_with_the_updated_registration() {
+    let (mut daemon, index) = daemon();
+    let published = service("echo", "old.local.", "127.0.0.1", "A");
+    let fullname = published.get_fullname().to_string();
+    daemon.register_service(published);
+    finish(&mut daemon, index);
+    let old_srv = daemon.dns_registry_map[&index]
+        .records_for_name(&fullname)
+        .iter()
+        .find(|record| record.get_type() == RRType::SRV)
+        .unwrap()
+        .clone();
+    assert!(daemon.dns_registry_map[&index].was_recently_multicast(&old_srv, Instant::now()));
+
+    daemon.register_service(service("echo", "new.local.", "127.0.0.1", "A"));
+    // Both multicast groups can deliver the previous response after the update.
+    receive(&mut daemon, index, vec![old_srv.clone()]);
+    receive(&mut daemon, index, vec![old_srv]);
+    finish(&mut daemon, index);
+    let registry = &daemon.dns_registry_map[&index];
+    assert_eq!(registry.resolve_name(&fullname), fullname);
+    assert!(registry.name_changes.is_empty());
+    assert_eq!(active_count(&daemon), 3);
+    assert!(registry.records_for_name("old.local.").is_empty());
+    let current_srv = registry
+        .records_for_name(&fullname)
+        .iter()
+        .find_map(|record| record.any().downcast_ref::<DnsSrv>())
+        .unwrap();
+    assert_eq!(current_srv.host(), "new.local.");
+    unregister(&mut daemon, &fullname);
+    assert_eq!(active_count(&daemon), 0);
+}
+
+#[test]
+fn recent_own_records_do_not_hide_a_different_srv_conflict() {
+    let (mut daemon, index) = daemon();
+    let published = service("genuine", "genuine.local.", "127.0.0.1", "A");
+    let fullname = published.get_fullname().to_string();
+    daemon.register_service(published);
+    finish(&mut daemon, index);
+    let foreign = DnsSrv::new(
+        &fullname,
+        CLASS_IN,
+        120,
+        0,
+        0,
+        9999,
+        "foreign.local.".to_string(),
+    )
+    .boxed();
+    assert!(!daemon.dns_registry_map[&index].was_recently_multicast(&foreign, Instant::now()));
+    receive(&mut daemon, index, vec![foreign]);
+    assert!(!daemon.dns_registry_map[&index].is_claimed(&fullname));
+    assert!(daemon.dns_registry_map[&index]
+        .probing
+        .contains_key(&registry_key(&fullname)));
+}
+
+#[test]
 fn unavailable_sockets_do_not_complete_a_probe() {
     let (mut daemon, index) = daemon();
     daemon.ipv4_sock = None;
@@ -633,5 +693,80 @@ fn failed_udp_sends_do_not_acknowledge_an_announcement() {
     assert_ne!(
         daemon.my_services[&fullname].get_status(index),
         ServiceStatus::Announced
+    );
+}
+
+#[test]
+fn a_failed_first_announcement_recovers_through_one_current_retry() {
+    let (mut daemon, index) = daemon();
+    let valid_port = daemon.port;
+    let published = service("recover", "recover.local.", "127.0.0.1", "A");
+    let fullname = registry_key(published.get_fullname());
+    daemon.register_service(published);
+    for _ in 0..3 {
+        for probe in daemon
+            .dns_registry_map
+            .get_mut(&index)
+            .unwrap()
+            .probing
+            .values_mut()
+        {
+            probe.next_send = Instant::now();
+        }
+        daemon.probing_handler();
+    }
+    assert!(daemon.dns_registry_map[&index]
+        .probing
+        .values()
+        .all(|probe| probe.probes_sent == 3));
+    daemon.port = 0;
+    finish(&mut daemon, index);
+    assert_eq!(
+        daemon.my_services[&fullname].get_status(index),
+        ServiceStatus::Probing
+    );
+    assert_eq!(registration_resends(&daemon, &fullname, index), 1);
+    daemon.port = valid_port;
+    expire_multicast_window(&mut daemon, index);
+    run_registration_resend(&mut daemon, &fullname, index);
+    assert_eq!(
+        daemon.my_services[&fullname].get_status(index),
+        ServiceStatus::Announced
+    );
+    assert_eq!(registration_resends(&daemon, &fullname, index), 1);
+    expire_multicast_window(&mut daemon, index);
+    run_registration_resend(&mut daemon, &fullname, index);
+    assert_eq!(registration_resends(&daemon, &fullname, index), 0);
+}
+
+#[test]
+fn unencodable_registration_does_not_create_name_claims() {
+    let (mut daemon, index) = daemon();
+    let (sender, events) = flume::unbounded();
+    daemon.monitors.push(sender);
+    let invalid_label = service(&"a".repeat(64), "valid.local.", "127.0.0.1", "A");
+    daemon.register_service(invalid_label);
+    let properties: Vec<_> = (0..60)
+        .map(|number| (format!("key{number}"), "x".repeat(200)))
+        .collect();
+    let oversized = ServiceInfo::new(
+        "_lifecycle._tcp.local.",
+        "large",
+        "valid.local.",
+        "127.0.0.1",
+        8080,
+        properties.as_slice(),
+    )
+    .unwrap();
+    daemon.register_service(oversized);
+    assert!(daemon.my_services.is_empty());
+    assert!(daemon.dns_registry_map[&index].active.is_empty());
+    assert!(daemon.dns_registry_map[&index].probing.is_empty());
+    assert_eq!(
+        events
+            .try_iter()
+            .filter(|event| matches!(event, DaemonEvent::Error(..)))
+            .count(),
+        2
     );
 }

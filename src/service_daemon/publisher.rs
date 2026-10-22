@@ -6,6 +6,10 @@ pub(super) type PublicationSnapshot = HashMap<u32, Vec<DnsRecordBox>>;
 
 impl Zeroconf {
     pub(super) fn replace_registration(&mut self, mut info: ServiceInfo) {
+        if let Err(error) = info.validate_records() {
+            self.notify_monitors(DaemonEvent::Error(error));
+            return;
+        }
         if let Err(error) = check_service_name_length(info.get_type(), self.service_name_len_max) {
             self.notify_monitors(DaemonEvent::Error(error));
             return;
@@ -139,10 +143,8 @@ impl Zeroconf {
     ) {
         let after = self.publication_snapshot();
         // A queued goodbye must never withdraw records reintroduced by a later registration.
-        self.retransmissions.retain(|rerun| match &rerun.command {
-            Command::UnregisterResend(..) => false,
-            _ => true,
-        });
+        self.retransmissions
+            .retain(|rerun| !matches!(&rerun.command, Command::UnregisterResend(..)));
         let indexes: HashSet<_> = before.keys().chain(after.keys()).copied().collect();
         for index in indexes {
             let previous = before.get(&index).map(Vec::as_slice).unwrap_or(&[]);

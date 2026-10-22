@@ -5,8 +5,8 @@ use crate::log::{debug, trace};
 use crate::{
     dns_name::{names_equal, CanonicalName, RrsetKey},
     dns_parser::{
-        ip_address_rr_type, DnsAddress, DnsIncoming, DnsOutgoing, DnsRecordBox, DnsRecordExt,
-        DnsSrv, DnsTxt, ScopedIp, CLASS_IN,
+        canonical_rdata, ip_address_rr_type, DnsAddress, DnsIncoming, DnsOutgoing, DnsRecordBox,
+        DnsRecordExt, DnsSrv, DnsTxt, ScopedIp, CLASS_IN,
     },
     Error, IfKind, InterfaceId, Result,
 };
@@ -251,6 +251,45 @@ impl ServiceInfo {
         };
 
         Ok(this)
+    }
+
+    pub(crate) fn validate_records(&self) -> Result<()> {
+        use crate::dns_parser::{DnsPointer, FLAGS_AA, FLAGS_QR_RESPONSE, MAX_PKT_DEFAULT};
+        let mut out = DnsOutgoing::new(FLAGS_QR_RESPONSE | FLAGS_AA);
+        out.add_answer_record(DnsSrv::new(
+            &self.fullname,
+            CLASS_IN,
+            self.host_ttl,
+            self.priority,
+            self.weight,
+            self.port,
+            self.server.clone(),
+        ));
+        out.add_answer_record(DnsTxt::new(
+            &self.fullname,
+            CLASS_IN,
+            self.other_ttl,
+            self.generate_txt(),
+        ));
+        out.add_answer_record(DnsPointer::new(
+            &self.ty_domain,
+            crate::RRType::PTR,
+            CLASS_IN,
+            self.other_ttl,
+            self.fullname.clone(),
+        ));
+        if let Some(subtype) = &self.sub_domain {
+            out.add_answer_record(DnsPointer::new(
+                subtype,
+                crate::RRType::PTR,
+                CLASS_IN,
+                self.other_ttl,
+                self.fullname.clone(),
+            ));
+        }
+        out.to_complete_data_on_wire(MAX_PKT_DEFAULT, false)
+            .ok_or_else(|| Error::Msg("Service records contain a DNS label over 63 bytes, a name over 255 wire bytes, or a record over the mDNS packet limit".to_string()))?;
+        Ok(())
     }
 
     /// Indicates that the library should automatically
@@ -837,7 +876,7 @@ impl fmt::Debug for TxtProperty {
         write!(
             f,
             "TxtProperty {{key: \"{}\", val: {}}}",
-            &self.key, &val_string,
+            self.key, val_string,
         )
     }
 }
@@ -1187,10 +1226,10 @@ pub(crate) struct DnsRegistry {
     /// carries both address families, but they are distinct multicast groups
     /// (`224.0.0.251` and `ff02::fb`) reaching potentially different listeners,
     /// so sending a record on one group must not throttle it on the other.
-    pub(crate) last_multicast_v4: HashMap<String, Instant>,
+    pub(crate) last_multicast_v4: HashMap<(RrsetKey, Vec<u8>), Instant>,
 
     /// Same as [`Self::last_multicast_v4`] but for this interface's IPv6 group.
-    pub(crate) last_multicast_v6: HashMap<String, Instant>,
+    pub(crate) last_multicast_v6: HashMap<(RrsetKey, Vec<u8>), Instant>,
 }
 
 #[derive(Default)]
@@ -1237,6 +1276,23 @@ impl DnsRegistry {
         }
     }
 
+    pub(crate) fn prune_multicast_history(&mut self, now: Instant) {
+        let recent = |_: &(RrsetKey, Vec<u8>), sent: &mut Instant| {
+            now.saturating_duration_since(*sent)
+                < Duration::from_millis(MULTICAST_RATE_LIMIT_MILLIS)
+        };
+        self.last_multicast_v4.retain(recent);
+        self.last_multicast_v6.retain(recent);
+    }
+
+    pub(crate) fn next_multicast_expiry(&self) -> Option<Instant> {
+        self.last_multicast_v4
+            .values()
+            .chain(self.last_multicast_v6.values())
+            .min()
+            .map(|sent| *sent + Duration::from_millis(MULTICAST_RATE_LIMIT_MILLIS))
+    }
+
     /// Enforces the RFC 6762 section 6 multicast rate limit on `out`.
     ///
     /// A responder MUST NOT multicast a record on a given interface until at
@@ -1258,18 +1314,12 @@ impl DnsRegistry {
         now: Instant,
         is_ipv4: bool,
     ) {
+        self.prune_multicast_history(now);
         let last_multicast = if is_ipv4 {
             &mut self.last_multicast_v4
         } else {
             &mut self.last_multicast_v6
         };
-
-        // Prune stale entries so the map stays bounded across name changes;
-        // any record older than the one-second window is irrelevant now.
-        last_multicast.retain(|_, last| {
-            now.saturating_duration_since(*last)
-                < Duration::from_millis(MULTICAST_RATE_LIMIT_MILLIS)
-        });
 
         let was_multicast =
             |record: &DnsRecordBox| last_multicast.contains_key(&rate_limit_key(record));
@@ -1295,6 +1345,19 @@ impl DnsRegistry {
         }
     }
 
+    /// Recognizes recent looped-back records after their published data changes.
+    /// The timestamps expire with the multicast window; they do not own records.
+    pub(crate) fn was_recently_multicast(&self, record: &DnsRecordBox, now: Instant) -> bool {
+        let key = rate_limit_key(record);
+        [&self.last_multicast_v4, &self.last_multicast_v6]
+            .iter()
+            .filter_map(|sent| sent.get(&key))
+            .any(|sent| {
+                now.saturating_duration_since(*sent)
+                    < Duration::from_millis(MULTICAST_RATE_LIMIT_MILLIS)
+            })
+    }
+
     /// Returns the effective name on this interface.
     pub(crate) fn resolve_name<'a>(&'a self, name: &'a str) -> &'a str {
         match self.name_changes.get(&registry_key(name)) {
@@ -1311,6 +1374,7 @@ impl DnsRegistry {
         intf: &MyIntf,
         now: Instant,
     ) {
+        self.prune_multicast_history(now);
         let originals: HashSet<_> = services
             .iter()
             .flat_map(|service| [service.get_fullname(), service.get_hostname()])
@@ -1447,15 +1511,13 @@ impl DnsRegistry {
 pub(crate) const MULTICAST_RATE_LIMIT_MILLIS: u64 = 1000;
 
 /// Builds the identity key for a record used by the RFC 6762 section 6
-/// multicast rate limit: name (case-insensitive) + type + rdata. TTL and the
+/// multicast rate limit: name (case-insensitive) + type + class + rdata. TTL and the
 /// cache-flush bit are intentionally excluded, so the same logical record maps
 /// to a single key regardless of the TTL it is sent with.
-fn rate_limit_key(record: &DnsRecordBox) -> String {
-    format!(
-        "{}-{}-{}",
-        registry_key(record.get_name()),
-        record.get_type(),
-        record.rdata_print(),
+fn rate_limit_key(record: &DnsRecordBox) -> (RrsetKey, Vec<u8>) {
+    (
+        RrsetKey::new(record.as_ref()),
+        canonical_rdata(record.as_ref()),
     )
 }
 
@@ -1612,12 +1674,12 @@ impl ResolvedService {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_txt, encode_txt, u8_slice_to_hex, DnsRegistry, Instant, MyIntf, ServiceInfo,
-        ServiceStatus, TxtProperty,
+        decode_txt, encode_txt, rate_limit_key, u8_slice_to_hex, DnsRegistry, Instant, MyIntf,
+        ServiceInfo, ServiceStatus, TxtProperty,
     };
     use crate::dns_parser::{
-        DnsAddress, DnsOutgoing, DnsPointer, DnsSrv, DnsTxt, RRType, CLASS_CACHE_FLUSH, CLASS_IN,
-        FLAGS_QR_RESPONSE,
+        DnsAddress, DnsOutgoing, DnsPointer, DnsRecordExt, DnsSrv, DnsTxt, RRType,
+        CLASS_CACHE_FLUSH, CLASS_IN, FLAGS_QR_RESPONSE,
     };
     use crate::{IfKind, IfPredicate};
     use if_addrs::{IfAddr, IfOperStatus, Ifv4Addr, Ifv6Addr, Interface};
@@ -1815,6 +1877,87 @@ mod tests {
         service.set_status(1, ServiceStatus::Announced);
         service.remove_status(1);
         assert_eq!(service.get_status(1), ServiceStatus::Unknown);
+    }
+
+    #[test]
+    fn multicast_identity_keeps_binary_txt_bytes_distinct() {
+        let first = DnsTxt::new("binary.local.", CLASS_IN, 120, vec![1, 0xfe]).boxed();
+        let second = DnsTxt::new("binary.local.", CLASS_IN, 120, vec![1, 0xff]).boxed();
+        assert_eq!(first.rdata_print(), second.rdata_print());
+        assert_ne!(rate_limit_key(&first), rate_limit_key(&second));
+        let mut registry = DnsRegistry::new();
+        let now = Instant::now();
+        let mut outgoing = DnsOutgoing::new(FLAGS_QR_RESPONSE);
+        outgoing.add_answer_box(first.clone());
+        registry.apply_multicast_rate_limit(&mut outgoing, now, true);
+        assert!(registry.was_recently_multicast(&first, now));
+        assert!(!registry.was_recently_multicast(&second, now));
+    }
+
+    #[test]
+    fn multicast_identity_canonicalizes_names_inside_srv_and_ptr_data() {
+        let first = DnsSrv::new(
+            "Instance.local.",
+            CLASS_IN,
+            120,
+            0,
+            0,
+            8080,
+            "Host.local.".to_string(),
+        )
+        .boxed();
+        let second = DnsSrv::new(
+            "instance.local.",
+            CLASS_IN | CLASS_CACHE_FLUSH,
+            30,
+            0,
+            0,
+            8080,
+            "host.local".to_string(),
+        )
+        .boxed();
+        assert_eq!(rate_limit_key(&first), rate_limit_key(&second));
+        let first = DnsPointer::new(
+            "_demo._tcp.local.",
+            RRType::PTR,
+            CLASS_IN,
+            120,
+            "Instance.local.".to_string(),
+        )
+        .boxed();
+        let second = DnsPointer::new(
+            "_DEMO._tcp.local.",
+            RRType::PTR,
+            CLASS_IN,
+            30,
+            "instance.local".to_string(),
+        )
+        .boxed();
+        assert_eq!(rate_limit_key(&first), rate_limit_key(&second));
+    }
+
+    #[test]
+    fn idle_multicast_history_has_a_deadline_and_expires_without_new_records() {
+        let mut registry = DnsRegistry::new();
+        let now = Instant::now();
+        for is_ipv4 in [true, false] {
+            let mut outgoing = DnsOutgoing::new(FLAGS_QR_RESPONSE);
+            outgoing.add_answer_record(DnsTxt::new(
+                "idle.local.",
+                CLASS_IN,
+                120,
+                b"\x03x=y".to_vec(),
+            ));
+            registry.apply_multicast_rate_limit(&mut outgoing, now, is_ipv4);
+        }
+        assert_eq!(
+            registry.next_multicast_expiry(),
+            Some(now + Duration::from_secs(1))
+        );
+        registry.reconcile_services(&[], &registry_interface(), now + Duration::from_secs(1));
+        assert!(registry.last_multicast_v4.is_empty());
+        assert!(registry.last_multicast_v6.is_empty());
+        assert_eq!(registry.next_multicast_expiry(), None);
     }
 
     /// RFC 6762 section 6: the same record must not be multicast on an

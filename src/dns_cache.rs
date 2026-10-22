@@ -304,7 +304,7 @@ impl DnsCache {
                         .record
                         .any()
                         .downcast_ref::<DnsSrv>()
-                        .map_or(false, |srv| CanonicalName::new(srv.host()) == host)
+                        .is_some_and(|srv| CanonicalName::new(srv.host()) == host)
                 })
             })
             .map(|((_, key), _)| key.name.as_str().to_string())
@@ -476,7 +476,7 @@ impl DnsCache {
                         .record
                         .any()
                         .downcast_ref::<DnsPointer>()
-                        .map_or(false, |ptr| CanonicalName::new(ptr.alias()) == name)
+                        .is_some_and(|ptr| CanonicalName::new(ptr.alias()) == name)
             })
     }
 
@@ -490,7 +490,7 @@ impl DnsCache {
                         .record
                         .any()
                         .downcast_ref::<DnsPointer>()
-                        .map_or(false, |ptr| {
+                        .is_some_and(|ptr| {
                             CanonicalName::new(ptr.alias()) == CanonicalName::new(instance)
                         })
                     && self
@@ -635,7 +635,9 @@ impl DnsCache {
 
     fn refresh_type(&mut self, name: &str, ty: RRType, index: Option<u32>, now: Instant) -> bool {
         let name = CanonicalName::new(name);
-        self.records
+        let mut due = false;
+        for record in self
+            .records
             .iter_mut()
             .filter(|((scope, key), _)| {
                 key.name == name
@@ -644,9 +646,10 @@ impl DnsCache {
                     && index.map_or(true, |index| *scope == index)
             })
             .flat_map(|(_, records)| records)
-            .fold(false, |due, record| {
-                record.record.updated_refresh_time(now).is_some() || due
-            })
+        {
+            due |= record.record.updated_refresh_time(now).is_some();
+        }
+        due
     }
 
     pub(crate) fn refresh_due_ptr(&mut self, ty: &str) -> bool {
