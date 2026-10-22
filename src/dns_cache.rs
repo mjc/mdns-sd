@@ -109,6 +109,23 @@ impl DnsCache {
         }
     }
 
+    fn retain_records(&mut self, mut retain: impl FnMut(&(u32, RrsetKey), &DnsRecordIntf) -> bool) {
+        let record_count = &mut self.record_count;
+        let charged_bytes = &mut self.charged_bytes;
+        self.records.retain(|key, records| {
+            records.retain(|record| {
+                let keep = retain(key, record);
+                if !keep {
+                    *record_count -= 1;
+                    *charged_bytes -= record.charge;
+                }
+                keep
+            });
+            !records.is_empty()
+        });
+        self.compact();
+    }
+
     fn evict_oldest(&mut self) -> bool {
         let now = Instant::now();
         let oldest = self
@@ -474,26 +491,11 @@ impl DnsCache {
     pub(crate) fn remove_on_intf(&mut self, record: &DnsRecordBox, index: u32) -> bool {
         let key = (index, RrsetKey::new(record.as_ref()));
         let mut removed = false;
-        let mut removed_count = 0;
-        let mut removed_bytes = 0;
-        self.records.retain(|candidate, records| {
-            if *candidate == key {
-                records.retain(|existing| {
-                    if existing.record.matches(record.as_ref()) {
-                        removed = true;
-                        removed_count += 1;
-                        removed_bytes += existing.charge;
-                        false
-                    } else {
-                        true
-                    }
-                });
-            }
-            !records.is_empty()
+        self.retain_records(|candidate, existing| {
+            let matches = *candidate == key && existing.record.matches(record.as_ref());
+            removed |= matches;
+            !matches
         });
-        self.record_count -= removed_count;
-        self.charged_bytes -= removed_bytes;
-        self.compact();
         removed
     }
 
@@ -523,29 +525,19 @@ impl DnsCache {
     pub(crate) fn evict_expired(&mut self, now: Instant) -> CacheEviction {
         let mut changed = false;
         let mut expired_addrs: HashMap<String, HashSet<ScopedIp>> = HashMap::new();
-        let mut removed_count = 0;
-        let mut removed_bytes = 0;
-        self.records.retain(|_, records| {
-            records.retain(|record| {
-                if !record.record.get_record().is_expired(now) {
-                    return true;
-                }
-                changed = true;
-                removed_count += 1;
-                removed_bytes += record.charge;
-                if let Some(addr) = record.record.any().downcast_ref::<DnsAddress>() {
-                    expired_addrs
-                        .entry(record.record.get_name().to_string())
-                        .or_default()
-                        .insert(addr.address());
-                }
-                false
-            });
-            !records.is_empty()
+        self.retain_records(|_, record| {
+            if !record.record.get_record().is_expired(now) {
+                return true;
+            }
+            changed = true;
+            if let Some(addr) = record.record.any().downcast_ref::<DnsAddress>() {
+                expired_addrs
+                    .entry(record.record.get_name().to_string())
+                    .or_default()
+                    .insert(addr.address());
+            }
+            false
         });
-        self.record_count -= removed_count;
-        self.charged_bytes -= removed_bytes;
-        self.compact();
         CacheEviction {
             changed,
             expired_addrs,
@@ -741,21 +733,11 @@ impl DnsCache {
     }
 
     pub(crate) fn remove_addrs_on_disabled_intf(&mut self, index: u32, ip_type: IpType) {
-        let mut removed_count = 0;
-        let mut removed_bytes = 0;
-        self.records.retain(|(scope, key), records| {
-            let remove = *scope == index
+        self.retain_records(|(scope, key), _| {
+            !(*scope == index
                 && ((key.rr_type == RRType::A && ip_type.contains(IpType::V4))
-                    || (key.rr_type == RRType::AAAA && ip_type.contains(IpType::V6)));
-            if remove {
-                removed_count += records.len();
-                removed_bytes += records.iter().map(|record| record.charge).sum::<usize>();
-            }
-            !remove
+                    || (key.rr_type == RRType::AAAA && ip_type.contains(IpType::V6))))
         });
-        self.record_count -= removed_count;
-        self.charged_bytes -= removed_bytes;
-        self.compact();
     }
 
     /// Removes a link's records and returns instances that may need re-resolution.
@@ -764,20 +746,14 @@ impl DnsCache {
         let mut ptrs = Vec::new();
         let mut modified_instances = HashSet::new();
         let mut hosts = HashSet::new();
-        let mut removed_count = 0;
-        let mut removed_bytes = 0;
-        self.records.retain(|(scope, key), records| {
+        self.retain_records(|(scope, key), record| {
             if *scope != intf.index {
                 return true;
             }
-            removed_count += records.len();
-            removed_bytes += records.iter().map(|record| record.charge).sum::<usize>();
             match key.rr_type {
                 RRType::PTR => {
-                    for ptr in records {
-                        if let Some(ptr) = ptr.record.any().downcast_ref::<DnsPointer>() {
-                            ptrs.push((key.name.as_str().to_string(), ptr.alias().to_string()));
-                        }
+                    if let Some(ptr) = record.record.any().downcast_ref::<DnsPointer>() {
+                        ptrs.push((key.name.as_str().to_string(), ptr.alias().to_string()));
                     }
                 }
                 RRType::SRV | RRType::TXT => {
@@ -790,8 +766,6 @@ impl DnsCache {
             }
             false
         });
-        self.record_count -= removed_count;
-        self.charged_bytes -= removed_bytes;
         for host in hosts {
             modified_instances.extend(self.get_instances_on_host(host.as_str()));
         }
@@ -801,7 +775,6 @@ impl DnsCache {
                 modified_instances.insert(instance);
             }
         }
-        self.compact();
         modified_instances
     }
 }
