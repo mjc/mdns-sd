@@ -171,6 +171,7 @@ fn integration_success() {
             break;
         }
     }
+
     assert_eq!(remove_count, 1);
     assert!(
         !resolved_after_removal,

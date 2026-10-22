@@ -52,11 +52,11 @@ pub(crate) struct DnsRecordIntf {
 
 /// Received RRsets share one expiry path across record types and interfaces.
 pub(crate) struct DnsCache {
-    /// DnsPointer records indexed by ty_domain.
+    /// DnsPointer records indexed by ty_domain
     ptr: HashMap<String, Vec<DnsRecordIntf>>,
-    /// DnsSrv records indexed by the fullname of an instance.
+    /// DnsSrv records indexed by the fullname of an instance
     srv: HashMap<String, Vec<DnsRecordIntf>>,
-    /// DnsTxt records indexed by the fullname of an instance.
+    /// DnsTxt records indexed by the fullname of an instance
     txt: HashMap<String, Vec<DnsRecordIntf>>,
     /// Address records indexed by canonical hostname.
     addr: HashMap<String, Vec<DnsRecordIntf>>,
@@ -277,15 +277,19 @@ impl DnsCache {
     pub(crate) fn ptr_count(&self) -> usize {
         self.ptr.values().map(|v| v.len()).sum()
     }
+
     pub(crate) fn srv_count(&self) -> usize {
         self.srv.values().map(|v| v.len()).sum()
     }
+
     pub(crate) fn txt_count(&self) -> usize {
         self.txt.values().map(|v| v.len()).sum()
     }
+
     pub(crate) fn addr_count(&self) -> usize {
         self.addr.values().map(|v| v.len()).sum()
     }
+
     pub(crate) fn nsec_count(&self) -> usize {
         self.nsec.values().map(|v| v.len()).sum()
     }
