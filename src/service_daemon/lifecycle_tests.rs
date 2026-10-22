@@ -614,6 +614,138 @@ fn a_looped_back_old_srv_does_not_conflict_with_the_updated_registration() {
     assert_eq!(active_count(&daemon), 0);
 }
 
+fn published_srv_host(daemon: &Zeroconf, index: u32, fullname: &str) -> String {
+    daemon.dns_registry_map[&index]
+        .records_for_name(fullname)
+        .iter()
+        .find_map(|record| record.any().downcast_ref::<DnsSrv>())
+        .unwrap()
+        .host()
+        .to_string()
+}
+
+#[test]
+fn hostname_updates_keep_the_old_publication_until_the_new_host_is_claimed() {
+    let (mut daemon, index) = daemon();
+    let original = service("staged", "old.local.", "127.0.0.1", "A");
+    let fullname = registry_key(original.get_fullname());
+    daemon.register_service(original);
+    finish(&mut daemon, index);
+    let before = daemon.publication_snapshot();
+    daemon.register_service(service("staged", "new.local.", "127.0.0.1", "B"));
+    assert_eq!(daemon.my_services[&fullname].get_hostname(), "old.local.");
+    assert_eq!(
+        daemon.my_services[&fullname].get_status(index),
+        ServiceStatus::Announced
+    );
+    assert_eq!(published_srv_host(&daemon, index, &fullname), "old.local.");
+    assert_eq!(daemon.pending_registrations.len(), 1);
+    assert_eq!(
+        before[&index].len(),
+        daemon.publication_snapshot()[&index].len()
+    );
+    assert!(!daemon
+        .retransmissions
+        .iter()
+        .any(|rerun| matches!(rerun.command, Command::UnregisterResend(..))));
+    finish(&mut daemon, index);
+    assert!(daemon.pending_registrations.is_empty());
+    assert_eq!(daemon.my_services[&fullname].get_hostname(), "new.local.");
+    assert_eq!(published_srv_host(&daemon, index, &fullname), "new.local.");
+    assert_eq!(active_count(&daemon), 3);
+    for rerun in &daemon.retransmissions {
+        if let Command::UnregisterResend(packet, _, _) = &rerun.command {
+            let message =
+                DnsIncoming::new(packet.clone(), (&daemon.my_intfs[&index]).into()).unwrap();
+            assert!(!message.all_records().any(|record| matches!(
+                record.get_type(),
+                RRType::PTR | RRType::SRV | RRType::TXT
+            )));
+        }
+    }
+}
+
+#[test]
+fn rapid_pending_hostname_changes_keep_only_the_latest_request() {
+    let (mut daemon, index) = daemon();
+    let original = service("latest-host", "a.local.", "127.0.0.1", "A");
+    let fullname = registry_key(original.get_fullname());
+    daemon.register_service(original);
+    finish(&mut daemon, index);
+    for hostname in ["b.local.", "c.local."] {
+        daemon.register_service(service("latest-host", hostname, "127.0.0.1", "B"));
+        assert_eq!(daemon.pending_registrations.len(), 1);
+        assert_eq!(
+            daemon.pending_registrations[&fullname].get_hostname(),
+            hostname
+        );
+        assert_eq!(published_srv_host(&daemon, index, &fullname), "a.local.");
+        assert_eq!(daemon.dns_registry_map[&index].probing.len(), 1);
+    }
+    daemon.register_service(service("latest-host", "a.local.", "127.0.0.1", "C"));
+    assert!(daemon.pending_registrations.is_empty());
+    assert!(daemon.dns_registry_map[&index].probing.is_empty());
+    assert_eq!(active_count(&daemon), 3);
+    daemon.register_service(service("latest-host", "d.local.", "127.0.0.1", "D"));
+    unregister(&mut daemon, &fullname);
+    assert!(daemon.pending_registrations.is_empty());
+    assert!(daemon.dns_registry_map[&index].probing.is_empty());
+    assert_eq!(active_count(&daemon), 0);
+    daemon.probing_handler();
+    assert!(daemon.my_services.is_empty());
+}
+
+#[test]
+fn conflicts_on_a_pending_hostname_keep_the_current_service_announced() {
+    let (mut daemon, index) = daemon();
+    let original = service("pending-conflict", "old.local.", "127.0.0.1", "A");
+    let fullname = registry_key(original.get_fullname());
+    daemon.register_service(original);
+    finish(&mut daemon, index);
+    daemon.register_service(service("pending-conflict", "new.local.", "127.0.0.1", "B"));
+    for probe in daemon
+        .dns_registry_map
+        .get_mut(&index)
+        .unwrap()
+        .probing
+        .values_mut()
+    {
+        probe.next_send = Instant::now();
+    }
+    daemon.probing_handler();
+    let intf = InterfaceId::from(&daemon.my_intfs[&index]);
+    receive(
+        &mut daemon,
+        index,
+        vec![DnsAddress::new(
+            "new.local.",
+            RRType::A,
+            CLASS_IN,
+            120,
+            Ipv4Addr::new(127, 0, 0, 99).into(),
+            intf,
+        )
+        .boxed()],
+    );
+    assert_eq!(
+        daemon.my_services[&fullname].get_status(index),
+        ServiceStatus::Announced
+    );
+    assert_eq!(published_srv_host(&daemon, index, &fullname), "old.local.");
+    assert_eq!(
+        daemon.dns_registry_map[&index].resolve_name("new.local."),
+        "new-2.local."
+    );
+    finish(&mut daemon, index);
+    assert_eq!(
+        published_srv_host(&daemon, index, &fullname),
+        "new-2.local."
+    );
+    assert_eq!(active_count(&daemon), 3);
+    unregister(&mut daemon, &fullname);
+    assert!(daemon.dns_registry_map[&index].name_changes.is_empty());
+}
+
 #[test]
 fn recent_own_records_do_not_hide_a_different_srv_conflict() {
     let (mut daemon, index) = daemon();
@@ -776,4 +908,36 @@ fn unencodable_registration_does_not_create_name_claims() {
             .count(),
         2
     );
+}
+
+#[test]
+fn hostname_update_keeps_the_current_publication_while_probing() {
+    let (mut daemon, index) = daemon();
+    let original = service("transition", "old.local.", "127.0.0.1", "A");
+    let fullname = registry_key(original.get_fullname());
+    daemon.register_service(original);
+    finish(&mut daemon, index);
+    daemon.register_service(service("transition", "new.local.", "127.0.0.1", "B"));
+    assert_eq!(daemon.my_services[&fullname].get_hostname(), "old.local.");
+    assert_eq!(
+        daemon.my_services[&fullname].get_status(index),
+        ServiceStatus::Announced
+    );
+    let srv = daemon.dns_registry_map[&index]
+        .records_for_name(&fullname)
+        .iter()
+        .find_map(|record| record.any().downcast_ref::<DnsSrv>())
+        .unwrap();
+    assert_eq!(srv.host(), "old.local.");
+    finish(&mut daemon, index);
+    assert_eq!(daemon.my_services[&fullname].get_hostname(), "new.local.");
+    let srv = daemon.dns_registry_map[&index]
+        .records_for_name(&fullname)
+        .iter()
+        .find_map(|record| record.any().downcast_ref::<DnsSrv>())
+        .unwrap();
+    assert_eq!(srv.host(), "new.local.");
+    assert_eq!(active_count(&daemon), 3);
+    unregister(&mut daemon, &fullname);
+    assert_eq!(active_count(&daemon), 0);
 }

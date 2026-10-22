@@ -24,8 +24,25 @@ impl Zeroconf {
             for index in self.my_intfs.keys() {
                 info.set_status(*index, previous.get_status(*index));
             }
+            let changes_host = !names_equal(previous.get_hostname(), info.get_hostname());
+            let waits_for_host = changes_host
+                && info.requires_probe()
+                && self.my_intfs.iter().any(|(index, intf)| {
+                    let eligible = !info.get_addrs_on_my_intf_v4(intf).is_empty()
+                        || !info.get_addrs_on_my_intf_v6(intf).is_empty();
+                    eligible
+                        && !self.dns_registry_map.get(index).is_some_and(|registry| {
+                            registry.is_claimed(registry.resolve_name(info.get_hostname()))
+                        })
+                });
+            if waits_for_host {
+                self.pending_registrations.insert(fullname, info);
+                self.reconcile_registries();
+                return;
+            }
         }
         let before = self.publication_snapshot();
+        self.pending_registrations.remove(&fullname);
         self.my_services.insert(fullname, info);
         self.reconcile_registries();
         self.finish_publication_change(before, true);
@@ -41,6 +58,7 @@ impl Zeroconf {
             return UnregisterStatus::NotFound;
         }
         let before = self.publication_snapshot();
+        self.pending_registrations.remove(&fullname);
         self.my_services.remove(&fullname);
         self.cancel_registration_resends(&fullname);
         self.reconcile_registries();
@@ -51,7 +69,14 @@ impl Zeroconf {
 
     pub(super) fn reconcile_registries(&mut self) {
         let indexes: HashSet<_> = self.my_intfs.keys().copied().collect();
-        for service in self.my_services.values_mut() {
+        let published = &self.my_services;
+        self.pending_registrations
+            .retain(|name, _| published.contains_key(name));
+        for service in self
+            .my_services
+            .values_mut()
+            .chain(self.pending_registrations.values_mut())
+        {
             service.retain_statuses(&indexes);
         }
         let services = &self.my_services;
@@ -67,12 +92,13 @@ impl Zeroconf {
         self.dns_registry_map
             .retain(|index, _| indexes.contains(index));
         let services: Vec<_> = self.my_services.values().collect();
+        let pending_hosts: Vec<_> = self.pending_registrations.values().collect();
         let now = Instant::now();
         for (index, intf) in &self.my_intfs {
             self.dns_registry_map
                 .entry(*index)
                 .or_insert_with(DnsRegistry::new)
-                .reconcile_services(&services, intf, now);
+                .reconcile_publication(&services, &pending_hosts, intf, now);
         }
         for service in self.my_services.values_mut() {
             for (index, registry) in &self.dns_registry_map {
@@ -85,6 +111,40 @@ impl Zeroconf {
         }
     }
 
+    pub(super) fn commit_ready_registrations(&mut self) {
+        let ready: Vec<_> = self
+            .pending_registrations
+            .iter()
+            .filter(|(_, service)| {
+                self.my_intfs.iter().all(|(index, intf)| {
+                    let eligible = !service.get_addrs_on_my_intf_v4(intf).is_empty()
+                        || !service.get_addrs_on_my_intf_v6(intf).is_empty();
+                    !eligible
+                        || self.dns_registry_map.get(index).is_some_and(|registry| {
+                            registry.is_claimed(registry.resolve_name(service.get_hostname()))
+                        })
+                })
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        if ready.is_empty() {
+            return;
+        }
+        let before = self.publication_snapshot();
+        for name in ready {
+            if let Some(mut service) = self.pending_registrations.remove(&name) {
+                if let Some(previous) = self.my_services.get(&name) {
+                    for index in self.my_intfs.keys() {
+                        service.set_status(*index, previous.get_status(*index));
+                    }
+                }
+                self.my_services.insert(name, service);
+            }
+        }
+        self.reconcile_registries();
+        self.finish_publication_change(before, true);
+    }
+
     pub(super) fn publication_snapshot(&self) -> PublicationSnapshot {
         let mut snapshot = HashMap::new();
         for (index, registry) in &self.dns_registry_map {
@@ -92,14 +152,12 @@ impl Zeroconf {
                 continue;
             }
             let mut records = Vec::new();
-            for record in registry.unique_records() {
-                if record.get_type() == RRType::A || record.get_type() == RRType::AAAA {
-                    push_record(&mut records, record.clone());
-                }
-            }
             for service in self.my_services.values() {
                 let fullname = registry.resolve_name(service.get_fullname());
                 let hostname = registry.resolve_name(service.get_hostname());
+                for record in registry.records_for_name(hostname) {
+                    push_record(&mut records, record.clone());
+                }
                 if !registry.is_claimed(fullname) || !registry.is_claimed(hostname) {
                     continue;
                 }

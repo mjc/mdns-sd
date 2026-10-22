@@ -1368,9 +1368,20 @@ impl DnsRegistry {
 
     /// Projects current registrations onto this interface and reconciles name claims.
     /// Established names keep their ownership when data changes (RFC 6762 section 8.4).
+    #[cfg(test)]
     pub(crate) fn reconcile_services(
         &mut self,
         services: &[&ServiceInfo],
+        intf: &MyIntf,
+        now: Instant,
+    ) {
+        self.reconcile_publication(services, &[], intf, now);
+    }
+
+    pub(crate) fn reconcile_publication(
+        &mut self,
+        services: &[&ServiceInfo],
+        pending_hosts: &[&ServiceInfo],
         intf: &MyIntf,
         now: Instant,
     ) {
@@ -1378,12 +1389,17 @@ impl DnsRegistry {
         let originals: HashSet<_> = services
             .iter()
             .flat_map(|service| [service.get_fullname(), service.get_hostname()])
+            .chain(pending_hosts.iter().map(|service| service.get_hostname()))
             .map(registry_key)
             .collect();
         self.name_changes.retain(|name, _| originals.contains(name));
 
         let mut proposals: HashMap<String, NameProposal> = HashMap::new();
-        for service in services {
+        for (service, publish_instance) in services
+            .iter()
+            .map(|service| (*service, true))
+            .chain(pending_hosts.iter().map(|service| (*service, false)))
+        {
             let addresses: Vec<_> = service
                 .get_addrs_on_my_intf_v4(intf)
                 .into_iter()
@@ -1394,28 +1410,30 @@ impl DnsRegistry {
             }
             let fullname = self.resolve_name(service.get_fullname());
             let hostname = self.resolve_name(service.get_hostname());
-            let mut srv = DnsSrv::new(
-                service.get_fullname(),
-                CLASS_IN,
-                service.get_host_ttl(),
-                service.get_priority(),
-                service.get_weight(),
-                service.get_port(),
-                hostname.to_string(),
-            );
-            let mut txt = DnsTxt::new(
-                service.get_fullname(),
-                CLASS_IN,
-                service.get_other_ttl(),
-                service.generate_txt(),
-            );
-            if fullname != service.get_fullname() {
-                srv.get_record_mut().set_new_name(fullname.to_string());
-                txt.get_record_mut().set_new_name(fullname.to_string());
+            if publish_instance {
+                let mut srv = DnsSrv::new(
+                    service.get_fullname(),
+                    CLASS_IN,
+                    service.get_host_ttl(),
+                    service.get_priority(),
+                    service.get_weight(),
+                    service.get_port(),
+                    hostname.to_string(),
+                );
+                let mut txt = DnsTxt::new(
+                    service.get_fullname(),
+                    CLASS_IN,
+                    service.get_other_ttl(),
+                    service.generate_txt(),
+                );
+                if fullname != service.get_fullname() {
+                    srv.get_record_mut().set_new_name(fullname.to_string());
+                    txt.get_record_mut().set_new_name(fullname.to_string());
+                }
+                let instance = proposals.entry(registry_key(fullname)).or_default();
+                instance.add(srv.boxed(), service);
+                instance.add(txt.boxed(), service);
             }
-            let instance = proposals.entry(registry_key(fullname)).or_default();
-            instance.add(srv.boxed(), service);
-            instance.add(txt.boxed(), service);
 
             let host = proposals.entry(registry_key(hostname)).or_default();
             for address in addresses {
@@ -1482,6 +1500,7 @@ impl DnsRegistry {
             .unwrap_or(&[])
     }
 
+    #[cfg(test)]
     pub(crate) fn unique_records(&self) -> impl Iterator<Item = &DnsRecordBox> {
         self.active.values().flatten()
     }

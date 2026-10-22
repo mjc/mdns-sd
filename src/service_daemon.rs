@@ -1246,6 +1246,9 @@ struct Zeroconf {
 
     /// Local registered services， keyed by service full names.
     my_services: HashMap<String, ServiceInfo>,
+    /// Latest hostname update per registration, awaiting ownership of its new target.
+    /// The current publication remains answerable until that target is ready.
+    pending_registrations: HashMap<String, ServiceInfo>,
 
     /// Received DNS records.
     cache: DnsCache,
@@ -1505,6 +1508,7 @@ impl Zeroconf {
             ipv4_sock,
             ipv6_sock,
             my_services: HashMap::new(),
+            pending_registrations: HashMap::new(),
             cache: DnsCache::new(),
             dns_registry_map,
             hostname_resolvers: HashMap::new(),
@@ -2163,7 +2167,11 @@ impl Zeroconf {
 
     /// Remove `addr` in my services that enabled `addr_auto`.
     fn del_addr_in_my_services(&mut self, addr: &IpAddr) {
-        for service_info in self.my_services.values_mut() {
+        for service_info in self
+            .my_services
+            .values_mut()
+            .chain(self.pending_registrations.values_mut())
+        {
             if service_info.is_addr_auto() {
                 service_info.remove_ipaddr(addr);
             }
@@ -2497,7 +2505,11 @@ impl Zeroconf {
                     name: intf.name.clone(),
                     index: if_index,
                 });
-                for service in self.my_services.values_mut() {
+                for service in self
+                    .my_services
+                    .values_mut()
+                    .chain(self.pending_registrations.values_mut())
+                {
                     service.remove_status(if_index);
                 }
                 self.delayed_responses
@@ -2572,7 +2584,11 @@ impl Zeroconf {
             current.max_packet_size_v6 =
                 resolve_max_packet_size(&self.max_packet_sizes, interfaces, index, false);
         }
-        for service in self.my_services.values_mut() {
+        for service in self
+            .my_services
+            .values_mut()
+            .chain(self.pending_registrations.values_mut())
+        {
             if service.is_addr_auto() {
                 service.insert_ipaddr(intf);
             }
@@ -2733,6 +2749,7 @@ impl Zeroconf {
         if !invalid_intf_addrs.is_empty() {
             let _ = self.send_cmd_to_self(Command::InvalidIntfAddrs(invalid_intf_addrs));
         }
+        self.commit_ready_registrations();
     }
 
     /// Binds a channel `listener` to querying mDNS hostnames.
@@ -3551,10 +3568,14 @@ impl Zeroconf {
                     .iter()
                     .any(|record| record.rrdata_match(incoming.as_ref()))
             {
-                let hostname = self.my_services.values().any(|service| {
-                    CanonicalName::new(registry.resolve_name(service.get_hostname())).as_str()
-                        == key
-                });
+                let hostname = self
+                    .my_services
+                    .values()
+                    .chain(self.pending_registrations.values())
+                    .any(|service| {
+                        CanonicalName::new(registry.resolve_name(service.get_hostname())).as_str()
+                            == key
+                    });
                 conflicts.insert(key, hostname);
             }
         }
@@ -3591,6 +3612,7 @@ impl Zeroconf {
                 let originals: Vec<_> = self
                     .my_services
                     .values()
+                    .chain(self.pending_registrations.values())
                     .flat_map(|service| [service.get_fullname(), service.get_hostname()])
                     .filter(|original| {
                         CanonicalName::new(registry.resolve_name(original)).as_str() == name
@@ -3609,12 +3631,13 @@ impl Zeroconf {
             }
         }
         let services: Vec<_> = self.my_services.values().collect();
+        let pending_hosts: Vec<_> = self.pending_registrations.values().collect();
         let start = if self.conflicts.len() == 15 {
             now + Duration::from_secs(5)
         } else {
             now
         };
-        registry.reconcile_services(&services, intf, start);
+        registry.reconcile_publication(&services, &pending_hosts, intf, start);
     }
 
     /// Resolve the updated (including new) instances.
