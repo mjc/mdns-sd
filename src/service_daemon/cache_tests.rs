@@ -821,3 +821,205 @@ fn cached_type_enumeration_replays_found_without_instance_resolution() {
     assert!(daemon.pending_resolves.is_empty());
     assert!(daemon.retransmissions.is_empty());
 }
+
+#[test]
+fn an_instance_has_one_found_and_removed_lifetime_across_links() {
+    for complete in [false, true] {
+        let (mut daemon, first) = daemon();
+        let second = second_interface(&mut daemon, first);
+        let receiver = subscribe(&mut daemon);
+        let instance = format!("linked.{TY}");
+        for (index, name) in [
+            (first, instance.clone()),
+            (second, instance.to_ascii_uppercase()),
+        ] {
+            let records = if complete {
+                discovery_records(&daemon, index, &name, "linked.local.", 120, true)
+            } else {
+                vec![DnsPointer::new(TY, RRType::PTR, CLASS_IN, 120, name).boxed()]
+            };
+            receive(&mut daemon, index, records);
+        }
+        let mut events: Vec<_> = receiver.try_iter().collect();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, ServiceEvent::ServiceFound(..)))
+                .count(),
+            1
+        );
+        assert_eq!(daemon.service_queriers[TY].delivered.len(), 2);
+        let first_id = (&daemon.my_intfs[&first]).into();
+        let removed = daemon.cache.remove_records_on_intf(first_id);
+        daemon.notify_service_removal(removed.removed_instances);
+        daemon.resolve_updated_instances(&removed.modified_instances);
+        let after_first: Vec<_> = receiver.try_iter().collect();
+        assert!(!after_first
+            .iter()
+            .any(|event| matches!(event, ServiceEvent::ServiceRemoved(..))));
+        assert_eq!(daemon.service_queriers[TY].delivered.len(), 1);
+        if complete {
+            let surviving = after_first
+                .iter()
+                .filter_map(|event| match event {
+                    ServiceEvent::ServiceResolved(service) => Some(service),
+                    _ => None,
+                })
+                .last()
+                .unwrap();
+            assert_eq!(surviving.host, "linked.local.");
+            assert_eq!(surviving.port, 8080);
+            for address in &surviving.addresses {
+                match address {
+                    ScopedIp::V4(address) => {
+                        assert!(address.interface_ids().iter().all(|id| id.index == second));
+                        assert!(!address.interface_ids().is_empty());
+                    }
+                    ScopedIp::V6(_) => panic!("test service only has an IPv4 address"),
+                }
+            }
+        }
+        events.extend(after_first);
+        let second_id = (&daemon.my_intfs[&second]).into();
+        let removed = daemon.cache.remove_records_on_intf(second_id);
+        daemon.notify_service_removal(removed.removed_instances);
+        daemon.resolve_updated_instances(&removed.modified_instances);
+        events.extend(receiver.try_iter());
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, ServiceEvent::ServiceFound(..)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, ServiceEvent::ServiceRemoved(..)))
+                .count(),
+            1
+        );
+        assert!(daemon.service_queriers[TY].delivered.is_empty());
+    }
+}
+
+#[test]
+fn deduplicating_found_does_not_downgrade_a_resolved_link() {
+    let (mut daemon, first) = daemon();
+    let second = second_interface(&mut daemon, first);
+    let receiver = subscribe(&mut daemon);
+    let instance = format!("mixed.{TY}");
+    let records = discovery_records(&daemon, first, &instance, "mixed.local.", 120, true);
+    receive(&mut daemon, first, records);
+    receive(
+        &mut daemon,
+        second,
+        vec![DnsPointer::new(
+            TY,
+            RRType::PTR,
+            CLASS_IN,
+            120,
+            instance.to_ascii_uppercase(),
+        )
+        .boxed()],
+    );
+    let key = CanonicalName::new(&instance).as_str().to_string();
+    assert!(matches!(
+        daemon.service_queriers[TY].delivered[&(first, key.clone())],
+        BrowseDelivery::Resolved(_)
+    ));
+    assert!(matches!(
+        daemon.service_queriers[TY].delivered[&(second, key)],
+        BrowseDelivery::Found(_)
+    ));
+    assert_eq!(
+        receiver
+            .try_iter()
+            .filter(|event| matches!(event, ServiceEvent::ServiceFound(..)))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn cached_type_enumeration_deduplicates_the_same_type_on_multiple_links() {
+    let (mut daemon, first) = daemon();
+    let second = second_interface(&mut daemon, first);
+    daemon.accept_unsolicited = true;
+    for index in [first, second] {
+        receive(
+            &mut daemon,
+            index,
+            vec![DnsPointer::new(
+                SERVICE_TYPE_ENUMERATION,
+                RRType::PTR,
+                CLASS_IN,
+                120,
+                TY.to_string(),
+            )
+            .boxed()],
+        );
+    }
+    let (sender, receiver) = flume::unbounded();
+    daemon.exec_command_browse(false, SERVICE_TYPE_ENUMERATION.to_string(), 1, true, sender);
+    assert_eq!(
+        receiver
+            .try_iter()
+            .filter(|event| matches!(event, ServiceEvent::ServiceFound(..)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        daemon.service_queriers[SERVICE_TYPE_ENUMERATION]
+            .delivered
+            .len(),
+        2
+    );
+    assert!(daemon.pending_resolves.is_empty());
+    assert!(daemon.retransmissions.is_empty());
+}
+
+#[test]
+fn duplicate_found_retires_a_disconnected_passive_subscription() {
+    let (mut daemon, first) = daemon();
+    let second = second_interface(&mut daemon, first);
+    let (sender, receiver) = flume::unbounded();
+    daemon.exec_command_browse(false, SERVICE_TYPE_ENUMERATION.to_string(), 1, true, sender);
+    receive(
+        &mut daemon,
+        first,
+        vec![DnsPointer::new(
+            SERVICE_TYPE_ENUMERATION,
+            RRType::PTR,
+            CLASS_IN,
+            120,
+            TY.to_string(),
+        )
+        .boxed()],
+    );
+    assert!(receiver
+        .try_iter()
+        .any(|event| matches!(event, ServiceEvent::ServiceFound(..))));
+    assert_eq!(
+        daemon.service_queriers[SERVICE_TYPE_ENUMERATION]
+            .delivered
+            .len(),
+        1
+    );
+    drop(receiver);
+    receive(
+        &mut daemon,
+        second,
+        vec![DnsPointer::new(
+            SERVICE_TYPE_ENUMERATION,
+            RRType::PTR,
+            CLASS_IN,
+            120,
+            TY.to_ascii_uppercase(),
+        )
+        .boxed()],
+    );
+    assert!(daemon.service_queriers.is_empty());
+    assert!(daemon.pending_resolves.is_empty());
+    assert!(daemon.retransmissions.is_empty());
+}

@@ -1605,6 +1605,10 @@ impl Zeroconf {
         else {
             return;
         };
+        if sender.is_disconnected() {
+            self.remove_service_subscription(&ty_domain);
+            return;
+        }
         let delivery = match &event {
             ServiceEvent::ServiceFound(_, name) => Some(BrowseDelivery::Found(name.clone())),
             ServiceEvent::ServiceResolved(service) => {
@@ -1616,7 +1620,22 @@ impl Zeroconf {
             ServiceEvent::ServiceRemoved(_, name) => Some(CanonicalName::new(name)),
             _ => None,
         };
-        match sender.try_send(event) {
+        let already_found = match &delivery {
+            Some(BrowseDelivery::Found(name)) => {
+                let name = CanonicalName::new(name);
+                self.service_queriers[&ty_domain]
+                    .delivered
+                    .keys()
+                    .any(|(_, instance)| instance == name.as_str())
+            }
+            _ => false,
+        };
+        let result = if already_found {
+            Ok(())
+        } else {
+            sender.try_send(event)
+        };
+        match result {
             Ok(()) => {
                 if let Some(delivery) = delivery {
                     let key = CanonicalName::new(delivery.fullname()).as_str().to_string();
