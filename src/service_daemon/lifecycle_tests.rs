@@ -187,6 +187,15 @@ fn txt_and_port_updates_keep_established_claims_and_current_records() {
             ServiceStatus::Announced
         );
     }
+    let (sender, receiver) = flume::unbounded();
+    daemon.monitors.push(sender);
+    expire_multicast_window(&mut daemon, index);
+    let current = daemon.my_services[&registry_key(&fullname)].clone();
+    daemon.register_service(current);
+    assert!(receiver
+        .try_iter()
+        .any(|event| matches!(event, DaemonEvent::Announce(..))));
+    assert_eq!(active_count(&daemon), 3);
     unregister(&mut daemon, &fullname);
     assert_eq!(active_count(&daemon), 0);
 }

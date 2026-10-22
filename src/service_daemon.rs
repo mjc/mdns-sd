@@ -1175,7 +1175,6 @@ mod lifecycle_tests;
 
 type PublicationSnapshot = HashMap<u32, Vec<DnsRecordBox>>;
 
-/// A struct holding the state. It was inspired by `zeroconf` package in Python.
 impl From<Sender<ServiceEvent>> for ServiceSubscription {
     fn from(sender: Sender<ServiceEvent>) -> Self {
         Self {
@@ -1193,6 +1192,7 @@ impl std::ops::Deref for ServiceSubscription {
     }
 }
 
+/// A struct holding the state. It was inspired by `zeroconf` package in Python.
 struct Zeroconf {
     /// The mDNS port number to use for socket binding.
     /// Typically MDNS_PORT (5353), but can be customized for development/testing.
@@ -1488,6 +1488,18 @@ fn publication_delta(
 }
 
 impl Zeroconf {
+    fn announce_registration(&mut self, name: &str) {
+        let mut info = self.my_services.remove(name).unwrap();
+        let outgoing_addrs = self.send_unsolicited_response(&mut info);
+        if !outgoing_addrs.is_empty() {
+            self.notify_monitors(DaemonEvent::Announce(
+                info.get_fullname().to_string(),
+                format!("{:?}", &outgoing_addrs),
+            ));
+        }
+        self.my_services.insert(name.to_string(), info);
+    }
+
     fn notify_service_removal(&mut self, expired: HashMap<String, HashSet<String>>) {
         let domains: Vec<String> = self.service_queriers.keys().cloned().collect();
         for ty_domain in domains {
@@ -1506,7 +1518,11 @@ impl Zeroconf {
         }
     }
 
-    fn finish_publication_change(&mut self, before: PublicationSnapshot, repeat: bool) {
+    fn finish_publication_change(
+        &mut self,
+        before: PublicationSnapshot,
+        repeat: bool,
+    ) -> HashSet<String> {
         let after = self.publication_snapshot();
         self.prune_goodbye_retries(&after);
         let mut announce = HashSet::new();
@@ -1558,17 +1574,10 @@ impl Zeroconf {
                 }
             }
         }
-        for name in announce {
-            let mut info = self.my_services.remove(&name).unwrap();
-            let outgoing_addrs = self.send_unsolicited_response(&mut info);
-            if !outgoing_addrs.is_empty() {
-                self.notify_monitors(DaemonEvent::Announce(
-                    info.get_fullname().to_string(),
-                    format!("{:?}", &outgoing_addrs),
-                ));
-            }
-            self.my_services.insert(name, info);
+        for name in &announce {
+            self.announce_registration(name);
         }
+        announce
     }
 
     fn scheduled_deadlines(&self) -> usize {
@@ -2387,8 +2396,6 @@ impl Zeroconf {
             last_now = now;
             last_wall_now = wall_now;
 
-            // Remove the timers if already passed.
-
             // Remove hostname resolvers with expired timeouts.
             self.expire_hostname_resolvers(now);
 
@@ -3068,9 +3075,14 @@ impl Zeroconf {
         }
         let before = self.publication_snapshot();
         self.pending_registrations.remove(&fullname);
-        self.my_services.insert(fullname, info);
+        self.my_services.insert(fullname.clone(), info);
         self.reconcile_registries();
-        self.finish_publication_change(before, true);
+        if !self
+            .finish_publication_change(before, true)
+            .contains(&fullname)
+        {
+            self.announce_registration(&fullname);
+        }
     }
 
     /// Sends out announcement of `info` on every valid interface.
@@ -3144,6 +3156,8 @@ impl Zeroconf {
 
             if announced {
                 info.set_status(intf.index, ServiceStatus::Announced);
+            } else if info.get_status(*if_index) != ServiceStatus::Announced {
+                info.set_status(*if_index, ServiceStatus::Probing);
             }
             if needs_retry {
                 outgoing_intfs.insert(*if_index);
@@ -5538,13 +5552,25 @@ fn unicast_on_intf(
         debug!("Drop over-sized packet ({} > {max_size})", packet.len());
         return false;
     }
-    match socket.send_to(packet, &dest.into()) {
-        Ok(size) => {
-            trace!("sent unicast {size} bytes on interface {if_name} to {dest}");
-            size == packet.len()
+
+    let sock_addr = dest.into();
+    match socket.send_to(packet, &sock_addr) {
+        Ok(sz) => {
+            trace!(
+                "sent unicast {} bytes on interface {} to {}",
+                sz,
+                if_name,
+                dest
+            );
+            sz == packet.len()
         }
-        Err(error) => {
-            debug!("Failed to send unicast to {dest} via {if_name}: {error}");
+        Err(e) => {
+            trace!(
+                "Failed to send unicast to {} via {:?}: {}",
+                dest,
+                &if_name,
+                e
+            );
             false
         }
     }
@@ -5564,20 +5590,31 @@ fn multicast_on_intf(
         debug!("Drop over-sized packet ({} > {max_size})", packet.len());
         return false;
     }
+
     let addr: SocketAddr = match if_addr {
-        IfAddr::V4(_) => SocketAddrV4::new(GROUP_ADDR_V4, port).into(),
-        IfAddr::V6(_) => SocketAddrV6::new(GROUP_ADDR_V6, port, 0, if_index).into(),
+        if_addrs::IfAddr::V4(_) => SocketAddrV4::new(GROUP_ADDR_V4, port).into(),
+        if_addrs::IfAddr::V6(_) => {
+            let mut sock = SocketAddrV6::new(GROUP_ADDR_V6, port, 0, 0);
+            sock.set_scope_id(if_index); // Choose iface for multicast
+            sock.into()
+        }
     };
-    match socket.send_to(packet, &addr.into()) {
-        Ok(size) => {
+
+    // Sends out `packet` to `addr` on the socket.
+    let sock_addr = addr.into();
+    match socket.send_to(packet, &sock_addr) {
+        Ok(sz) => {
             trace!(
-                "sent out {size} bytes on interface {if_name} (idx {if_index}) addr {}",
+                "sent out {} bytes on interface {} (idx {}) addr {}",
+                sz,
+                if_name,
+                if_index,
                 if_addr.ip()
             );
-            size == packet.len()
+            sz == packet.len()
         }
-        Err(error) => {
-            debug!("Failed to send to {addr} via {if_name}: {error}");
+        Err(e) => {
+            trace!("Failed to send to {} via {:?}: {}", addr, &if_name, e);
             false
         }
     }
