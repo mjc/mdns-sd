@@ -1261,6 +1261,9 @@ struct Zeroconf {
 
     status: DaemonStatus,
 
+    /// Service instances resolved by a current subscription.
+    resolved: HashSet<String>,
+
     /// Service instances that are pending for resolving SRV and TXT.
     pending_resolves: HashSet<String>,
 
@@ -1485,6 +1488,24 @@ fn publication_delta(
 }
 
 impl Zeroconf {
+    fn notify_service_removal(&mut self, expired: HashMap<String, HashSet<String>>) {
+        let domains: Vec<String> = self.service_queriers.keys().cloned().collect();
+        for ty_domain in domains {
+            if let Some(instances) = expired.get(&ty_domain) {
+                for instance_name in instances {
+                    let event = ServiceEvent::ServiceRemoved(
+                        ty_domain.to_string(),
+                        instance_name.to_string(),
+                    );
+                    self.push_service(&ty_domain, event);
+                    if self.service_queriers.contains_key(&ty_domain) {
+                        debug!("notify_service_removal: sent ServiceRemoved to listener of {ty_domain}: {instance_name}");
+                    }
+                }
+            }
+        }
+    }
+
     fn finish_publication_change(&mut self, before: PublicationSnapshot, repeat: bool) {
         let after = self.publication_snapshot();
         self.prune_goodbye_retries(&after);
@@ -1872,7 +1893,10 @@ impl Zeroconf {
                 } else if ty == SERVICE_TYPE_ENUMERATION {
                     None
                 } else {
-                    let current = self.resolve_service_from_cache(ty, delivery.fullname());
+                    let Ok(current) = self.resolve_service_from_cache(ty, delivery.fullname())
+                    else {
+                        continue;
+                    };
                     match delivery {
                         BrowseDelivery::Found(_) if current.is_valid() => {
                             Some(ServiceEvent::ServiceResolved(Box::new(current)))
@@ -1918,6 +1942,15 @@ impl Zeroconf {
         self.retransmissions.retain(|rerun| match &rerun.command {
             Command::Resolve(instance, _) => wanted.contains(CanonicalName::new(instance).as_str()),
             _ => true,
+        });
+        let subscriptions = &self.service_queriers;
+        self.resolved.retain(|instance| {
+            subscriptions.values().any(|subscription| {
+                matches!(
+                    subscription.delivered.get(instance),
+                    Some(BrowseDelivery::Resolved(_))
+                )
+            })
         });
     }
 
@@ -2052,6 +2085,7 @@ impl Zeroconf {
             if_selections,
             status,
             pending_resolves: HashSet::new(),
+            resolved: HashSet::new(),
             multicast_loop_v4: true,
             multicast_loop_v6: true,
             accept_unsolicited: false,
@@ -2236,6 +2270,7 @@ impl Zeroconf {
             self.remove_registration(fullname, true);
         }
         self.my_services.clear();
+        self.resolved.clear();
 
         // 2. Stop all browse operations
         let browse_types: Vec<String> = self.service_queriers.keys().cloned().collect();
@@ -3518,14 +3553,19 @@ impl Zeroconf {
     /// active.
     fn query_unresolved_instances(&mut self, ty_domain: &str) {
         let now = Instant::now();
-        let instances: Vec<_> = self
-            .cache
-            .pointers(ty_domain, None)
-            .filter(|(record, _)| !record.record.expires_soon(now))
-            .map(|(_, ptr)| ptr.alias().to_string())
-            .collect();
+        let mut instances = Vec::new();
+        if let Some(records) = self.cache.get_ptr(ty_domain) {
+            for record in records.iter().filter(|r| !r.record.expires_soon(now)) {
+                if let Some(ptr) = record.record.any().downcast_ref::<DnsPointer>() {
+                    instances.push(ptr.alias().to_string());
+                }
+            }
+        }
+
         for instance in instances {
-            self.query_unresolved(&instance);
+            if !self.resolved.contains(&registry_key(&instance)) {
+                self.query_unresolved(&instance);
+            }
         }
     }
 
@@ -3537,20 +3577,49 @@ impl Zeroconf {
         sender: &Sender<ServiceEvent>,
         now: Instant,
     ) {
-        let mut aliases: Vec<_> = self
+        let mut aliases: Vec<String> = self
             .cache
-            .pointers(ty_domain, None)
-            .filter(|(record, _)| !record.record.expires_soon(now))
-            .map(|(_, ptr)| ptr.alias().to_string())
-            .collect();
-        let mut seen = HashSet::new();
-        aliases.retain(|alias| seen.insert(CanonicalName::new(alias)));
+            .get_ptr(ty_domain)
+            .map(|records| {
+                let mut records: Vec<_> = records.iter().collect();
+                records.sort_by_key(|record| record.src_intf.index);
+                records
+                    .into_iter()
+                    .filter(|r| !r.record.expires_soon(now))
+                    .filter_map(|r| {
+                        r.record
+                            .any()
+                            .downcast_ref::<DnsPointer>()
+                            .map(|p| p.alias().to_string())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
 
+        let mut seen = HashSet::new();
+        aliases.retain(|alias| seen.insert(registry_key(alias)));
         for alias in aliases {
-            let resolved_event = (ty_domain != SERVICE_TYPE_ENUMERATION)
-                .then(|| self.resolve_service_from_cache(ty_domain, &alias))
-                .filter(ResolvedService::is_valid)
-                .map(|service| ServiceEvent::ServiceResolved(Box::new(service)));
+            let resolved_event = match self.resolve_service_from_cache(ty_domain, &alias) {
+                Ok(resolved_service)
+                    if ty_domain != SERVICE_TYPE_ENUMERATION && resolved_service.is_valid() =>
+                {
+                    debug!("Resolved service from cache: {}", alias);
+                    Some(ServiceEvent::ServiceResolved(Box::new(resolved_service)))
+                }
+                Ok(resolved_service) => {
+                    debug!(
+                        "query_cache_for_service: not valid: {} (host_empty={}, addrs_empty={})",
+                        alias,
+                        resolved_service.get_hostname().is_empty(),
+                        resolved_service.get_addresses().is_empty(),
+                    );
+                    None
+                }
+                Err(err) => {
+                    debug!("Error while resolving service from cache: {}", err);
+                    continue;
+                }
+            };
 
             self.push_service(
                 ty_domain,
@@ -3568,6 +3637,7 @@ impl Zeroconf {
                 }
                 debug!("sent service resolved: {}", alias);
                 self.pending_resolves.remove(&alias);
+                self.resolved.insert(registry_key(&alias));
             } else if ty_domain != SERVICE_TYPE_ENUMERATION {
                 self.add_pending_resolve(alias);
             }
@@ -3607,7 +3677,11 @@ impl Zeroconf {
     }
 
     /// Creates a `ResolvedService` from the cache.
-    fn resolve_service_from_cache(&self, ty_domain: &str, fullname: &str) -> ResolvedService {
+    fn resolve_service_from_cache(
+        &self,
+        ty_domain: &str,
+        fullname: &str,
+    ) -> Result<ResolvedService> {
         let now = Instant::now();
         let mut resolved_service = ResolvedService {
             ty_domain: ty_domain.to_string(),
@@ -3688,7 +3762,7 @@ impl Zeroconf {
             }
         }
 
-        resolved_service
+        Ok(resolved_service)
     }
 
     fn handle_poller_events(&mut self, events: &mio::Events) {
@@ -3928,38 +4002,97 @@ impl Zeroconf {
     /// service type PTR can both point to the same service instance.
     /// This loop automatically handles the sub-type PTRs.
     fn resolve_updated_instances(&mut self, updated_instances: &HashSet<String>) {
-        let updated: HashSet<_> = updated_instances
+        if updated_instances.is_empty() {
+            return;
+        }
+
+        let updated_instances: HashSet<_> = updated_instances
             .iter()
-            .map(|name| CanonicalName::new(name))
+            .map(|name| registry_key(name))
             .collect();
-        let mut instances = HashSet::new();
-        for (ty, records) in self.cache.all_ptr() {
-            if ty == SERVICE_TYPE_ENUMERATION || !self.service_queriers.contains_key(ty) {
+        let mut resolved: HashSet<String> = HashSet::new();
+        let mut unresolved: HashSet<String> = HashSet::new();
+        let mut removed_instances = HashMap::new();
+        let mut deliver = Vec::new();
+
+        let now = Instant::now();
+
+        for (ty_domain, records) in self.cache.all_ptr().iter() {
+            if ty_domain == SERVICE_TYPE_ENUMERATION
+                || !self.service_queriers.contains_key(ty_domain)
+            {
+                // No need to resolve if not in our queries.
                 continue;
             }
-            for record in records {
-                if record.record.get_record().is_expired(Instant::now()) {
+
+            for ptr in records
+                .iter()
+                .filter(|r| !r.record.get_record().is_expired(now))
+            {
+                let Some(dns_ptr) = ptr.record.any().downcast_ref::<DnsPointer>() else {
+                    continue;
+                };
+
+                let instance = dns_ptr.alias();
+                if !updated_instances.contains(&registry_key(instance)) {
                     continue;
                 }
-                if let Some(ptr) = record.record.any().downcast_ref::<DnsPointer>() {
-                    if updated.contains(&CanonicalName::new(ptr.alias())) {
-                        instances.insert((ty.clone(), ptr.alias().to_string()));
+
+                let Ok(resolved_service) = self.resolve_service_from_cache(ty_domain, instance)
+                else {
+                    continue;
+                };
+
+                debug!("resolve_updated_instances: from cache: {instance}");
+                if resolved_service.is_valid() {
+                    debug!(
+                        "resolved '{}' -> host '{}' port {} addrs {:?}",
+                        instance,
+                        resolved_service.host,
+                        resolved_service.port,
+                        resolved_service.addresses,
+                    );
+                    resolved.insert(instance.to_string());
+                    deliver.push((
+                        ty_domain.to_string(),
+                        ServiceEvent::ServiceResolved(Box::new(resolved_service)),
+                    ));
+                } else {
+                    debug!(
+                        "resolve_updated_instances: not valid: {instance} (host_empty={}, addrs_empty={})",
+                        resolved_service.get_hostname().is_empty(),
+                        resolved_service.get_addresses().is_empty(),
+                    );
+                    if self.resolved.remove(&registry_key(dns_ptr.alias())) {
+                        removed_instances
+                            .entry(ty_domain.to_string())
+                            .or_insert_with(HashSet::new)
+                            .insert(instance.to_string());
                     }
+                    unresolved.insert(instance.to_string());
                 }
             }
         }
-        for (ty, instance) in instances {
-            let service = self.resolve_service_from_cache(&ty, &instance);
-            let valid = service.is_valid();
-            if valid {
-                self.push_service(&ty, ServiceEvent::ServiceResolved(Box::new(service)));
-            }
-            if valid && self.unresolved_questions(&instance).is_empty() {
-                self.pending_resolves
-                    .remove(CanonicalName::new(&instance).as_str());
-            } else {
-                self.add_pending_resolve(instance);
-            }
+
+        for (ty_domain, event) in deliver {
+            self.push_service(&ty_domain, event);
+        }
+
+        for instance in resolved.drain() {
+            self.pending_resolves.remove(&registry_key(&instance));
+            self.resolved.insert(registry_key(&instance));
+        }
+
+        for instance in unresolved.drain() {
+            self.add_pending_resolve(instance);
+        }
+
+        if !removed_instances.is_empty() {
+            debug!(
+                "resolve_updated_instances: removed {}",
+                &removed_instances.len()
+            );
+            self.notify_service_removal(removed_instances);
         }
         self.reconcile_browse_state();
     }
@@ -4356,15 +4489,7 @@ impl Zeroconf {
         let (cached_records, cached_bytes) = self.cache.usage();
         self.set_counter(Counter::CachedRecords, cached_records as i64);
         self.set_counter(Counter::CachedBytes, cached_bytes as i64);
-        let resolved = self
-            .service_queriers
-            .values()
-            .flat_map(|subscription| subscription.delivered.iter())
-            .filter(|(_, delivery)| matches!(delivery, BrowseDelivery::Resolved(_)))
-            .map(|(instance, _)| instance)
-            .collect::<HashSet<_>>()
-            .len();
-        self.set_counter(Counter::Resolved, resolved as i64);
+        self.set_counter(Counter::Resolved, self.resolved.len() as i64);
         self.set_counter(Counter::PendingResolves, self.pending_resolves.len() as i64);
         self.set_counter(Counter::Timer, self.scheduled_deadlines() as i64);
 
@@ -4445,6 +4570,7 @@ impl Zeroconf {
                     delivered: HashMap::new(),
                 },
             );
+            self.reconcile_browse_state();
             let now = Instant::now();
             self.query_cache_for_service(&ty, &listener, now);
             if !self.service_live(&ty, &listener) {

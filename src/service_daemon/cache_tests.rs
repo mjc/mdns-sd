@@ -569,6 +569,7 @@ fn stopping_browses_releases_interest_without_deleting_live_records_or_verificat
     assert_eq!(daemon.service_queriers.len(), 1);
     assert!(daemon
         .resolve_service_from_cache(subtype, &instance)
+        .unwrap()
         .is_valid());
     daemon.exec_command_stop_browse(subtype.to_string());
     assert!(daemon.service_queriers.is_empty());
