@@ -14,7 +14,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// Bitflags for selecting address families.
+/// Bitflags-style type for filtering by IP version.
 #[derive(Clone, Copy)]
 pub(crate) struct IpType(u8);
 
@@ -51,14 +51,14 @@ pub(crate) struct CacheEviction {
     pub(crate) expired_addrs: HashMap<String, HashSet<ScopedIp>>,
 }
 
-/// A received record, its receiving interface and retained-data charge in bytes.
+/// Associate a DnsRecord with the interface it was received on.
 pub(crate) struct DnsRecordIntf {
     pub(crate) record: DnsRecordBox,
     pub(crate) src_intf: InterfaceId,
     charge: usize,
 }
 
-/// Received RRsets share one expiry path across record types and interfaces.
+/// A cache for all types of DNS records.
 pub(crate) struct DnsCache {
     /// DnsPointer records indexed by ty_domain
     ptr: HashMap<String, Vec<DnsRecordIntf>>,
@@ -68,8 +68,10 @@ pub(crate) struct DnsCache {
 
     /// DnsTxt records indexed by the fullname of an instance
     txt: HashMap<String, Vec<DnsRecordIntf>>,
+
     /// Address records indexed by canonical hostname.
     addr: HashMap<String, Vec<DnsRecordIntf>>,
+
     /// Negative responses indexed by canonical owner name.
     nsec: HashMap<String, Vec<DnsRecordIntf>>,
     record_count: usize,
@@ -283,7 +285,7 @@ impl DnsCache {
         &self.ptr
     }
 
-    /// Counts retained PTR records across interfaces.
+    /// Count all PTR records in the cache.
     pub(crate) fn ptr_count(&self) -> usize {
         self.ptr.values().map(|v| v.len()).sum()
     }
@@ -435,8 +437,10 @@ impl DnsCache {
         result
     }
 
-    /// Returns SRV queries for an instance and address queries for its cached targets.
-    /// When `expire_at` is set, shortens those records' expiry times on their links.
+    /// Returns a list of resource records (name, rr_type) that need to be queried in order to
+    /// verify the `instance`.
+    ///
+    /// If `expire_at` is not None, the resource records' expire time will be updated.
     pub(crate) fn service_verify_queries(
         &mut self,
         instance: &str,
@@ -479,7 +483,7 @@ impl DnsCache {
         query_vec
     }
 
-    /// Refreshes existing records; admits new records only when they are for us.
+    /// Update a DNSRecord TTL if already exists, otherwise insert a new record.
     ///
     /// Returns the cached record and `true` for insertion or `false` for a TTL refresh.
     /// Returns `None` for records that are not for us, unsupported types or classes,
@@ -589,7 +593,8 @@ impl DnsCache {
         });
     }
 
-    /// Ages cached records by the time spent asleep.
+    /// Ages every cached record by `elapsed`, so that time the system spent
+    /// asleep counts toward the records' TTLs.
     pub(crate) fn age_records(&mut self, elapsed: Duration) {
         let all_records = self
             .ptr

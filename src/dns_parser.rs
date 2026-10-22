@@ -347,8 +347,7 @@ pub(crate) const MAX_NAME_BYTES: usize = 255;
 /// whatever was written and skips the item.
 #[derive(Debug, PartialEq, Eq)]
 pub enum WriteError {
-    /// A label exceeds [`MAX_LABEL_BYTES`] or the complete encoded name exceeds
-    /// [`MAX_NAME_BYTES`].
+    /// A label in a name is longer than [`MAX_LABEL_BYTES`].
     NameTooLong,
 
     /// The packet would exceed its max size with this record.
@@ -1985,9 +1984,9 @@ impl DnsOutgoing {
     /// Adds a PTR answer for `service` along with recommended additional records
     /// (SRV, TXT, and address records) per [RFC 6763 Section 12.1].
     ///
-    /// Uses the interface registry's current SRV/TXT records and complete host
-    /// address sets. The selected transport and both name claims must be ready.
-    /// Known-answer entries in `msg` may suppress the PTR and its additionals.
+    /// Resolves any name conflicts via `dns_registry` and selects addresses
+    /// matching the given interface. Does nothing if no addresses are available
+    /// on `intf` or if the PTR answer is suppressed by known-answer entries in `msg`.
     ///
     /// [RFC 6763 Section 12.1]: https://tools.ietf.org/html/rfc6763#section-12.1
     pub(crate) fn add_answer_with_additionals(
@@ -3322,7 +3321,10 @@ mod tests {
         assert_eq!(incoming.answers().len(), 1);
     }
 
-    /// A trailing backslash in a wire label must not escape the next separator.
+    /// A name learned from the network can hold a label that ends with a
+    /// backslash, which escapes the following label separator. Unescaping such
+    /// a name on the way out merges two 63-byte labels into a 127-byte one.
+    /// This used to panic the daemon thread. See issue #483.
     #[test]
     fn test_incoming_name_with_merged_labels_does_not_panic() {
         // A query with one question: "aa..a\" + "bb..b", 63 bytes each.
