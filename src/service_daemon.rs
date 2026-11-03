@@ -3192,6 +3192,18 @@ impl Zeroconf {
         // check possible conflicts and handle them.
         self.conflict_handler(&msg, if_index);
 
+        // A publisher that is not browsing or resolving hostnames has no use
+        // for learned response records. `is_for_us` below still defaults to
+        // true when a response contains no PTR, so those TXT, SRV and address
+        // records would otherwise stay cached for the daemon's lifetime.
+        // Conflict handling above has already seen the message.
+        if !self.accept_unsolicited
+            && self.service_queriers.is_empty()
+            && self.hostname_resolvers.is_empty()
+        {
+            return;
+        }
+
         // check if the message is for us.
         let mut is_for_us = true; // assume it is for us.
 
@@ -5468,8 +5480,8 @@ mod tests {
     };
     use crate::{
         dns_parser::{
-            DnsAddress, DnsEntryExt, DnsIncoming, DnsOutgoing, DnsPointer, DnsSrv, InterfaceId,
-            RRType, ScopedIp, CLASS_IN, FLAGS_AA, FLAGS_QR_QUERY, FLAGS_QR_RESPONSE,
+            DnsAddress, DnsEntryExt, DnsIncoming, DnsOutgoing, DnsPointer, DnsSrv, DnsTxt,
+            InterfaceId, RRType, ScopedIp, CLASS_IN, FLAGS_AA, FLAGS_QR_QUERY, FLAGS_QR_RESPONSE,
             LEGACY_UNICAST_MAX_TTL,
         },
         service_daemon::{add_answer_of_service, check_hostname},
@@ -7905,6 +7917,161 @@ mod tests {
             old_receiver.try_recv(),
             Err(flume::TryRecvError::Disconnected)
         ));
+    }
+
+    /// A response carrying one service instance and no PTR record.
+    fn unsolicited_instance(index: u32, name: &str, port: u16) -> DnsIncoming {
+        let instance = format!("{name}._other._tcp.local.");
+        let host = format!("{name}.local.");
+        let interface_id = InterfaceId {
+            name: "mdns-sd-fake".to_string(),
+            index,
+        };
+        let mut out = DnsOutgoing::new(FLAGS_QR_RESPONSE | FLAGS_AA);
+        out.add_answer_record(DnsSrv::new(
+            &instance,
+            CLASS_IN,
+            4_500,
+            0,
+            0,
+            port,
+            host.clone(),
+        ));
+        out.add_answer_record(DnsTxt::new(&instance, CLASS_IN, 4_500, Vec::new()));
+        out.add_answer_record(DnsAddress::new(
+            &host,
+            RRType::A,
+            CLASS_IN,
+            4_500,
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 50)),
+            interface_id.clone(),
+        ));
+        let packets = out.to_data_on_wire(MAX_PKT_DEFAULT, true);
+        DnsIncoming::new(packets.into_iter().next().unwrap(), interface_id).unwrap()
+    }
+
+    fn instance_is_cached(daemon: &super::Zeroconf, name: &str) -> bool {
+        let instance = format!("{name}._other._tcp.local.");
+        let host = format!("{name}.local.");
+        daemon.cache.get_srv(&instance).is_some()
+            || daemon.cache.get_txt(&instance).is_some()
+            || daemon.cache.get_addr(&host).is_some()
+    }
+
+    /// An idle publisher still handles conflicts, and does not retain response
+    /// records it did not ask for. Browsing and explicit unsolicited acceptance
+    /// still keep those records.
+    #[test]
+    fn test_idle_publisher_drops_unsolicited_responses() {
+        let mut daemon = new_test_zeroconf();
+        let index = 65_001;
+        add_fake_intf(
+            &mut daemon,
+            index,
+            &[test_ifaddr_v4(Ipv4Addr::new(192, 0, 2, 1))],
+        );
+        assert!(daemon.service_queriers.is_empty());
+        assert!(daemon.hostname_resolvers.is_empty());
+        assert!(!daemon.accept_unsolicited);
+
+        for i in 0..32 {
+            let name = format!("peer{i}");
+            daemon.handle_response(unsolicited_instance(index, &name, 9), index);
+            assert!(
+                !instance_is_cached(&daemon, &name),
+                "{name} was retained without a querier",
+                name = name
+            );
+        }
+
+        daemon.accept_unsolicited = true;
+        daemon.handle_response(unsolicited_instance(index, "kept", 9), index);
+        assert!(
+            instance_is_cached(&daemon, "kept"),
+            "accept_unsolicited must still retain a response"
+        );
+
+        daemon.accept_unsolicited = false;
+        let (sender, _receiver) = flume::bounded(4);
+        daemon
+            .service_queriers
+            .insert("_other._tcp.local.".to_string(), sender);
+        daemon.handle_response(unsolicited_instance(index, "browsed", 9), index);
+        assert!(
+            instance_is_cached(&daemon, "browsed"),
+            "an active browse must still retain a response"
+        );
+    }
+
+    /// A conflicting answer still renames an in-flight probe when the daemon
+    /// is not browsing.
+    #[test]
+    fn test_idle_publisher_still_handles_probe_conflicts() {
+        let (mut daemon, _receiver) = new_test_zeroconf_with_receiver();
+        let loopback = my_ip_interfaces(true)
+            .into_iter()
+            .find(|intf| intf.ip() == IpAddr::V4(Ipv4Addr::LOCALHOST))
+            .unwrap();
+        let index = loopback.index.unwrap();
+        daemon.my_intfs.retain(|key, _| *key == index);
+        daemon.dns_registry_map.retain(|key, _| *key == index);
+        let mut service = ServiceInfo::new(
+            "_conflict._tcp.local.",
+            "conflict",
+            "conflict.local.",
+            "",
+            8080,
+            None,
+        )
+        .unwrap()
+        .enable_addr_auto();
+        service.set_interfaces(vec![IfKind::IPv4]);
+        daemon.register_service(service);
+        let probed_srv =
+            daemon.dns_registry_map[&index]
+                .probing
+                .iter()
+                .find_map(|(name, probe)| {
+                    probe
+                        .records
+                        .iter()
+                        .any(|record| record.get_type() == RRType::SRV)
+                        .then(|| name.clone())
+                });
+        let Some(fullname) = probed_srv else {
+            panic!(
+                "precondition: an SRV record is still probing, keys {:?}",
+                daemon.dns_registry_map[&index].probing.keys()
+            );
+        };
+
+        let interface_id = InterfaceId {
+            name: loopback.name.clone(),
+            index,
+        };
+        let mut out = DnsOutgoing::new(FLAGS_QR_RESPONSE | FLAGS_AA);
+        out.add_answer_record(DnsSrv::new(
+            &fullname,
+            CLASS_IN,
+            4_500,
+            0,
+            0,
+            9,
+            "conflict.local.".to_string(),
+        ));
+        let packets = out.to_data_on_wire(MAX_PKT_DEFAULT, true);
+        let msg = DnsIncoming::new(packets.into_iter().next().unwrap(), interface_id).unwrap();
+        daemon.handle_response(msg, index);
+
+        let renamed = daemon.dns_registry_map[&index]
+            .name_changes
+            .values()
+            .any(|name| name.contains(" (2)"));
+        assert!(renamed, "a conflicting SRV must rename the probe");
+        assert!(
+            daemon.cache.get_srv(&fullname).is_none(),
+            "the conflicting response must not stay in the cache"
+        );
     }
 
     #[test]
